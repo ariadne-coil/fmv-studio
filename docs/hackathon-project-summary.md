@@ -140,3 +140,5 @@ Google describes [Flow](https://labs.google/flow/about) as an AI filmmaking tool
   - Project state, async jobs, generated media, and deployment automation are part of the product design itself.
 
 So the distinction is not that FMV Studio replaces Flow feature-for-feature. The distinction is that FMV Studio wraps Google model capabilities in a structured music video production pipeline with durable state, critique loops, and editable production tooling.
+
+The biggest UX difference is that FMV Studio keeps the user oriented around the full creative arc at every stage. The user can always understand where the project stands globally, what is ready, what needs attention, and how the current stage affects the final video. Shot-level detail is available when needed, but the system does not force the user to micromanage every individual frame or clip just to keep moving. That balance between high-level control and optional low-level intervention is central to the product design.
