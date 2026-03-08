@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_IMAGE}
+      - --build-arg
+      - NEXT_PUBLIC_API_ORIGIN=${_NEXT_PUBLIC_API_ORIGIN}
+      - .
+images:
+  - ${_IMAGE}

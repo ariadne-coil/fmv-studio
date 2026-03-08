@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #0f1115;
+  --color-foreground: #f8fafc;
+  --color-primary: #6366f1;
+  --color-primary-hover: #4f46e5;
+  --color-surface: #1e293b;
+  --color-surface-hover: #334155;
+  --color-surface-border: #334155;
+  --font-inter: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Base styles for premium look */
+html,
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-inter);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Glassmorphism utilities */
+@layer utilities {
+  .glass {
+    @apply bg-surface/50 backdrop-blur-md border border-surface-border;
+  }
+}
+
+/* Custom scrollbar for timeline */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-background;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-surface-hover rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-surface-border;
+}
