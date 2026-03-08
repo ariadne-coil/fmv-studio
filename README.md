@@ -18,6 +18,7 @@ Detailed setup and deploy instructions are in [`docs/google-cloud-deployment.md`
 ## Hackathon Artifacts
 
 - Architecture diagram: [`docs/hackathon-architecture-diagram.md`](docs/hackathon-architecture-diagram.md)
+- Project summary: [`docs/hackathon-project-summary.md`](docs/hackathon-project-summary.md)
 
 ## Cloud Smoke Test
 
