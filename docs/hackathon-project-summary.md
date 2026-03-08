@@ -64,7 +64,7 @@ The backend acts as the central agent runtime. It owns project state, orchestrat
 - `Gemini Image 2`: storyboard frame generation
 - `Veo 3.1`: video generation
 - `Lyria 2`: music
-- 'Gemini TTS': spoken stage summaries
+- `Gemini TTS`: spoken stage summaries
 
 ## Other Data Sources Used
 
