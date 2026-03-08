@@ -123,3 +123,20 @@ The result is a cloud-deployed, agent-driven music video studio that combines:
 - automated Google Cloud deployment
 
 That combination is the main technical contribution of FMV Studio: not just generating assets, but turning multiple Google AI systems into a usable end-to-end creative production workflow.
+
+## How This Differs From Flow
+
+Google describes [Flow](https://labs.google/flow/about) as an AI filmmaking tool built around Google models such as Veo, Imagen, and Gemini for scene creation and cinematic control. Based on Google's official Flow materials, FMV Studio differs in a few important ways:
+
+- FMV Studio is explicitly music-video-centric.
+  - The workflow starts from song, lyrics, pacing, and beat-aligned visual planning rather than from open-ended scene generation.
+- FMV Studio is stage-driven and agentic.
+  - Instead of a single creation surface, it moves the user through `Music`, `Planning`, `Storyboarding`, `Filming`, and `Production`, with orchestration and critique happening between stages.
+- FMV Studio treats review and regeneration as first-class workflow steps.
+  - Storyboards and clips are critiqued, retried, and approved before they become inputs to later stages.
+- FMV Studio includes an integrated post-generation production pass.
+  - The user can split, reorder, mute audio fragments, and render a final master inside the same system.
+- FMV Studio is built as a cloud-deployed agent architecture, not just a creator UI.
+  - Project state, async jobs, generated media, and deployment automation are part of the product design itself.
+
+So the distinction is not that FMV Studio replaces Flow feature-for-feature. The distinction is that FMV Studio wraps Google model capabilities in a structured music video production pipeline with durable state, critique loops, and editable production tooling.
