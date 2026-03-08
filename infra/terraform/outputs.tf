@@ -22,6 +22,10 @@ output "frontend_service_account_email" {
   value = google_service_account.frontend_runtime.email
 }
 
+output "tasks_service_account_email" {
+  value = google_service_account.tasks_invoker.email
+}
+
 output "backend_service_name" {
   value = var.backend_service_name
 }

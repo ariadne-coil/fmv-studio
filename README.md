@@ -97,10 +97,10 @@ This script:
 4. Run the low-cost smoke test:
 
 ```bash
-BACKEND_URL="https://your-backend-url" ./scripts/smoke_test_cloud.sh
+APP_URL="https://your-frontend-url" ./scripts/smoke_test_cloud.sh
 ```
 
-The smoke test intentionally stops at `Planning`, so judges can verify the deployed system without paying for storyboard or video generation.
+The smoke test intentionally stops at `Planning`, so judges can verify the deployed system without paying for storyboard or video generation. It runs through the public frontend URL because the backend is private in the hardened cloud deployment.
 
 For a full cloud walkthrough, see [`docs/google-cloud-deployment.md`](docs/google-cloud-deployment.md).
 
@@ -125,7 +125,7 @@ Detailed setup and deploy instructions are in [`docs/google-cloud-deployment.md`
 After deployment, you can run a low-cost live smoke test that avoids image and video generation:
 
 ```bash
-BACKEND_URL=https://your-backend-url ./scripts/smoke_test_cloud.sh
+APP_URL=https://your-frontend-url ./scripts/smoke_test_cloud.sh
 ```
 
 The script creates a project, uploads the fixture audio in [`tests/fixtures/test_audio.mp3`](tests/fixtures/test_audio.mp3), forces the `uploaded_track` path, runs only through Planning, and verifies the deployed backend responds with a saved shot list.

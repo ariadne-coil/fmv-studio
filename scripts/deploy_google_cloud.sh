@@ -28,6 +28,7 @@ terraform -chdir="${TF_DIR}" apply -auto-approve \
 REPOSITORY_URL="$(terraform -chdir="${TF_DIR}" output -raw artifact_registry_repository_url)"
 BACKEND_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw backend_service_account_email)"
 FRONTEND_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw frontend_service_account_email)"
+TASKS_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw tasks_service_account_email)"
 INTERNAL_TASK_TOKEN="$(terraform -chdir="${TF_DIR}" output -raw internal_task_token)"
 
 BACKEND_IMAGE="${REPOSITORY_URL}/backend:${IMAGE_TAG}"
@@ -43,13 +44,13 @@ gcloud builds submit "${ROOT_DIR}/backend" \
 gcloud run deploy "${BACKEND_SERVICE_NAME}" \
   --image "${BACKEND_IMAGE}" \
   --region "${REGION}" \
-  --allow-unauthenticated \
+  --no-allow-unauthenticated \
   --service-account "${BACKEND_SERVICE_ACCOUNT}" \
   --concurrency 1 \
   --cpu 2 \
   --memory 4Gi \
   --timeout 3600 \
-  --set-env-vars "FMV_GENAI_BACKEND=vertex,FMV_STORAGE_BACKEND=gcs,FMV_GCS_BUCKET=${STORAGE_BUCKET_NAME},FMV_GCP_PROJECT=${PROJECT_ID},FMV_VERTEX_LOCATION=${VERTEX_LOCATION},FMV_VERTEX_MEDIA_LOCATION=${VERTEX_MEDIA_LOCATION},FMV_JOB_DRIVER=cloud_tasks,FMV_CLOUD_TASKS_LOCATION=${REGION},FMV_CLOUD_TASKS_QUEUE=${TASKS_QUEUE_NAME},FMV_INTERNAL_TASK_TOKEN=${INTERNAL_TASK_TOKEN}"
+  --set-env-vars "FMV_GENAI_BACKEND=vertex,FMV_STORAGE_BACKEND=gcs,FMV_GCS_BUCKET=${STORAGE_BUCKET_NAME},FMV_GCP_PROJECT=${PROJECT_ID},FMV_VERTEX_LOCATION=${VERTEX_LOCATION},FMV_VERTEX_MEDIA_LOCATION=${VERTEX_MEDIA_LOCATION},FMV_JOB_DRIVER=cloud_tasks,FMV_CLOUD_TASKS_LOCATION=${REGION},FMV_CLOUD_TASKS_QUEUE=${TASKS_QUEUE_NAME},FMV_INTERNAL_TASK_TOKEN=${INTERNAL_TASK_TOKEN},FMV_CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL=${TASKS_SERVICE_ACCOUNT}"
 
 BACKEND_URL="$(gcloud run services describe "${BACKEND_SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
 
@@ -57,9 +58,19 @@ gcloud run services update "${BACKEND_SERVICE_NAME}" \
   --region "${REGION}" \
   --update-env-vars "FMV_BASE_URL=${BACKEND_URL}" >/dev/null
 
+gcloud run services add-iam-policy-binding "${BACKEND_SERVICE_NAME}" \
+  --region "${REGION}" \
+  --member "serviceAccount:${FRONTEND_SERVICE_ACCOUNT}" \
+  --role "roles/run.invoker" >/dev/null
+
+gcloud run services add-iam-policy-binding "${BACKEND_SERVICE_NAME}" \
+  --region "${REGION}" \
+  --member "serviceAccount:${TASKS_SERVICE_ACCOUNT}" \
+  --role "roles/run.invoker" >/dev/null
+
 gcloud builds submit "${ROOT_DIR}/frontend" \
   --config "${ROOT_DIR}/infra/cloudbuild/frontend.yaml" \
-  --substitutions "_IMAGE=${FRONTEND_IMAGE},_NEXT_PUBLIC_API_ORIGIN=${BACKEND_URL}"
+  --substitutions "_IMAGE=${FRONTEND_IMAGE}"
 
 gcloud run deploy "${FRONTEND_SERVICE_NAME}" \
   --image "${FRONTEND_IMAGE}" \
@@ -68,7 +79,7 @@ gcloud run deploy "${FRONTEND_SERVICE_NAME}" \
   --service-account "${FRONTEND_SERVICE_ACCOUNT}" \
   --cpu 1 \
   --memory 1Gi \
-  --set-env-vars "NEXT_PUBLIC_API_ORIGIN=${BACKEND_URL}"
+  --set-env-vars "FMV_BACKEND_ORIGIN=${BACKEND_URL}"
 
 FRONTEND_URL="$(gcloud run services describe "${FRONTEND_SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
 

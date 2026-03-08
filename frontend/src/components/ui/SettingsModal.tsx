@@ -7,12 +7,12 @@ import {
   DEFAULT_MODELS,
   DEFAULT_PREFERENCES,
   getMusicProviderOption,
-  SHOULD_SHOW_API_KEY_SETTINGS,
   getStoredApiKey,
   getStoredModels,
   getStoredPreferences,
   MUSIC_PROVIDER_OPTIONS,
   normalizeMusicProviderId,
+  shouldShowApiKeySettings,
   setStoredApiKey,
   setStoredModels,
   setStoredPreferences,
@@ -29,6 +29,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [preferences, setPreferences] = useState<AppPreferences>(DEFAULT_PREFERENCES);
   const [saved, setSaved] = useState(false);
   const [visible, setVisible] = useState(false);
+  const [showApiKeySettings, setShowApiKeySettings] = useState(false);
   const selectedMusicProvider = getMusicProviderOption(models.music);
 
   useEffect(() => {
@@ -36,6 +37,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       setApiKey(getStoredApiKey());
       setModels(getStoredModels());
       setPreferences(getStoredPreferences());
+      setShowApiKeySettings(shouldShowApiKeySettings());
       setSaved(false);
     }
   }, [isOpen]);
@@ -73,7 +75,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           <button className="settings-close" onClick={onClose} aria-label="Close">✕</button>
         </div>
 
-        {SHOULD_SHOW_API_KEY_SETTINGS && (
+        {showApiKeySettings && (
           <div className="settings-section">
             <label className="settings-label">
               Gemini API Key
@@ -279,7 +281,7 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
         {/* Footer */}
         <div className="settings-footer">
-          {SHOULD_SHOW_API_KEY_SETTINGS ? (
+          {showApiKeySettings ? (
             <a
               href="https://aistudio.google.com/apikey"
               target="_blank"

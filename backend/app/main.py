@@ -17,13 +17,20 @@ for env_path in (ENV_FILE, LEGACY_ENV_FILE):
 app = FastAPI(title="FMV Studio Backend")
 get_storage_backend().ensure_ready()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], # Allow nextjs frontend
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configured_cors_origins = [
+    origin.strip()
+    for origin in (os.getenv("FMV_CORS_ORIGINS") or "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if origin.strip()
+]
+
+if configured_cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=configured_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 app.include_router(project_router, prefix="/api")
 app.include_router(media_router)

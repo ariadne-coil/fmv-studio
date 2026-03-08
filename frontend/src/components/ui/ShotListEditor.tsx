@@ -95,7 +95,7 @@ export default function ShotListEditor({ clips, projectId, expandedShotId, onCha
         }
 
         try {
-            const res = await fetch(`http://localhost:8000/api/projects/${projectId}/fill-clip`, {
+            const res = await fetch(`/api/projects/${projectId}/fill-clip`, {
                 method: "POST",
                 headers,
                 body: JSON.stringify({

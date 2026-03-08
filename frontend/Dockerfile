@@ -7,8 +7,6 @@ RUN npm ci
 FROM node:22-bookworm-slim AS builder
 
 WORKDIR /app
-ARG NEXT_PUBLIC_API_ORIGIN=http://localhost:8000
-ENV NEXT_PUBLIC_API_ORIGIN=${NEXT_PUBLIC_API_ORIGIN}
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .

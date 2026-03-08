@@ -5,6 +5,7 @@ locals {
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "cloudtasks.googleapis.com",
+    "iamcredentials.googleapis.com",
     "run.googleapis.com",
     "storage.googleapis.com",
   ])
@@ -66,6 +67,11 @@ resource "google_service_account" "frontend_runtime" {
   display_name = "FMV Studio Frontend Runtime"
 }
 
+resource "google_service_account" "tasks_invoker" {
+  account_id   = "fmv-tasks-invoker"
+  display_name = "FMV Studio Cloud Tasks Invoker"
+}
+
 resource "google_project_iam_member" "backend_vertex_user" {
   project = var.project_id
   role    = "roles/aiplatform.user"
@@ -88,6 +94,12 @@ resource "google_project_iam_member" "frontend_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
   member  = "serviceAccount:${google_service_account.frontend_runtime.email}"
+}
+
+resource "google_service_account_iam_member" "backend_can_act_as_tasks_invoker" {
+  service_account_id = google_service_account.tasks_invoker.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.backend_runtime.email}"
 }
 
 resource "google_storage_bucket_iam_member" "backend_bucket_admin" {

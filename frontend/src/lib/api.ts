@@ -97,17 +97,13 @@ export interface ProjectRunStatus {
     driver?: string | null;
 }
 
-export const API_ORIGIN = (process.env.NEXT_PUBLIC_API_ORIGIN || "http://localhost:8000").trim();
-const API_URL = `${API_ORIGIN}/api`;
+const API_URL = "/api";
+const LOCAL_APP_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
-export const SHOULD_SHOW_API_KEY_SETTINGS = (() => {
-    try {
-        const origin = new URL(API_ORIGIN);
-        return ["localhost", "127.0.0.1", "::1"].includes(origin.hostname);
-    } catch {
-        return API_ORIGIN.includes("localhost") || API_ORIGIN.includes("127.0.0.1");
-    }
-})();
+export function shouldShowApiKeySettings(): boolean {
+    if (typeof window === "undefined") return false;
+    return LOCAL_APP_HOSTS.has(window.location.hostname);
+}
 
 function isNetworkError(error: unknown): boolean {
     return error instanceof TypeError && error.message === "Failed to fetch";
@@ -115,7 +111,7 @@ function isNetworkError(error: unknown): boolean {
 
 function toApiError(message: string, error: unknown): Error {
     if (isNetworkError(error)) {
-        return new Error(`Cannot reach the backend API at ${API_ORIGIN}. Start the backend server and retry.`);
+        return new Error("Cannot reach the FMV Studio API. If you are running locally, make sure both the frontend and backend servers are started.");
     }
     if (error instanceof Error) {
         return error;
@@ -149,7 +145,10 @@ export function toBackendAssetUrl(pathOrUrl?: string): string {
 
     const normalized = pathOrUrl.replaceAll("\\", "/");
     const basePath = normalized.startsWith("/") ? normalized : `/${normalized}`;
-    return new URL(basePath, `${API_ORIGIN}/`).toString();
+    if (typeof window !== "undefined") {
+        return new URL(basePath, window.location.origin).toString();
+    }
+    return basePath;
 }
 
 // ── API Key localStorage helpers ──────────────────────────────────────────────

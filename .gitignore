@@ -7,7 +7,7 @@
 .terraform.lock.hcl
 *.tfstate
 *.tfstate.*
-projects/
+/projects/
 
 backend/.env
 backend/venv/

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BACKEND_URL="${BACKEND_URL:-${1:-}}"
-if [[ -z "${BACKEND_URL}" ]]; then
-  echo "Usage: BACKEND_URL=https://... $0"
+APP_URL="${APP_URL:-${FRONTEND_URL:-${BACKEND_URL:-${1:-}}}}"
+if [[ -z "${APP_URL}" ]]; then
+  echo "Usage: APP_URL=https://... $0"
   exit 1
 fi
 
@@ -71,12 +71,12 @@ print(json.dumps(payload))
 PY
 
 echo "Checking backend availability..."
-curl -fsS "${BACKEND_URL%/}/openapi.json" > /dev/null
+curl -fsS "${APP_URL%/}/api/health" > /dev/null
 
 echo "Creating project ${PROJECT_ID}..."
 curl -fsS \
   -X POST \
-  "${BACKEND_URL%/}/api/projects" \
+  "${APP_URL%/}/api/projects" \
   -H "Content-Type: application/json" \
   --data @"${CREATE_PAYLOAD}" > /dev/null
 
@@ -84,14 +84,14 @@ echo "Uploading fixture audio..."
 UPLOAD_RESPONSE="$(
   curl -fsS \
     -X POST \
-    "${BACKEND_URL%/}/api/projects/${PROJECT_ID}/upload" \
+    "${APP_URL%/}/api/projects/${PROJECT_ID}/upload" \
     -F "file=@${FIXTURE_PATH};type=audio/mpeg"
 )"
 UPLOAD_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<< "${UPLOAD_RESPONSE}")"
 export UPLOAD_URL
 
 echo "Verifying uploaded media route..."
-curl -fsS "${BACKEND_URL%/}${UPLOAD_URL}" -o /dev/null -D "${HEADERS_FILE}"
+curl -fsS "${APP_URL%/}${UPLOAD_URL}" -o /dev/null -D "${HEADERS_FILE}"
 
 python3 > "${UPDATE_PAYLOAD}" <<'PY'
 import json
@@ -119,19 +119,19 @@ PY
 echo "Saving uploaded-track state..."
 curl -fsS \
   -X PUT \
-  "${BACKEND_URL%/}/api/projects/${PROJECT_ID}" \
+  "${APP_URL%/}/api/projects/${PROJECT_ID}" \
   -H "Content-Type: application/json" \
   --data @"${UPDATE_PAYLOAD}" > /dev/null
 
 echo "Running a planning-only smoke pass..."
 curl -fsS \
   -X POST \
-  "${BACKEND_URL%/}/api/projects/${PROJECT_ID}/run" \
+  "${APP_URL%/}/api/projects/${PROJECT_ID}/run" \
   -H "X-Orchestrator-Model: ${ORCHESTRATOR_MODEL}" \
   -H "X-Stage-Voice-Briefs-Enabled: false" \
   > "${RUN_RESPONSE}"
 
-curl -fsS "${BACKEND_URL%/}/api/projects" > "${LIST_RESPONSE}"
+curl -fsS "${APP_URL%/}/api/projects" > "${LIST_RESPONSE}"
 
 python3 - <<'PY'
 import json

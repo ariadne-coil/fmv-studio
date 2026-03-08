@@ -22,7 +22,7 @@ The backend Cloud Run deploy command explicitly sets:
 - `FMV_STORAGE_BACKEND=gcs`
 - `FMV_JOB_DRIVER=cloud_tasks`
 
-Those environment variables are the runtime switch that moves the backend off local disk / local jobs and onto Google Cloud services.
+Those environment variables are the runtime switch that moves the backend off local disk / local jobs and onto Google Cloud services. The deploy script also hardens the backend by removing anonymous access and granting `roles/run.invoker` only to the frontend service account and the Cloud Tasks service account.
 
 ### 2. Terraform infrastructure
 

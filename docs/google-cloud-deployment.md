@@ -32,7 +32,7 @@ Cloud Build configs live in [`infra/cloudbuild`](../infra/cloudbuild):
 - [`backend.yaml`](../infra/cloudbuild/backend.yaml)
 - [`frontend.yaml`](../infra/cloudbuild/frontend.yaml)
 
-The frontend build injects `NEXT_PUBLIC_API_ORIGIN` at build time so the deployed UI points at the Cloud Run backend.
+The frontend container is runtime-configured with `FMV_BACKEND_ORIGIN` so its server-side proxy routes know how to reach the private Cloud Run backend.
 
 ## One-Command Deploy
 
@@ -73,6 +73,18 @@ That means:
 - project JSON and generated media persist to GCS instead of local disk
 - long-running storyboard/filming runs are dispatched through Cloud Tasks instead of in-process asyncio jobs
 
+## Backend Hardening
+
+The cloud deployment keeps the frontend public but makes the backend private.
+
+- the backend Cloud Run service is deployed without anonymous access
+- the frontend talks to the backend through same-origin Next.js proxy routes
+- the frontend runtime service account receives `roles/run.invoker` on the backend service
+- Cloud Tasks uses a dedicated service account with `roles/run.invoker` on the backend service
+- the internal task endpoint still requires `X-Internal-Task-Token` as a second check
+
+This keeps public users on the frontend URL while removing direct anonymous access to the backend API.
+
 ## Local Testing
 
 The same codebase still supports local mode:
@@ -92,5 +104,6 @@ Then set the relevant environment variables from [`.env.example`](../.env.exampl
 ## Notes
 
 - The backend serves media through `/projects/...` regardless of whether the underlying storage is local disk or GCS.
+- In cloud mode, media and API traffic flow through the frontend's same-origin proxy routes so the private backend URL does not need to be exposed to browsers.
 - The current official cloud music path is instrumental-only.
 - Frontend and backend are deployed as separate Cloud Run services.
