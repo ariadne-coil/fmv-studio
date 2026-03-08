@@ -54,6 +54,8 @@ npm install
 npm run dev
 ```
 
+In the current Windows + WSL local setup, `npm run dev` uses webpack mode by default for compatibility.
+
 4. Open:
 
 ```text
