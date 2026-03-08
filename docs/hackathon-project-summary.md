@@ -2,7 +2,7 @@
 
 ## What FMV Studio Does
 
-FMV Studio is an AI-assisted music video production environment. It guides a user from an initial song idea to a finished edited video through a staged workflow:
+FMV Studio is an AI-assisted music video production environment. It is designed to compress the time required to produce a high-quality AI-generated music video from days of manual prompt chaining, file passing, and tool switching down to minutes inside one guided workflow. Instead of forcing the user to juggle separate tools for music generation, planning, image generation, video generation, review, and editing, FMV Studio keeps the whole creative process in one place and moves the user from an initial song idea to a finished edited video through a staged workflow:
 
 1. `Input`: provide concept, screenplay direction, audio, and reference assets.
 2. `Music`: generate or import the song and align the creative direction.
