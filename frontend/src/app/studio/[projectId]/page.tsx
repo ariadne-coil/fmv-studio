@@ -1,11 +1,13 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import { GlassCard } from "@/components/ui/GlassCard";
+import LiveDirectorPanel from "@/components/ui/LiveDirectorPanel";
 import ProductionTimelineEditor from "@/components/ui/ProductionTimelineEditor";
 import SettingsModal from "@/components/ui/SettingsModal";
 import ShotListEditor from "@/components/ui/ShotListEditor";
-import { Loader2, Music, ImageIcon, Play, Pause, SkipBack, SkipForward, Wand2, X, AlertCircle, Save, Video, Settings, ListPlus, Maximize2, GripVertical } from 'lucide-react';
+import { Loader2, Music, ImageIcon, Play, Pause, SkipBack, SkipForward, Wand2, X, AlertCircle, Save, Video, Settings, ListPlus, Maximize2, GripVertical, Home } from 'lucide-react';
 import { api, getMusicProviderOption, getStoredModels, getStoredPreferences, isManualImportMusicProvider, normalizeMusicProviderId, ProductionTimelineFragment, ProjectRunStatus, ProjectState, toBackendAssetUrl, VideoClip } from "@/lib/api";
 
 const MIN_PRODUCTION_FRAGMENT_DURATION = 0.25;
@@ -123,6 +125,7 @@ function buildMusicPromptPackageForClipboard(project: ProjectState): string {
 }
 
 export default function StudioPage({ params }: { params: Promise<{ projectId: string }> }) {
+    const router = useRouter();
     const { projectId } = React.use(params);
     const [project, setProject] = useState<ProjectState | null>(null);
     const [loadError, setLoadError] = useState<string | null>(null);
@@ -135,6 +138,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const [activeMediaSwapKey, setActiveMediaSwapKey] = useState<string | null>(null);
     const [isExportingResources, setIsExportingResources] = useState(false);
     const [isRegeneratingMusic, setIsRegeneratingMusic] = useState(false);
+    const [isDirectorProcessing, setIsDirectorProcessing] = useState(false);
     const [zoomedStoryboardImage, setZoomedStoryboardImage] = useState<{ url: string; label: string } | null>(null);
     const [musicStageCurrentTime, setMusicStageCurrentTime] = useState(0);
     const [musicStageDuration, setMusicStageDuration] = useState(0);
@@ -188,6 +192,35 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const displayStage = viewedStage || (project?.current_stage ?? 'input');
     const displayStageIndex = stageMap[displayStage] ?? 0;
     const isCurrentDisplayedStage = displayStage === (project?.current_stage ?? 'input');
+    const productionTimeline = project
+        ? normalizeProductionTimeline(
+            project.production_timeline.length > 0
+                ? project.production_timeline
+                : buildDefaultProductionTimeline(project.timeline)
+        )
+        : [];
+    const liveDirectorFocusLabel = (() => {
+        if (!project) return null;
+        if (displayStage === 'planning' && selectedPlanningShotId) {
+            const shotIndex = project.timeline.findIndex((clip) => clip.id === selectedPlanningShotId);
+            return shotIndex >= 0 ? `Shot ${shotIndex + 1}` : "Selected shot";
+        }
+        if (displayStage === 'storyboarding' && selectedPlanningShotId) {
+            const shotIndex = project.timeline.findIndex((clip) => clip.id === selectedPlanningShotId);
+            return shotIndex >= 0 ? `Shot ${shotIndex + 1}` : "Selected frame";
+        }
+        if (displayStage === 'filming' && selectedFilmingClipId) {
+            const shotIndex = project.timeline.findIndex((clip) => clip.id === selectedFilmingClipId);
+            return shotIndex >= 0 ? `Clip ${shotIndex + 1}` : "Selected clip";
+        }
+        if (displayStage === 'production' && selectedProductionFragmentId) {
+            const fragment = productionTimeline.find((item) => item.id === selectedProductionFragmentId);
+            if (!fragment) return "Selected edit";
+            const shotIndex = project.timeline.findIndex((clip) => clip.id === fragment.source_clip_id);
+            return shotIndex >= 0 ? `Edit from Shot ${shotIndex + 1}` : "Selected edit";
+        }
+        return null;
+    })();
     const isProductionDisplay = displayStage === 'production';
     const stageSummary = project?.stage_summaries?.[displayStage] ?? null;
     const stageVoiceBriefsEnabled = getStoredPreferences().stageVoiceBriefsEnabled;
@@ -199,13 +232,6 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         !!project.music_url
         || project.timeline.some((clip) => !!clip.video_url || !!clip.image_url)
     );
-    const productionTimeline = project
-        ? normalizeProductionTimeline(
-            project.production_timeline.length > 0
-                ? project.production_timeline
-                : buildDefaultProductionTimeline(project.timeline)
-        )
-        : [];
     const productionDuration = productionTimeline.reduce(
         (maxDuration, fragment) => Math.max(maxDuration, fragment.timeline_start + fragment.duration),
         0
@@ -1307,6 +1333,53 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         }
     };
 
+    const handleLiveDirector = async (message: string, source: "text" | "voice") => {
+        if (!project || isBusy || isDirectorProcessing) return;
+
+        try {
+            setIsDirectorProcessing(true);
+            const response = await api.liveDirector(project.project_id, {
+                message,
+                display_stage: displayStage as ProjectState["current_stage"],
+                selected_clip_id: (
+                    displayStage === 'planning' || displayStage === 'storyboarding'
+                        ? selectedPlanningShotId
+                        : displayStage === 'filming'
+                            ? selectedFilmingClipId
+                            : null
+                ) ?? undefined,
+                selected_fragment_id: (
+                    displayStage === 'production'
+                        ? selectedProductionFragmentId
+                        : null
+                ) ?? undefined,
+                source,
+            });
+
+            setProject(response.project);
+            setViewedStage(null);
+
+            if (response.target_clip_id) {
+                if (response.stage === 'planning' || response.stage === 'storyboarding') {
+                    setSelectedPlanningShotId(response.target_clip_id);
+                }
+                if (response.stage === 'filming') {
+                    setSelectedFilmingClipId(response.target_clip_id);
+                }
+            }
+
+            if (response.target_fragment_id && response.stage === 'production') {
+                setSelectedProductionFragmentId(response.target_fragment_id);
+                setSelectedProductionTrack("audio");
+            }
+        } catch (error) {
+            console.error("Live Director Mode failed", error);
+            alert(error instanceof Error ? error.message : "Live Director Mode failed.");
+        } finally {
+            setIsDirectorProcessing(false);
+        }
+    };
+
     const handleRedo = async () => {
         if (!project || isBusy) return;
 
@@ -1437,6 +1510,13 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                     >
                         <Save className="w-4 h-4" />
                         Save Project
+                    </button>
+                    <button
+                        title="Back to Projects"
+                        onClick={() => router.push("/")}
+                        className="p-2 rounded hover:bg-surface-hover text-surface-border hover:text-white transition-colors"
+                    >
+                        <Home className="w-5 h-5" />
                     </button>
                     <button
                         title="Settings"
@@ -1819,8 +1899,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                     {project.timeline.map((clip, index) => (
                                         <div
                                             key={clip.id}
-                                            className="relative p-3 bg-surface/40 backdrop-blur border border-surface-border rounded-xl cursor-grab active:cursor-grabbing hover:ring-1 ring-primary/30 transition-shadow"
+                                            className={`relative p-3 bg-surface/40 backdrop-blur border rounded-xl cursor-grab active:cursor-grabbing transition-shadow ${selectedPlanningShotId === clip.id
+                                                ? 'border-primary ring-2 ring-primary/40 bg-primary/10'
+                                                : 'border-surface-border hover:ring-1 ring-primary/30'
+                                                }`}
                                             draggable
+                                            onClick={() => setSelectedPlanningShotId(clip.id)}
                                             onDragStart={(e) => {
                                                 dragSrc.current = index;
                                                 e.dataTransfer.effectAllowed = 'move';
@@ -2771,6 +2855,14 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                     </div>
                 </div>
             )}
+            <LiveDirectorPanel
+                currentStage={displayStage}
+                focusLabel={liveDirectorFocusLabel}
+                turns={project.director_log ?? []}
+                isBusy={isBusy}
+                isProcessing={isDirectorProcessing}
+                onSubmit={handleLiveDirector}
+            />
         </div >
     );
 }

@@ -10,12 +10,14 @@ import {
   getStoredApiKey,
   getStoredModels,
   getStoredPreferences,
+  IMAGE_RESOLUTION_OPTIONS,
   MUSIC_PROVIDER_OPTIONS,
   normalizeMusicProviderId,
   shouldShowApiKeySettings,
   setStoredApiKey,
   setStoredModels,
   setStoredPreferences,
+  VIDEO_RESOLUTION_OPTIONS,
 } from "@/lib/api";
 
 interface SettingsModalProps {
@@ -241,6 +243,71 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   Warning: lyrics will not be used with this instrumental-only provider. Only style and song length affect generation.
                 </p>
               )}
+            </div>
+          </div>
+        </div>
+
+        <div className="settings-section mt-6">
+          <label className="settings-label">
+            Output Resolution
+          </label>
+          <p className="settings-description">
+            These save automatically and apply to future storyboard and filming runs. Aspect ratio stays fixed at <code>16:9</code>.
+          </p>
+
+          <div className="space-y-4">
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-white/70">Storyboard Image Resolution</label>
+              <select
+                className="w-full bg-surface-hover border border-surface-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-primary transition-colors appearance-none"
+                value={preferences.imageResolution}
+                aria-label="Storyboard Image Resolution"
+                onChange={(e) => {
+                  const nextPreferences = {
+                    ...preferences,
+                    imageResolution: e.target.value as AppPreferences["imageResolution"],
+                  };
+                  setPreferences(nextPreferences);
+                  setStoredPreferences(nextPreferences);
+                  setSaved(false);
+                }}
+              >
+                {IMAGE_RESOLUTION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-surface-border">
+                {IMAGE_RESOLUTION_OPTIONS.find((option) => option.value === preferences.imageResolution)?.description}
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-white/70">Filming Video Resolution</label>
+              <select
+                className="w-full bg-surface-hover border border-surface-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-primary transition-colors appearance-none"
+                value={preferences.videoResolution}
+                aria-label="Filming Video Resolution"
+                onChange={(e) => {
+                  const nextPreferences = {
+                    ...preferences,
+                    videoResolution: e.target.value as AppPreferences["videoResolution"],
+                  };
+                  setPreferences(nextPreferences);
+                  setStoredPreferences(nextPreferences);
+                  setSaved(false);
+                }}
+              >
+                {VIDEO_RESOLUTION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-surface-border">
+                {VIDEO_RESOLUTION_OPTIONS.find((option) => option.value === preferences.videoResolution)?.description}
+              </p>
             </div>
           </div>
         </div>

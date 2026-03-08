@@ -50,6 +50,16 @@ export interface StageSummary {
     generated_at: string;
 }
 
+export interface DirectorTurn {
+    id: string;
+    role: "user" | "agent";
+    text: string;
+    stage: string;
+    created_at: string;
+    source?: string | null;
+    applied_changes: string[];
+}
+
 export interface ProjectState {
     project_id: string;
     name: string;
@@ -79,6 +89,7 @@ export interface ProjectState {
     last_error?: string;
     active_run?: ActivePipelineRun | null;
     stage_summaries: Record<string, StageSummary>;
+    director_log: DirectorTurn[];
 }
 
 export interface ProjectSummary {
@@ -95,6 +106,23 @@ export interface ProjectRunStatus {
     started_at?: string | null;
     status?: 'queued' | 'running' | null;
     driver?: string | null;
+}
+
+export interface LiveDirectorRequest {
+    message: string;
+    display_stage?: AgentStage;
+    selected_clip_id?: string | null;
+    selected_fragment_id?: string | null;
+    source?: "text" | "voice";
+}
+
+export interface LiveDirectorResponse {
+    project: ProjectState;
+    reply_text: string;
+    applied_changes: string[];
+    target_clip_id?: string | null;
+    target_fragment_id?: string | null;
+    stage: AgentStage;
 }
 
 const API_URL = "/api";
@@ -242,6 +270,40 @@ export function isManualImportMusicProvider(value?: string | null): boolean {
 
 export interface AppPreferences {
     stageVoiceBriefsEnabled: boolean;
+    imageResolution: ImageResolution;
+    videoResolution: VideoResolution;
+}
+
+export type ImageResolution = "1K" | "2K" | "4K";
+export type VideoResolution = "720p" | "1080p";
+
+export interface ResolutionOption<T extends string> {
+    value: T;
+    label: string;
+    description: string;
+}
+
+export const IMAGE_RESOLUTION_OPTIONS: ResolutionOption<ImageResolution>[] = [
+    { value: "1K", label: "1K", description: "Fastest and lowest-cost storyboard frames." },
+    { value: "2K", label: "2K", description: "Sharper storyboard frames with a moderate cost increase." },
+    { value: "4K", label: "4K", description: "Maximum storyboard detail for stronger source frames." },
+];
+
+export const VIDEO_RESOLUTION_OPTIONS: ResolutionOption<VideoResolution>[] = [
+    { value: "720p", label: "720p", description: "Faster Veo generation with lower output detail." },
+    { value: "1080p", label: "1080p", description: "Higher-quality Veo renders at higher cost." },
+];
+
+export function normalizeImageResolution(value?: string | null): ImageResolution {
+    const normalized = (value ?? "").trim().toUpperCase();
+    if (normalized === "1K" || normalized === "2K" || normalized === "4K") return normalized;
+    return "4K";
+}
+
+export function normalizeVideoResolution(value?: string | null): VideoResolution {
+    const normalized = (value ?? "").trim().toLowerCase();
+    if (normalized === "720p" || normalized === "1080p") return normalized;
+    return "1080p";
 }
 
 export const DEFAULT_MODELS: AppModels = {
@@ -290,6 +352,8 @@ export function setStoredModels(models: AppModels): void {
 
 export const DEFAULT_PREFERENCES: AppPreferences = {
     stageVoiceBriefsEnabled: true,
+    imageResolution: "4K",
+    videoResolution: "1080p",
 };
 
 export function getStoredPreferences(): AppPreferences {
@@ -301,6 +365,8 @@ export function getStoredPreferences(): AppPreferences {
             return {
                 ...DEFAULT_PREFERENCES,
                 ...parsed,
+                imageResolution: normalizeImageResolution(parsed?.imageResolution),
+                videoResolution: normalizeVideoResolution(parsed?.videoResolution),
             };
         }
     } catch (e) {
@@ -424,7 +490,9 @@ export const api = {
             "X-Critic-Model": models.critic,
             "X-Text-Model": models.orchestrator,
             "X-Image-Model": models.image,
+            "X-Image-Resolution": preferences.imageResolution,
             "X-Video-Model": models.video,
+            "X-Video-Resolution": preferences.videoResolution,
             "X-Music-Model": models.music,
             "X-Stage-Voice-Briefs-Enabled": String(preferences.stageVoiceBriefsEnabled),
         };
@@ -452,7 +520,9 @@ export const api = {
             "X-Critic-Model": models.critic,
             "X-Text-Model": models.orchestrator,
             "X-Image-Model": models.image,
+            "X-Image-Resolution": preferences.imageResolution,
             "X-Video-Model": models.video,
+            "X-Video-Resolution": preferences.videoResolution,
             "X-Music-Model": models.music,
             "X-Stage-Voice-Briefs-Enabled": String(preferences.stageVoiceBriefsEnabled),
         };
@@ -491,6 +561,31 @@ export const api = {
             return res.json();
         } catch (error) {
             throw toApiError("Failed to revert pipeline", error);
+        }
+    },
+
+    async liveDirector(id: string, request: LiveDirectorRequest): Promise<LiveDirectorResponse> {
+        const key = getStoredApiKey();
+        const models = getStoredModels();
+        const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            "X-Orchestrator-Model": models.orchestrator,
+            "X-Text-Model": models.orchestrator,
+        };
+        if (key) headers["X-API-Key"] = key;
+
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/live-director`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify(request),
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Live Director Mode failed"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Live Director Mode failed", error);
         }
     }
 }

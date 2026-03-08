@@ -5,7 +5,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Header, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.agent.models import ProjectState, AgentStage, PipelineRunState, PipelineRunStatus
 from app.agent.graph import FMVAgentPipeline
@@ -50,7 +50,9 @@ class ExecutePipelineRunRequest(BaseModel):
     critic_model: Optional[str] = None
     text_model: Optional[str] = None
     image_model: Optional[str] = None
+    image_resolution: Optional[str] = None
     video_model: Optional[str] = None
+    video_resolution: Optional[str] = None
     music_model: Optional[str] = None
     stage_voice_briefs_enabled: Optional[bool] = None
 
@@ -288,7 +290,9 @@ async def _execute_pipeline_run(
     orchestrator_model: Optional[str],
     critic_model: Optional[str],
     image_model: Optional[str],
+    image_resolution: Optional[str],
     video_model: Optional[str],
+    video_resolution: Optional[str],
     music_model: Optional[str],
     stage_voice_briefs_enabled: Optional[bool],
 ) -> None:
@@ -304,7 +308,9 @@ async def _execute_pipeline_run(
             orchestrator_model=orchestrator_model,
             critic_model=critic_model,
             image_model=_resolve_image_provider(image_model, state),
+            image_size=image_resolution,
             video_model=_resolve_video_provider(video_model, state),
+            video_resolution=video_resolution,
             music_model=_resolve_music_provider(music_model, state),
             stage_voice_briefs_enabled=True if stage_voice_briefs_enabled is None else stage_voice_briefs_enabled,
             persist_state_callback=lambda next_state: _persist_pipeline_progress(project_id, run_id, next_state),
@@ -468,7 +474,9 @@ async def run_pipeline_step(
     x_critic_model: Optional[str] = Header(default=None, alias="X-Critic-Model"),
     x_text_model: Optional[str] = Header(default=None, alias="X-Text-Model"),
     x_image_model: Optional[str] = Header(default=None, alias="X-Image-Model"),
+    x_image_resolution: Optional[str] = Header(default=None, alias="X-Image-Resolution"),
     x_video_model: Optional[str] = Header(default=None, alias="X-Video-Model"),
+    x_video_resolution: Optional[str] = Header(default=None, alias="X-Video-Resolution"),
     x_music_model: Optional[str] = Header(default=None, alias="X-Music-Model"),
     x_stage_voice_briefs_enabled: Optional[str] = Header(default=None, alias="X-Stage-Voice-Briefs-Enabled"),
 ):
@@ -477,7 +485,9 @@ async def run_pipeline_step(
     x_critic_model = _coerce_optional_header(x_critic_model)
     x_text_model = _coerce_optional_header(x_text_model)
     x_image_model = _coerce_optional_header(x_image_model)
+    x_image_resolution = _coerce_optional_header(x_image_resolution)
     x_video_model = _coerce_optional_header(x_video_model)
+    x_video_resolution = _coerce_optional_header(x_video_resolution)
     x_music_model = _coerce_optional_header(x_music_model)
     stage_voice_briefs_enabled = _coerce_optional_bool_header(x_stage_voice_briefs_enabled)
 
@@ -489,7 +499,9 @@ async def run_pipeline_step(
         orchestrator_model=_resolve_orchestrator_model(x_orchestrator_model, x_text_model),
         critic_model=_resolve_critic_model(x_critic_model),
         image_model=_resolve_image_provider(x_image_model, state),
+        image_size=x_image_resolution,
         video_model=_resolve_video_provider(x_video_model, state),
+        video_resolution=x_video_resolution,
         music_model=_resolve_music_provider(x_music_model, state),
         stage_voice_briefs_enabled=True if stage_voice_briefs_enabled is None else stage_voice_briefs_enabled,
     )
@@ -507,7 +519,9 @@ async def run_pipeline_step_async(
     x_critic_model: Optional[str] = Header(default=None, alias="X-Critic-Model"),
     x_text_model: Optional[str] = Header(default=None, alias="X-Text-Model"),
     x_image_model: Optional[str] = Header(default=None, alias="X-Image-Model"),
+    x_image_resolution: Optional[str] = Header(default=None, alias="X-Image-Resolution"),
     x_video_model: Optional[str] = Header(default=None, alias="X-Video-Model"),
+    x_video_resolution: Optional[str] = Header(default=None, alias="X-Video-Resolution"),
     x_music_model: Optional[str] = Header(default=None, alias="X-Music-Model"),
     x_stage_voice_briefs_enabled: Optional[str] = Header(default=None, alias="X-Stage-Voice-Briefs-Enabled"),
 ):
@@ -516,7 +530,9 @@ async def run_pipeline_step_async(
     x_critic_model = _coerce_optional_header(x_critic_model)
     x_text_model = _coerce_optional_header(x_text_model)
     x_image_model = _coerce_optional_header(x_image_model)
+    x_image_resolution = _coerce_optional_header(x_image_resolution)
     x_video_model = _coerce_optional_header(x_video_model)
+    x_video_resolution = _coerce_optional_header(x_video_resolution)
     x_music_model = _coerce_optional_header(x_music_model)
     stage_voice_briefs_enabled = _coerce_optional_bool_header(x_stage_voice_briefs_enabled)
 
@@ -531,7 +547,9 @@ async def run_pipeline_step_async(
         orchestrator_model=_resolve_orchestrator_model(x_orchestrator_model, x_text_model),
         critic_model=_resolve_critic_model(x_critic_model),
         image_model=_resolve_image_provider(x_image_model, state),
+        image_size=x_image_resolution,
         video_model=_resolve_video_provider(x_video_model, state),
+        video_resolution=x_video_resolution,
         music_model=_resolve_music_provider(x_music_model, state),
         stage_voice_briefs_enabled=True if stage_voice_briefs_enabled is None else stage_voice_briefs_enabled,
     )
@@ -562,7 +580,9 @@ async def run_pipeline_step_async(
         critic_model=_resolve_critic_model(x_critic_model),
         text_model=x_text_model,
         image_model=x_image_model,
+        image_resolution=x_image_resolution,
         video_model=x_video_model,
+        video_resolution=x_video_resolution,
         music_model=x_music_model,
         stage_voice_briefs_enabled=stage_voice_briefs_enabled,
     )
@@ -579,7 +599,9 @@ async def run_pipeline_step_async(
                 orchestrator_model=_resolve_orchestrator_model(x_orchestrator_model, x_text_model),
                 critic_model=_resolve_critic_model(x_critic_model),
                 image_model=x_image_model,
+                image_resolution=x_image_resolution,
                 video_model=x_video_model,
+                video_resolution=x_video_resolution,
                 music_model=x_music_model,
                 stage_voice_briefs_enabled=stage_voice_briefs_enabled,
             ),
@@ -619,7 +641,9 @@ async def execute_pipeline_run_internal(
         orchestrator_model=_resolve_orchestrator_model(body.orchestrator_model, body.text_model),
         critic_model=_resolve_critic_model(body.critic_model),
         image_model=body.image_model,
+        image_resolution=body.image_resolution,
         video_model=body.video_model,
+        video_resolution=body.video_resolution,
         music_model=body.music_model,
         stage_voice_briefs_enabled=body.stage_voice_briefs_enabled,
     )
@@ -701,6 +725,23 @@ class FillClipRequest(BaseModel):
     duration: float
 
 
+class LiveDirectorRequest(BaseModel):
+    message: str
+    display_stage: Optional[AgentStage] = None
+    selected_clip_id: Optional[str] = None
+    selected_fragment_id: Optional[str] = None
+    source: str = "text"
+
+
+class LiveDirectorResponse(BaseModel):
+    project: ProjectState
+    reply_text: str
+    applied_changes: List[str] = Field(default_factory=list)
+    target_clip_id: Optional[str] = None
+    target_fragment_id: Optional[str] = None
+    stage: AgentStage
+
+
 @router.post("/projects/{project_id}/fill-clip")
 async def fill_clip(
     project_id: str,
@@ -757,5 +798,48 @@ Return ONLY the storyboard description text, no bullet points, no JSON, no extra
         ),
     )
     return {"storyboard_text": response.text.strip()}
+
+
+@router.post("/projects/{project_id}/live-director", response_model=LiveDirectorResponse)
+async def live_director_mode(
+    project_id: str,
+    body: LiveDirectorRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_orchestrator_model: Optional[str] = Header(default=None, alias="X-Orchestrator-Model"),
+    x_text_model: Optional[str] = Header(default=None, alias="X-Text-Model"),
+):
+    if _get_project_run_state(project_id):
+        raise HTTPException(status_code=409, detail="Live Director Mode is unavailable while a background pipeline run is active")
+
+    state = get_project(project_id)
+    pipeline = FMVAgentPipeline(
+        api_key=_coerce_optional_header(x_api_key),
+        orchestrator_model=_resolve_orchestrator_model(
+            _coerce_optional_header(x_orchestrator_model),
+            _coerce_optional_header(x_text_model),
+        ),
+    )
+
+    try:
+        updated_state, result = await pipeline.handle_live_director_mode(
+            state,
+            message=body.message,
+            display_stage=body.display_stage,
+            selected_clip_id=body.selected_clip_id,
+            selected_fragment_id=body.selected_fragment_id,
+            source=body.source,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Live Director Mode failed: {str(exc)}") from exc
+
+    _write_project(project_id, updated_state)
+    return LiveDirectorResponse(
+        project=updated_state,
+        reply_text=result["reply_text"],
+        applied_changes=result.get("applied_changes", []),
+        target_clip_id=result.get("target_clip_id"),
+        target_fragment_id=result.get("target_fragment_id"),
+        stage=updated_state.current_stage,
+    )
 
 

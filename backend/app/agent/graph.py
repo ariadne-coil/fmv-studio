@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, Any, List
 from urllib.parse import urlsplit
 from google import genai
-from .models import AgentStage, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
+from .models import AgentStage, DirectorTurn, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
 from app.image.providers import (
     DEFAULT_IMAGE_PROVIDER,
     get_image_provider,
@@ -83,13 +83,18 @@ FFMPEG = _find_ffmpeg()
 FFPROBE = _find_ffprobe(FFMPEG)
 VALID_VEO_DURATIONS = (4, 6, 8)
 TARGET_IMAGE_ASPECT_RATIO = "16:9"
-TARGET_IMAGE_SIZE = "4K"
-TARGET_IMAGE_WIDTH = 3840
-TARGET_IMAGE_HEIGHT = 2160
 TARGET_VIDEO_ASPECT_RATIO = "16:9"
-TARGET_VIDEO_RESOLUTION = "1080p"
-TARGET_VIDEO_WIDTH = 1920
-TARGET_VIDEO_HEIGHT = 1080
+DEFAULT_TARGET_IMAGE_SIZE = "4K"
+DEFAULT_TARGET_VIDEO_RESOLUTION = "1080p"
+IMAGE_SIZE_DIMENSIONS = {
+    "1K": (1024, 576),
+    "2K": (2048, 1152),
+    "4K": (3840, 2160),
+}
+VIDEO_RESOLUTION_DIMENSIONS = {
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+}
 STORYBOARD_PASS_SCORE = 8
 STORYBOARD_MAX_ATTEMPTS = 5
 STORYBOARD_MAX_REFERENCE_SHOTS = 6
@@ -122,6 +127,20 @@ def _normalize_text_model_name(model_name: str | None, default: str) -> str:
     if not normalized:
         return default
     return LEGACY_TEXT_MODEL_ALIASES.get(normalized, normalized)
+
+
+def _normalize_image_size_name(image_size: str | None) -> str:
+    normalized = (image_size or "").strip().upper()
+    if normalized in IMAGE_SIZE_DIMENSIONS:
+        return normalized
+    return DEFAULT_TARGET_IMAGE_SIZE
+
+
+def _normalize_video_resolution_name(video_resolution: str | None) -> str:
+    normalized = (video_resolution or "").strip().lower()
+    if normalized in VIDEO_RESOLUTION_DIMENSIONS:
+        return normalized
+    return DEFAULT_TARGET_VIDEO_RESOLUTION
 
 
 def _local_media_path(path_or_url: str | None) -> str | None:
@@ -663,7 +682,9 @@ class FMVAgentPipeline:
         critic_model: str = None,
         text_model: str = None,
         image_model: str = None,
+        image_size: str = None,
         video_model: str = None,
+        video_resolution: str = None,
         music_model: str = None,
         stage_voice_briefs_enabled: bool = True,
         persist_state_callback: Callable[[ProjectState], Any] | None = None,
@@ -683,8 +704,14 @@ class FMVAgentPipeline:
         self.text_model = self.orchestrator_model
         self.image_provider_id, self.image_model = resolve_image_provider_selection(image_model or DEFAULT_IMAGE_PROVIDER)
         self.image_provider = get_image_provider(self.image_provider_id)
+        self.image_aspect_ratio = TARGET_IMAGE_ASPECT_RATIO
+        self.image_size = _normalize_image_size_name(image_size)
+        self.image_width, self.image_height = IMAGE_SIZE_DIMENSIONS[self.image_size]
         self.video_provider_id, self.video_model = resolve_video_provider_selection(video_model or DEFAULT_VIDEO_PROVIDER)
         self.video_provider = get_video_provider(self.video_provider_id)
+        self.video_aspect_ratio = TARGET_VIDEO_ASPECT_RATIO
+        self.video_resolution = _normalize_video_resolution_name(video_resolution)
+        self.video_width, self.video_height = VIDEO_RESOLUTION_DIMENSIONS[self.video_resolution]
         self.music_provider_id = normalize_music_provider_id(music_model or DEFAULT_MUSIC_PROVIDER)
         self.music_provider = get_music_provider(self.music_provider_id)
         self.music_model = self.music_provider.definition.default_model
@@ -801,6 +828,34 @@ class FMVAgentPipeline:
         shot_number = shot_lookup.get(clip.id)
         return f"shot {shot_number}" if shot_number is not None else clip.id
 
+    def _resolve_director_shot_reference(self, state: ProjectState, message: str) -> tuple[int | None, str | None]:
+        match = re.search(r"\b(?:shot|scene|clip|frame)\s+(\d{1,3})\b", message, flags=re.IGNORECASE)
+        if not match:
+            return None, None
+
+        shot_number = int(match.group(1))
+        if shot_number < 1:
+            return None, None
+
+        shot_lookup = self._shot_lookup(state)
+        clip_id_by_shot_number = {
+            clip_number: clip_id
+            for clip_id, clip_number in shot_lookup.items()
+        }
+        return shot_number, clip_id_by_shot_number.get(shot_number)
+
+    def _resolve_director_fragment_reference_for_clip(self, state: ProjectState, clip_id: str | None) -> str | None:
+        if not clip_id:
+            return None
+
+        matching_fragments = sorted(
+            [fragment for fragment in state.production_timeline if fragment.source_clip_id == clip_id],
+            key=lambda fragment: fragment.timeline_start,
+        )
+        if len(matching_fragments) == 1:
+            return matching_fragments[0].id
+        return None
+
     def _latest_review_note(self, critiques: list[str]) -> str:
         if not critiques:
             return ""
@@ -817,6 +872,451 @@ class FMVAgentPipeline:
         if " | " in note:
             note = note.split(" | ", 1)[0].strip()
         return note.rstrip(". ")
+
+    def _append_director_turn(
+        self,
+        state: ProjectState,
+        *,
+        role: str,
+        text: str,
+        stage: AgentStage | str,
+        source: str | None = None,
+        applied_changes: list[str] | None = None,
+    ) -> None:
+        if not text.strip():
+            return
+
+        state.director_log.append(
+            DirectorTurn(
+                id=f"director_{uuid.uuid4().hex}",
+                role=role,
+                text=text.strip(),
+                stage=stage.value if isinstance(stage, AgentStage) else str(stage),
+                created_at=datetime.now(timezone.utc).isoformat(),
+                source=source,
+                applied_changes=applied_changes or [],
+            )
+        )
+        state.director_log = state.director_log[-24:]
+
+    def _trim_stage_summaries_to_stage(self, state: ProjectState, max_stage: AgentStage | str) -> None:
+        stage_value = max_stage.value if isinstance(max_stage, AgentStage) else str(max_stage)
+        stage_order = [stage.value for stage in AgentStage if stage != AgentStage.HALTED_FOR_REVIEW]
+        if stage_value not in stage_order:
+            return
+        max_index = stage_order.index(stage_value)
+        state.stage_summaries = {
+            stage_name: summary
+            for stage_name, summary in state.stage_summaries.items()
+            if stage_name in stage_order and stage_order.index(stage_name) <= max_index
+        }
+
+    def _clear_clip_storyboard_outputs(self, clip: VideoClip) -> None:
+        clip.image_prompt = None
+        clip.image_url = None
+        clip.image_critiques = []
+        clip.image_approved = False
+        clip.image_score = None
+        clip.image_reference_ready = False
+        clip.video_prompt = None
+        clip.video_url = None
+        clip.video_critiques = []
+        clip.video_score = None
+        clip.video_approved = False
+
+    def _clear_clip_video_outputs(self, clip: VideoClip, *, preserve_prompt: bool = True) -> None:
+        if not preserve_prompt:
+            clip.video_prompt = None
+        clip.video_url = None
+        clip.video_critiques = []
+        clip.video_score = None
+        clip.video_approved = False
+
+    def _recalculate_timeline_starts(self, state: ProjectState) -> None:
+        current_time = 0.0
+        for clip in state.timeline:
+            clip.duration = float(_closest_valid_veo_duration(clip.duration))
+            clip.timeline_start = current_time
+            current_time += clip.duration
+
+    def _reconcile_after_planning_edits(self, previous: ProjectState, state: ProjectState) -> None:
+        previous_clips = {clip.id: clip for clip in previous.timeline}
+        self._recalculate_timeline_starts(state)
+
+        for clip in state.timeline:
+            previous_clip = previous_clips.get(clip.id)
+            if previous_clip is None:
+                self._clear_clip_storyboard_outputs(clip)
+                continue
+
+            storyboard_changed = (previous_clip.storyboard_text or "").strip() != (clip.storyboard_text or "").strip()
+            duration_changed = round(float(previous_clip.duration), 3) != round(float(clip.duration), 3)
+            if storyboard_changed or duration_changed:
+                self._clear_clip_storyboard_outputs(clip)
+
+        state.production_timeline = []
+        state.final_video_url = None
+        state.last_error = None
+        self._trim_stage_summaries_to_stage(state, AgentStage.LYRIA_PROMPTING)
+
+        if not state.timeline:
+            state.current_stage = AgentStage.PLANNING
+            return
+
+        if all(clip.video_approved and clip.video_url for clip in state.timeline):
+            state.current_stage = AgentStage.PRODUCTION
+            return
+
+        if all(clip.image_approved and clip.image_url for clip in state.timeline):
+            state.current_stage = AgentStage.FILMING
+            return
+
+        state.current_stage = AgentStage.STORYBOARDING
+
+    def _rewind_state_to_stage(self, state: ProjectState, target_stage: AgentStage) -> None:
+        stage_order = [
+            AgentStage.INPUT,
+            AgentStage.LYRIA_PROMPTING,
+            AgentStage.PLANNING,
+            AgentStage.STORYBOARDING,
+            AgentStage.FILMING,
+            AgentStage.PRODUCTION,
+            AgentStage.COMPLETED,
+        ]
+        target_idx = stage_order.index(target_stage)
+
+        if target_stage == AgentStage.INPUT:
+            state.timeline = []
+            state.lyrics_prompt = ""
+            state.style_prompt = ""
+
+        if target_idx <= stage_order.index(AgentStage.PLANNING) and target_stage != AgentStage.INPUT:
+            for clip in state.timeline:
+                clip.image_url = None
+                clip.image_prompt = None
+                clip.image_critiques = []
+                clip.image_approved = False
+                clip.image_score = None
+                clip.image_reference_ready = False
+
+        if target_idx <= stage_order.index(AgentStage.STORYBOARDING):
+            for clip in state.timeline:
+                clip.video_url = None
+                clip.video_critiques = []
+                clip.video_score = None
+                clip.video_approved = False
+                clip.video_prompt = None
+            state.production_timeline = []
+
+        if target_idx <= stage_order.index(AgentStage.FILMING):
+            state.production_timeline = []
+
+        if target_idx <= stage_order.index(AgentStage.PRODUCTION):
+            state.final_video_url = None
+
+        self._trim_stage_summaries_to_stage(state, target_stage)
+        state.last_error = None
+        state.current_stage = target_stage
+
+    async def handle_live_director_mode(
+        self,
+        state: ProjectState,
+        *,
+        message: str,
+        display_stage: AgentStage | str | None = None,
+        selected_clip_id: str | None = None,
+        selected_fragment_id: str | None = None,
+        source: str = "text",
+    ) -> tuple[ProjectState, dict[str, Any]]:
+        if not self.client:
+            raise RuntimeError("Live Director Mode requires Google model access.")
+
+        requested_message = message.strip()
+        if not requested_message:
+            raise ValueError("Director instruction cannot be empty.")
+
+        stage_value = display_stage.value if isinstance(display_stage, AgentStage) else str(display_stage or state.current_stage.value)
+        try:
+            review_stage = AgentStage(stage_value)
+        except ValueError:
+            review_stage = state.current_stage
+
+        updated_state = state.model_copy(deep=True)
+        previous_state = state.model_copy(deep=True)
+
+        selected_clip = next((clip for clip in updated_state.timeline if clip.id == selected_clip_id), None)
+        selected_fragment = next((fragment for fragment in updated_state.production_timeline if fragment.id == selected_fragment_id), None)
+        shot_lookup = self._shot_lookup(updated_state)
+        explicit_shot_number, explicit_target_clip_id = self._resolve_director_shot_reference(updated_state, requested_message)
+        explicit_target_fragment_id = self._resolve_director_fragment_reference_for_clip(updated_state, explicit_target_clip_id)
+
+        clip_context = [
+            {
+                "shot_number": shot_lookup.get(clip.id),
+                "clip_id": clip.id,
+                "duration": clip.duration,
+                "storyboard_text": clip.storyboard_text,
+                "video_prompt": clip.video_prompt,
+                "image_ready": bool(clip.image_url),
+                "video_ready": bool(clip.video_url),
+                "image_approved": clip.image_approved,
+                "video_approved": clip.video_approved,
+            }
+            for clip in updated_state.timeline
+        ]
+        fragment_context = [
+            {
+                "fragment_id": fragment.id,
+                "source_clip_id": fragment.source_clip_id,
+                "source_shot_number": shot_lookup.get(fragment.source_clip_id),
+                "timeline_start": fragment.timeline_start,
+                "source_start": fragment.source_start,
+                "duration": fragment.duration,
+                "audio_enabled": fragment.audio_enabled,
+            }
+            for fragment in updated_state.production_timeline
+        ]
+
+        prompt = f"""
+You are FMV Studio's Live Director agent.
+
+Your job is to help the user adjust the CURRENTLY REVIEWED stage of an AI music video project in real time.
+You must stay within the supported operations and never invent ids.
+
+Current reviewed stage: {review_stage.value}
+Actual saved pipeline stage: {updated_state.current_stage.value}
+Selected clip id: {selected_clip.id if selected_clip else ""}
+Selected fragment id: {selected_fragment.id if selected_fragment else ""}
+Explicitly referenced shot number: {explicit_shot_number if explicit_shot_number is not None else ""}
+Resolved explicit clip id: {explicit_target_clip_id or ""}
+Resolved explicit fragment id: {explicit_target_fragment_id or ""}
+
+Project summary:
+- Name: {updated_state.name}
+- Screenplay: {updated_state.screenplay}
+- Instructions: {updated_state.instructions}
+- Additional lore: {updated_state.additional_lore}
+- Lyrics prompt: {updated_state.lyrics_prompt}
+- Style prompt: {updated_state.style_prompt}
+
+Timeline clips:
+{json.dumps(clip_context, ensure_ascii=True)}
+
+Production fragments:
+{json.dumps(fragment_context, ensure_ascii=True)}
+
+Supported operations:
+- global_updates: screenplay, instructions, additional_lore, lyrics_prompt, style_prompt, music_min_duration_seconds, music_max_duration_seconds
+- one clip update: target_clip_id + clip_updates.storyboard_text and/or clip_updates.duration
+- one filming update: target_clip_id + clip_updates.video_prompt
+- force regeneration on the target clip: clear_target_image and/or clear_target_video
+- one production audio toggle: target_fragment_id + fragment_updates.audio_enabled
+- optional rewind_to_stage when the requested change requires revisiting an earlier stage
+
+Rules:
+- If the user explicitly names a shot number, that exact shot is the primary target. Do not switch to a different shot.
+- In production, use fragment source_shot_number to match numbered shot requests when you need target_fragment_id.
+- If the user says "this shot", "this clip", "this frame", or "this edit", prefer the selected ids.
+- duration must be one of 4, 6, or 8 seconds.
+- storyboard_text is only for planning/storyboarding-level changes.
+- video_prompt is only for filming-level changes.
+- fragment_updates.audio_enabled is only for production.
+- Do not invent unsupported multi-shot timeline edits, multi-fragment edits, or batch operations.
+- If the request is unsupported, explain that briefly in reply_text and leave the update fields empty.
+- Keep reply_text concise and director-facing.
+
+Return STRICTLY as JSON matching this schema:
+{{
+  "reply_text": string,
+  "change_summary": [string],
+  "global_updates": {{
+    "screenplay": string | null,
+    "instructions": string | null,
+    "additional_lore": string | null,
+    "lyrics_prompt": string | null,
+    "style_prompt": string | null,
+    "music_min_duration_seconds": number | null,
+    "music_max_duration_seconds": number | null
+  }},
+  "target_clip_id": string | null,
+  "clip_updates": {{
+    "storyboard_text": string | null,
+    "duration": number | null,
+    "video_prompt": string | null
+  }},
+  "clear_target_image": boolean,
+  "clear_target_video": boolean,
+  "target_fragment_id": string | null,
+  "fragment_updates": {{
+    "audio_enabled": boolean | null
+  }},
+  "rewind_to_stage": string | null
+}}
+
+User instruction:
+{requested_message}
+"""
+
+        response = self.client.models.generate_content(
+            model=self.orchestrator_model,
+            contents=[prompt],
+            config=self._orchestrator_config(
+                response_mime_type="application/json",
+                thinking_budget=2048,
+                temperature=0.4,
+            ),
+        )
+        action = json.loads(response.text)
+
+        reply_text = str(action.get("reply_text") or "I reviewed the request, but I did not apply any concrete changes.").strip()
+        change_summary = [
+            str(item).strip()
+            for item in (action.get("change_summary") or [])
+            if str(item).strip()
+        ]
+
+        self._append_director_turn(
+            updated_state,
+            role="user",
+            text=requested_message,
+            stage=review_stage,
+            source=source,
+        )
+
+        global_updates = action.get("global_updates") or {}
+        for field_name in ("screenplay", "instructions", "additional_lore", "lyrics_prompt", "style_prompt"):
+            value = global_updates.get(field_name)
+            if isinstance(value, str):
+                setattr(updated_state, field_name, value.strip())
+
+        min_duration = global_updates.get("music_min_duration_seconds")
+        max_duration = global_updates.get("music_max_duration_seconds")
+        if isinstance(min_duration, (int, float)):
+            updated_state.music_min_duration_seconds = max(8.0, float(min_duration))
+        if isinstance(max_duration, (int, float)):
+            updated_state.music_max_duration_seconds = max(8.0, float(max_duration))
+        if (
+            updated_state.music_min_duration_seconds is not None
+            and updated_state.music_max_duration_seconds is not None
+            and updated_state.music_min_duration_seconds > updated_state.music_max_duration_seconds
+        ):
+            updated_state.music_min_duration_seconds, updated_state.music_max_duration_seconds = (
+                updated_state.music_max_duration_seconds,
+                updated_state.music_min_duration_seconds,
+            )
+
+        target_clip_id = str(
+            explicit_target_clip_id
+            or action.get("target_clip_id")
+            or selected_clip_id
+            or ""
+        ).strip() or None
+        clip_updates = action.get("clip_updates") or {}
+        target_clip = next((clip for clip in updated_state.timeline if clip.id == target_clip_id), None)
+        target_clip_changed_for_planning = False
+        target_clip_changed_for_storyboarding = False
+        target_clip_changed_for_filming = False
+
+        if target_clip:
+            storyboard_text = clip_updates.get("storyboard_text")
+            if isinstance(storyboard_text, str) and storyboard_text.strip():
+                target_clip.storyboard_text = storyboard_text.strip()
+                if review_stage == AgentStage.PLANNING:
+                    target_clip_changed_for_planning = True
+                else:
+                    target_clip_changed_for_storyboarding = True
+
+            duration = clip_updates.get("duration")
+            if isinstance(duration, (int, float)):
+                target_clip.duration = float(_closest_valid_veo_duration(duration))
+                target_clip_changed_for_planning = True
+
+            video_prompt = clip_updates.get("video_prompt")
+            if isinstance(video_prompt, str) and video_prompt.strip():
+                target_clip.video_prompt = video_prompt.strip()
+                target_clip_changed_for_filming = True
+
+            if bool(action.get("clear_target_image")):
+                self._clear_clip_storyboard_outputs(target_clip)
+                target_clip_changed_for_storyboarding = True
+
+            if bool(action.get("clear_target_video")):
+                self._clear_clip_video_outputs(target_clip, preserve_prompt=True)
+                target_clip_changed_for_filming = True
+
+        target_fragment_id = str(
+            explicit_target_fragment_id
+            or action.get("target_fragment_id")
+            or selected_fragment_id
+            or ""
+        ).strip() or None
+        fragment_updates = action.get("fragment_updates") or {}
+        target_fragment = next((fragment for fragment in updated_state.production_timeline if fragment.id == target_fragment_id), None)
+        fragment_changed = False
+        if target_fragment and isinstance(fragment_updates.get("audio_enabled"), bool):
+            target_fragment.audio_enabled = bool(fragment_updates["audio_enabled"])
+            fragment_changed = True
+
+        rewind_to_stage_raw = str(action.get("rewind_to_stage") or "").strip().lower()
+        rewind_to_stage: AgentStage | None = None
+        if rewind_to_stage_raw:
+            try:
+                rewind_to_stage = AgentStage(rewind_to_stage_raw)
+            except ValueError:
+                rewind_to_stage = None
+
+        if target_clip_changed_for_planning:
+            self._reconcile_after_planning_edits(previous_state, updated_state)
+            if not change_summary:
+                change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and reconciled downstream outputs.")
+        else:
+            if target_clip_changed_for_storyboarding:
+                updated_state.production_timeline = []
+                updated_state.final_video_url = None
+                updated_state.last_error = None
+                updated_state.current_stage = AgentStage.STORYBOARDING
+                self._trim_stage_summaries_to_stage(updated_state, AgentStage.PLANNING)
+                if not change_summary:
+                    change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and cleared its frame/video outputs.")
+
+            if target_clip_changed_for_filming:
+                updated_state.production_timeline = []
+                updated_state.final_video_url = None
+                updated_state.last_error = None
+                updated_state.current_stage = AgentStage.FILMING
+                self._trim_stage_summaries_to_stage(updated_state, AgentStage.STORYBOARDING)
+                if not change_summary:
+                    change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and cleared its rendered clip.")
+
+            if fragment_changed:
+                updated_state.final_video_url = None
+                updated_state.last_error = None
+                updated_state.current_stage = AgentStage.PRODUCTION
+                self._trim_stage_summaries_to_stage(updated_state, AgentStage.FILMING)
+                if not change_summary:
+                    change_summary.append("Updated the selected production fragment.")
+
+        if rewind_to_stage:
+            self._rewind_state_to_stage(updated_state, rewind_to_stage)
+            if not change_summary:
+                change_summary.append(f"Rewound the project to {rewind_to_stage.value}.")
+
+        self._append_director_turn(
+            updated_state,
+            role="agent",
+            text=reply_text,
+            stage=updated_state.current_stage,
+            source="agent",
+            applied_changes=change_summary,
+        )
+
+        return updated_state, {
+            "reply_text": reply_text,
+            "applied_changes": change_summary,
+            "target_clip_id": target_clip.id if target_clip else None,
+            "target_fragment_id": target_fragment.id if target_fragment else None,
+            "stage": updated_state.current_stage.value,
+        }
 
     def _build_stage_summary_text(self, state: ProjectState, stage: AgentStage) -> str:
         shot_lookup = self._shot_lookup(state)
@@ -1148,8 +1648,8 @@ class FMVAgentPipeline:
             "-i", input_path,
             "-vf",
             (
-                f"scale={TARGET_IMAGE_WIDTH}:{TARGET_IMAGE_HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={TARGET_IMAGE_WIDTH}:{TARGET_IMAGE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"scale={self.image_width}:{self.image_height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.image_width}:{self.image_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
                 "setsar=1"
             ),
             "-frames:v", "1",
@@ -1183,7 +1683,7 @@ class FMVAgentPipeline:
         if is_png and len(image_bytes) >= 24:
             width = int.from_bytes(image_bytes[16:20], "big")
             height = int.from_bytes(image_bytes[20:24], "big")
-            if (width, height) == (TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT):
+            if (width, height) == (self.image_width, self.image_height):
                 return image_bytes, image_mime_type
 
         guessed_extension = mimetypes.guess_extension(image_mime_type) or ".png"
@@ -1199,7 +1699,7 @@ class FMVAgentPipeline:
             width, height = await self._probe_image_dimensions(input_path)
             if width is None or height is None:
                 return image_bytes, image_mime_type
-            if (width, height) != (TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT):
+            if (width, height) != (self.image_width, self.image_height):
                 await self._normalize_image_canvas(
                     input_path=input_path,
                     output_path=output_path,
@@ -1232,8 +1732,8 @@ class FMVAgentPipeline:
         command.extend([
             "-vf", (
                 "fps=30,"
-                f"scale={TARGET_VIDEO_WIDTH}:{TARGET_VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={TARGET_VIDEO_WIDTH}:{TARGET_VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
+                f"scale={self.video_width}:{self.video_height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.video_width}:{self.video_height}:(ow-iw)/2:(oh-ih)/2,"
                 "setsar=1"
             ),
             "-c:v", "libx264",
@@ -1278,8 +1778,8 @@ class FMVAgentPipeline:
             config=genai.types.GenerateContentConfig(
                 response_modalities=["IMAGE", "TEXT"],
                 image_config=genai.types.ImageConfig(
-                    aspect_ratio=TARGET_IMAGE_ASPECT_RATIO,
-                    image_size=TARGET_IMAGE_SIZE,
+                    aspect_ratio=self.image_aspect_ratio,
+                    image_size=self.image_size,
                 ),
             )
         )
@@ -1504,8 +2004,8 @@ Return only the rewritten motion prompt.
         config_kwargs: dict[str, Any] = {
             "number_of_videos": 1,
             "duration_seconds": duration_seconds,
-            "aspect_ratio": TARGET_VIDEO_ASPECT_RATIO,
-            "resolution": TARGET_VIDEO_RESOLUTION,
+            "aspect_ratio": self.video_aspect_ratio,
+            "resolution": self.video_resolution,
         }
         output_gcs_uri: str | None = None
         if self.uses_vertex_ai:
@@ -2537,7 +3037,7 @@ Return your answer STRICTLY as a JSON object:
         ) -> None:
             base_prompt = (
                 f"{clip.storyboard_text}. {state.instructions}. "
-                "High quality, cinematic still frame, 16:9 aspect ratio, 4K detail."
+                f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
             )
             working_prompt = base_prompt
             clip.image_prompt = base_prompt
@@ -2646,7 +3146,7 @@ Return your answer STRICTLY as a JSON object:
                         working_prompt = (
                             f"{clip.storyboard_text}. {state.instructions}. "
                             f"Mandatory corrections before regeneration: {critique['suggestions']}. "
-                            "High quality, cinematic still frame, 16:9 aspect ratio, 4K detail. "
+                            f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail. "
                             "Do not introduce extra limbs, extra people, missing heads, fused bodies, broken animals, or inconsistent character design."
                         )
                 except Exception as e:
@@ -2756,7 +3256,7 @@ Return your answer STRICTLY as a JSON object:
                     f.write(video_bytes)
 
                 probed_width, probed_height = await self._probe_video_dimensions(str(raw_video_path))
-                if (probed_width, probed_height) != (TARGET_VIDEO_WIDTH, TARGET_VIDEO_HEIGHT):
+                if (probed_width, probed_height) != (self.video_width, self.video_height):
                     await self._normalize_video_canvas(
                         input_path=str(raw_video_path),
                         output_path=str(video_path),

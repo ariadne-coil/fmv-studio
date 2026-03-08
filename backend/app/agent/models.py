@@ -69,6 +69,16 @@ class StageSummary(BaseModel):
     audio_url: Optional[str] = None
     generated_at: str
 
+
+class DirectorTurn(BaseModel):
+    id: str
+    role: str
+    text: str
+    stage: str
+    created_at: str
+    source: Optional[str] = None
+    applied_changes: List[str] = Field(default_factory=list)
+
 class ProjectState(BaseModel):
     project_id: str
     name: str
@@ -102,3 +112,4 @@ class ProjectState(BaseModel):
     last_error: Optional[str] = None
     active_run: Optional[PipelineRunState] = None
     stage_summaries: Dict[str, StageSummary] = Field(default_factory=dict)
+    director_log: List[DirectorTurn] = Field(default_factory=list)
