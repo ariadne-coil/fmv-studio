@@ -59,11 +59,12 @@ The backend acts as the central agent runtime. It owns project state, orchestrat
 
 ### Model Roles
 
-- `Gemini Pro`: orchestration, planning, prompt rewriting, continuity reasoning
-- `Gemini Flash`: critique and validation
-- `Gemini Image`: storyboard frame generation
+- `Gemini 3.1 Pro`: orchestration, planning, prompt rewriting, continuity reasoning
+- `Gemini 3 Flash`: critique and validation
+- `Gemini Image 2`: storyboard frame generation
 - `Veo 3.1`: video generation
-- `Lyria / TTS`: music and spoken stage summaries
+- `Lyria 2`: music
+- 'Gemini TTS': spoken stage summaries
 
 ## Other Data Sources Used
 
