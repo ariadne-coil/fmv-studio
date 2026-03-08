@@ -85,6 +85,10 @@ flowchart LR
     clip_crit -->|approved clips only| production
     production --> editor --> render --> completed
 
+    frame_crit -. failed critique / regenerate .-> storyboard
+    clip_crit -. filtered or low-confidence / retry .-> filming
+    render -. edit changes or rerender .-> production
+
     planning -. ready summary .-> brief
     storyboard -. ready summary .-> brief
     filming -. ready summary .-> brief
