@@ -9,21 +9,21 @@ flowchart TB
     user[User Browser]
 
     subgraph experience[User Experience]
-        frontend[Next.js Studio UI\nCloud Run]
+        frontend[Next.js Studio UI<br/>Cloud Run]
     end
 
     subgraph runtime[Agent Runtime]
-        backend[FastAPI Orchestrator\nCloud Run]
-        tasks[Cloud Tasks Queue\nasync storyboard and filming jobs]
-        gcs[GCS Bucket\nproject state, uploads, frames,\nclips, music, final renders]
+        backend[FastAPI Orchestrator<br/>Cloud Run]
+        tasks[Cloud Tasks Queue<br/>async storyboard and filming jobs]
+        gcs[GCS Bucket<br/>project state, uploads, frames,<br/>clips, music, final renders]
     end
 
     subgraph models[Vertex AI Model Layer]
-        orch[Gemini Pro\norchestrator and prompt rewriting]
-        critic[Gemini Flash\n3-critic validation panel]
-        image[Gemini Image\nstoryboard generation]
-        veo[Veo 3.1\nfilming generation]
-        audio[Lyria and TTS\nmusic and stage briefs]
+        orch[Gemini Pro<br/>orchestrator and prompt rewriting]
+        critic[Gemini Flash<br/>3-critic validation panel]
+        image[Gemini Image<br/>storyboard generation]
+        veo[Veo 3.1<br/>filming generation]
+        audio[Lyria and TTS<br/>music and stage briefs]
     end
 
     user -->|HTTPS| frontend
@@ -34,7 +34,7 @@ flowchart TB
     backend -->|enqueue long-running runs| tasks
     tasks -->|authenticated execute-run callback| backend
 
-    backend -->|planning, continuity,\nprompt rewriting| orch
+    backend -->|planning, continuity,<br/>prompt rewriting| orch
     backend -->|frame and clip review| critic
     backend -->|generate storyboard frames| image
     backend -->|generate clips from approved frames| veo
@@ -65,16 +65,16 @@ flowchart LR
     production[6 Production]
     completed[7 Completed]
 
-    orch_music[Gemini Pro\nlyrics, style, structure]
+    orch_music[Gemini Pro<br/>lyrics, style, structure]
     lyria[Lyria or imported song]
-    orch_plan[Gemini Pro\nshot list, durations, continuity plan]
-    frame_gen[Gemini Image\n16:9 storyboard frames]
-    frame_crit[Gemini Flash\n3-critic frame panel]
-    clip_gen[Veo 3.1\n16:9 1080p clips]
-    clip_crit[Gemini Flash\n3-critic video panel]
-    editor[Production timeline editor\nsplit, reorder, audio edit]
-    render[ffmpeg render\nfinal master]
-    brief[TTS stage brief\none-time spoken summary]
+    orch_plan[Gemini Pro<br/>shot list, durations, continuity plan]
+    frame_gen[Gemini Image<br/>16:9 storyboard frames]
+    frame_crit[Gemini Flash<br/>3-critic frame panel]
+    clip_gen[Veo 3.1<br/>16:9 1080p clips]
+    clip_crit[Gemini Flash<br/>3-critic video panel]
+    editor[Production timeline editor<br/>split, reorder, audio edit]
+    render[ffmpeg render<br/>final master]
+    brief[TTS stage brief<br/>one-time spoken summary]
 
     input --> music_stage
     music_stage --> orch_music --> lyria --> planning
