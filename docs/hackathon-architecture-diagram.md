@@ -133,7 +133,7 @@ flowchart LR
 - The frontend and backend are deployed separately.
 - Realtime Live Director voice uses a separate Cloud Run WebSocket gateway that proxies to Vertex AI Live.
 - Async runs are durable because project state is persisted outside the Cloud Run instance.
-- Model roles are split:
+- Model roles are split. Default model selections are as follows:
   - `Gemini Pro` for orchestration and prompt rewriting
   - `Gemini Flash` for critique
   - `Veo` for video

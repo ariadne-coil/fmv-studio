@@ -2,9 +2,7 @@
 
 This document is the repo artifact for the hackathon's "Proof of Google Cloud Deployment" requirement.
 
-Instead of a screen recording, it points judges to the code that proves the FMV Studio backend is designed to run on Google Cloud and uses Google Cloud services directly.
-
-It also covers the project's `Live Director` path, which uses a dedicated Google Cloud service and Vertex Live session proxy rather than a browser-only mock voice flow.
+The code below proves the FMV Studio backend is designed to run on Google Cloud and uses Google Cloud services directly.
 
 ## Primary Proof Files
 
@@ -54,8 +52,6 @@ This is the backend code that switches the app into Vertex AI mode. When `FMV_GE
 - the configured Google Cloud project
 - the configured Vertex AI location
 
-That is the direct code proof that the backend is calling Google Cloud Vertex AI rather than only using a local or Gemini API key flow.
-
 ### 4. Google Cloud Storage persistence
 
 [`backend/app/storage.py`](../backend/app/storage.py)
@@ -71,7 +67,7 @@ This file contains `GCSStorageBackend`, which stores:
 
 in a Google Cloud Storage bucket.
 
-This is important because it shows the backend is not just "deployed on Cloud Run"; it is also using durable Google Cloud storage instead of local instance disk.
+This is important because the backend is not just deployed on Cloud Run; it is also using durable Google Cloud storage instead of local instance disk.
 
 ### 5. Cloud Tasks async job dispatch
 
@@ -123,13 +119,7 @@ Taken together, these files show both:
 1. the backend is meant to be deployed on Google Cloud
 2. the backend actively uses Google Cloud services and APIs at runtime
 
-## Recommended Submission Link
-
-If a single link is needed for the deliverable, use this file:
-
-[`docs/hackathon-google-cloud-proof.md`](./hackathon-google-cloud-proof.md)
-
-If supporting links are allowed, include these as well:
+## Supporting Link
 
 - [`scripts/deploy_google_cloud.sh`](../scripts/deploy_google_cloud.sh)
 - [`infra/terraform/main.tf`](../infra/terraform/main.tf)

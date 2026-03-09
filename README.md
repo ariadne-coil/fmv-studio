@@ -13,7 +13,7 @@ FMV Studio is an AI-assisted music video editor and realtime directing environme
 - Production timeline editing with split, reorder, independent source-audio muting, music placement, and final export
 - Google Cloud deployment on `Cloud Run` + `Vertex AI` + `Cloud Tasks` + `GCS`
 
-## Judge Spin-Up
+## Installation
 
 This project is reproducible in two ways:
 
@@ -62,7 +62,7 @@ npm install
 npm run dev
 ```
 
-In the current Windows + WSL local setup, `npm run dev` uses webpack mode by default for compatibility.
+The project uses webpack mode by default for compatibility.
 
 4. Open:
 
