@@ -1,9 +1,17 @@
 # FMV Studio
 
-FMV Studio is an AI-assisted music video editor built from:
+FMV Studio is an AI-assisted music video editor and realtime directing environment built from:
 
 - `frontend/`: Next.js 16 / React 19 studio UI
 - `backend/`: FastAPI orchestration service for planning, storyboarding, filming, and production
+
+## Core Highlights
+
+- Stage-driven pipeline from `Input` to `Completed`, with review gates between `Music`, `Planning`, `Storyboarding`, `Filming`, and `Production`
+- `Live Director` window with typed chat and realtime voice, so the user can direct the project conversationally while it is in progress
+- Background storyboard and filming runs that stream results into the UI instead of blocking on a static processing state
+- Production timeline editing with split, reorder, independent source-audio muting, music placement, and final export
+- Google Cloud deployment on `Cloud Run` + `Vertex AI` + `Cloud Tasks` + `GCS`
 
 ## Judge Spin-Up
 
@@ -91,7 +99,7 @@ This script:
 
 - provisions infrastructure with Terraform
 - builds backend and frontend images with Cloud Build
-- deploys both services to Cloud Run
+- deploys the frontend, backend, and Live Director gateway to Cloud Run
 - configures GCS and Cloud Tasks for durable project state and async jobs
 
 4. Run the low-cost smoke test:

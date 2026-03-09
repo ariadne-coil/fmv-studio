@@ -4,6 +4,8 @@ This document is the repo artifact for the hackathon's "Proof of Google Cloud De
 
 Instead of a screen recording, it points judges to the code that proves the FMV Studio backend is designed to run on Google Cloud and uses Google Cloud services directly.
 
+It also covers the project's `Live Director` path, which uses a dedicated Google Cloud service and Vertex Live session proxy rather than a browser-only mock voice flow.
+
 ## Primary Proof Files
 
 ### 1. Cloud Run deployment script
@@ -15,6 +17,7 @@ This is the end-to-end deployment entrypoint. It:
 - applies Terraform infrastructure
 - builds backend and frontend images with Cloud Build
 - deploys the backend to Cloud Run with Vertex AI, GCS, and Cloud Tasks enabled
+- deploys a separate `Live Director` Cloud Run gateway for realtime voice sessions
 
 The backend Cloud Run deploy command explicitly sets:
 
@@ -23,6 +26,8 @@ The backend Cloud Run deploy command explicitly sets:
 - `FMV_JOB_DRIVER=cloud_tasks`
 
 Those environment variables are the runtime switch that moves the backend off local disk / local jobs and onto Google Cloud services. The deploy script also hardens the backend by removing anonymous access and granting `roles/run.invoker` only to the frontend service account and the Cloud Tasks service account.
+
+The same script also deploys the public websocket gateway used by `Live Director`, which proxies browser sessions to the Vertex AI Live API with Google Cloud credentials.
 
 ### 2. Terraform infrastructure
 
@@ -88,15 +93,30 @@ The pipeline graph contains the cloud media path for Vertex-backed generation. I
 
 This is the strongest backend-only code proof that the generation pipeline is wired to Google Cloud services in production.
 
+### 7. Vertex Live gateway for Live Director
+
+[`backend/app/live_gateway.py`](../backend/app/live_gateway.py)
+
+This file is the clearest code proof that FMV Studio's realtime director feature is also running on Google Cloud. It:
+
+- runs as a public Cloud Run websocket service
+- uses Google Cloud ADC to mint bearer tokens
+- opens a Vertex AI Live session against Google's bidirectional live endpoint
+- relays browser audio and model audio between the user and Vertex AI
+
+This shows that the live multimodal part of the product is also using Google Cloud services directly, not only the staged backend pipeline.
+
 ## Why This Satisfies the Deliverable
 
 The hackathon asks for proof that the backend is running on Google Cloud. This repo provides that proof in code form:
 
 - deployment automation to Cloud Run
+- deployment automation for the Live Director Cloud Run gateway
 - Terraform-managed Google Cloud infrastructure
 - backend runtime configuration for Vertex AI
 - Google Cloud Storage persistence
 - Cloud Tasks background execution
+- Vertex AI Live websocket proxying for realtime director voice
 
 Taken together, these files show both:
 
@@ -116,3 +136,4 @@ If supporting links are allowed, include these as well:
 - [`backend/app/genai_runtime.py`](../backend/app/genai_runtime.py)
 - [`backend/app/storage.py`](../backend/app/storage.py)
 - [`backend/app/job_queue.py`](../backend/app/job_queue.py)
+- [`backend/app/live_gateway.py`](../backend/app/live_gateway.py)

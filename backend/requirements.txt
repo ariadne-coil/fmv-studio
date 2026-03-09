@@ -4,7 +4,11 @@ google-genai
 google-cloud-tasks
 google-cloud-storage
 google-auth
+websockets
+certifi
 ffmpeg-python
 pydantic
 python-multipart
 python-dotenv
+pypdf
+python-docx

@@ -2,7 +2,16 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, GripVertical, Loader2, Maximize2, Mic, MicOff, Radio, Send, Volume2, VolumeX } from "lucide-react";
-import { DirectorTurn } from "@/lib/api";
+import { DirectorTurn, LiveDirectorResponse, toBackendAssetUrl } from "@/lib/api";
+import {
+  getLiveDirectorRealtimeLocation,
+  getLiveDirectorRealtimeModel,
+  getLiveDirectorRealtimeProjectId,
+  getLiveDirectorWsUrl,
+  hasLiveDirectorRealtimeConfig,
+} from "@/lib/liveDirectorConfig";
+import { LiveDirectorAudioCapture, LiveDirectorAudioPlayer } from "@/lib/liveDirectorAudio";
+import { LiveDirectorRealtimeEvent, LiveDirectorRealtimeSession } from "@/lib/liveDirectorRealtime";
 
 declare global {
   interface Window {
@@ -43,13 +52,19 @@ interface LiveDirectorPanelProps {
   turns: DirectorTurn[];
   isBusy: boolean;
   isProcessing: boolean;
-  onSubmit: (message: string, source: "text" | "voice") => Promise<void> | void;
+  onSubmit: (
+    message: string,
+    source: "text" | "voice",
+    speechMode?: "standard" | "realtime",
+  ) => Promise<LiveDirectorResponse | null> | LiveDirectorResponse | null;
 }
 
 interface WindowPosition {
   x: number;
   y: number;
 }
+
+type RealtimeStatus = "unavailable" | "disconnected" | "connecting" | "connected" | "error";
 
 function formatTurnTime(value: string): string {
   const date = new Date(value);
@@ -75,6 +90,32 @@ function clampPanelPosition(position: WindowPosition, width: number, height: num
   };
 }
 
+function buildRealtimeSystemInstruction(): string {
+  return [
+    "You are FMV Studio's Live Director voice interface.",
+    "For any request that changes, inspects, rewrites, regenerates, or adjusts the user's project, call apply_director_command.",
+    "Do not claim that edits were applied until the tool confirms them.",
+    "After receiving tool output, explain the result briefly and naturally in spoken form.",
+    "You may answer very short greetings or capability questions without a tool call, but project work must go through the tool.",
+    "Keep spoken replies concise, collaborative, and director-facing.",
+  ].join(" ");
+}
+
+function buildRealtimeStatusLabel(status: RealtimeStatus, errorText: string | null): string {
+  switch (status) {
+    case "connected":
+      return "Realtime voice online.";
+    case "connecting":
+      return "Connecting realtime voice...";
+    case "error":
+      return errorText || "Realtime voice unavailable. Falling back to standard replies.";
+    case "unavailable":
+      return "Realtime voice is not configured here. Standard replies remain available.";
+    default:
+      return "Realtime voice ready to connect.";
+  }
+}
+
 export default function LiveDirectorPanel({
   currentStage,
   focusLabel,
@@ -85,66 +126,251 @@ export default function LiveDirectorPanel({
 }: LiveDirectorPanelProps) {
   const [draft, setDraft] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
+  const [liveReplyTranscript, setLiveReplyTranscript] = useState("");
   const [isListening, setIsListening] = useState(false);
   const [isOpen, setIsOpen] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
   const [position, setPosition] = useState<WindowPosition | null>(null);
-  const [speechSupported, setSpeechSupported] = useState(false);
+  const [legacySpeechSupported, setLegacySpeechSupported] = useState(false);
   const [autoSpeakReplies, setAutoSpeakReplies] = useState(true);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>(
+    hasLiveDirectorRealtimeConfig() ? "disconnected" : "unavailable",
+  );
+  const [realtimeError, setRealtimeError] = useState<string | null>(null);
 
   const panelRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const dragOffsetRef = useRef<WindowPosition>({ x: 0, y: 0 });
   const listeningSeedRef = useRef("");
   const hydratedReplyIdsRef = useRef<Set<string>>(new Set());
+  const replyAudioRef = useRef<HTMLAudioElement | null>(null);
+  const realtimeSessionRef = useRef<LiveDirectorRealtimeSession | null>(null);
+  const realtimeCaptureRef = useRef<LiveDirectorAudioCapture | null>(null);
+  const realtimePlayerRef = useRef<LiveDirectorAudioPlayer | null>(null);
+  const latestOnSubmitRef = useRef(onSubmit);
+  const currentInputSourceRef = useRef<"text" | "voice">("text");
+
   const transcriptList = useMemo(() => turns.slice(-10), [turns]);
-  const composerValue = mergeDraftAndInterim(draft, interimTranscript);
+  const composerValue = mergeDraftAndInterim(draft, hasLiveDirectorRealtimeConfig() ? "" : interimTranscript);
   const canSubmit = !isBusy && !isProcessing && composerValue.length > 0;
+  const realtimeEnabled = hasLiveDirectorRealtimeConfig();
+  const realtimeStatusLabel = buildRealtimeStatusLabel(realtimeStatus, realtimeError);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const RecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!RecognitionCtor) {
-      setSpeechSupported(false);
+    latestOnSubmitRef.current = onSubmit;
+  }, [onSubmit]);
+
+  const speakWithBrowserVoice = (text: string) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const stopLegacySpeechRecognition = () => {
+    recognitionRef.current?.stop();
+    setIsListening(false);
+  };
+
+  const stopRealtimeCapture = async () => {
+    if (!realtimeCaptureRef.current) return;
+    if (realtimeSessionRef.current?.isConnected) {
+      realtimeCaptureRef.current.emitTrailingSilence();
+    }
+    await realtimeCaptureRef.current.stop();
+    realtimeCaptureRef.current = null;
+    setIsListening(false);
+  };
+
+  async function handleRealtimeToolCalls(functionCalls: Array<{ id: string; name: string; args?: Record<string, unknown> }>) {
+    for (const functionCall of functionCalls) {
+      if (functionCall.name !== "apply_director_command") {
+        realtimeSessionRef.current?.sendToolResponse(functionCall.id, functionCall.name, {
+          ok: false,
+          error: `Unsupported function: ${functionCall.name}`,
+        });
+        continue;
+      }
+
+      const message = typeof functionCall.args?.message === "string" ? functionCall.args.message : "";
+      if (!message.trim()) {
+        realtimeSessionRef.current?.sendToolResponse(functionCall.id, functionCall.name, {
+          ok: false,
+          error: "Missing message argument.",
+        });
+        continue;
+      }
+
+      const response = await latestOnSubmitRef.current(message, currentInputSourceRef.current, "realtime");
+      if (!response) {
+        realtimeSessionRef.current?.sendToolResponse(functionCall.id, functionCall.name, {
+          ok: false,
+          error: "Failed to apply the requested Live Director command.",
+        });
+        continue;
+      }
+
+      realtimeSessionRef.current?.sendToolResponse(functionCall.id, functionCall.name, {
+        ok: true,
+        reply_text: response.reply_text,
+        applied_changes: response.applied_changes,
+        target_clip_id: response.target_clip_id || null,
+        target_fragment_id: response.target_fragment_id || null,
+        stage: response.stage,
+      });
+    }
+  }
+
+  async function handleRealtimeEvent(event: LiveDirectorRealtimeEvent) {
+    if (event.type === "setup-complete") {
+      setRealtimeStatus("connected");
+      setRealtimeError(null);
       return;
     }
 
-    setSpeechSupported(true);
-    const recognition = new RecognitionCtor();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-    recognition.onresult = (event) => {
-      let finalTranscript = "";
-      let liveTranscript = "";
-      for (let index = 0; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        const piece = result[0]?.transcript ?? "";
-        if (result.isFinal) {
-          finalTranscript += piece;
-        } else {
-          liveTranscript += piece;
+    if (event.type === "audio") {
+      if (autoSpeakReplies) {
+        try {
+          await realtimePlayerRef.current?.play(event.data);
+        } catch {
+          setRealtimeStatus("error");
+          setRealtimeError("Live Director audio playback failed.");
         }
       }
+      return;
+    }
 
-      const seed = listeningSeedRef.current.trim();
-      const mergedFinal = [seed, finalTranscript.trim()].filter(Boolean).join(seed && finalTranscript.trim() ? " " : "");
-      setDraft(mergedFinal);
-      setInterimTranscript(liveTranscript.trim());
-    };
-    recognition.onerror = () => {
-      setIsListening(false);
-    };
-    recognition.onend = () => {
-      setIsListening(false);
-    };
-    recognitionRef.current = recognition;
+    if (event.type === "input-transcription") {
+      setInterimTranscript(event.finished ? "" : event.text);
+      return;
+    }
 
-    return () => {
-      recognition.stop();
-      recognitionRef.current = null;
-    };
-  }, []);
+    if (event.type === "output-transcription") {
+      setLiveReplyTranscript(event.finished ? "" : event.text);
+      return;
+    }
+
+    if (event.type === "tool-call") {
+      await handleRealtimeToolCalls(event.functionCalls);
+      return;
+    }
+
+    if (event.type === "interrupted") {
+      realtimePlayerRef.current?.interrupt();
+      setLiveReplyTranscript("");
+      return;
+    }
+
+    if (event.type === "turn-complete") {
+      setInterimTranscript("");
+      setLiveReplyTranscript("");
+      return;
+    }
+
+    if (event.type === "error") {
+      setRealtimeStatus("error");
+      setRealtimeError(event.message);
+      return;
+    }
+
+    if (event.type === "text") {
+      setLiveReplyTranscript(event.text);
+    }
+  }
+
+  const ensureRealtimeSession = async (): Promise<boolean> => {
+    if (!realtimeEnabled) return false;
+    if (realtimeSessionRef.current?.isConnected) return true;
+
+    const proxyUrl = getLiveDirectorWsUrl();
+    const projectId = getLiveDirectorRealtimeProjectId();
+    if (!proxyUrl || !projectId) {
+      setRealtimeStatus("unavailable");
+      return false;
+    }
+
+    try {
+      setRealtimeStatus("connecting");
+      setRealtimeError(null);
+
+      if (!realtimePlayerRef.current) {
+        realtimePlayerRef.current = new LiveDirectorAudioPlayer();
+      }
+
+      const session = new LiveDirectorRealtimeSession({
+        proxyUrl,
+        model: getLiveDirectorRealtimeModel(),
+        projectId,
+        location: getLiveDirectorRealtimeLocation(),
+        systemInstruction: buildRealtimeSystemInstruction(),
+        voiceName: "Kore",
+        onEvent: (event) => {
+          void handleRealtimeEvent(event);
+        },
+      });
+
+      realtimeSessionRef.current = session;
+      await session.connect();
+      realtimePlayerRef.current.setMuted(!autoSpeakReplies);
+      setRealtimeStatus("connected");
+      return true;
+    } catch (error) {
+      setRealtimeStatus("error");
+      setRealtimeError(error instanceof Error ? error.message : "Live Director realtime connection failed.");
+      realtimeSessionRef.current = null;
+      return false;
+    }
+  };
+
+  useEffect(() => {
+    if (!realtimeEnabled && typeof window !== "undefined") {
+      const RecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!RecognitionCtor) {
+        setLegacySpeechSupported(false);
+        return;
+      }
+
+      setLegacySpeechSupported(true);
+      const recognition = new RecognitionCtor();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = "en-US";
+      recognition.onresult = (event) => {
+        let finalTranscript = "";
+        let liveTranscript = "";
+        for (let index = 0; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const piece = result[0]?.transcript ?? "";
+          if (result.isFinal) {
+            finalTranscript += piece;
+          } else {
+            liveTranscript += piece;
+          }
+        }
+
+        const seed = listeningSeedRef.current.trim();
+        const mergedFinal = [seed, finalTranscript.trim()].filter(Boolean).join(seed && finalTranscript.trim() ? " " : "");
+        setDraft(mergedFinal);
+        setInterimTranscript(liveTranscript.trim());
+      };
+      recognition.onerror = () => {
+        setIsListening(false);
+      };
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+      recognitionRef.current = recognition;
+
+      return () => {
+        recognition.stop();
+        recognitionRef.current = null;
+      };
+    }
+    return undefined;
+  }, [realtimeEnabled]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -210,7 +436,16 @@ export default function LiveDirectorPanel({
   }, [isDragging]);
 
   useEffect(() => {
+    realtimePlayerRef.current?.setMuted(!autoSpeakReplies);
+  }, [autoSpeakReplies]);
+
+  useEffect(() => {
     if (!hydratedReplyIdsRef.current.size) {
+      hydratedReplyIdsRef.current = new Set(turns.map((turn) => turn.id));
+      return;
+    }
+
+    if (realtimeStatus === "connected" || realtimeStatus === "connecting") {
       hydratedReplyIdsRef.current = new Set(turns.map((turn) => turn.id));
       return;
     }
@@ -220,20 +455,74 @@ export default function LiveDirectorPanel({
     if (hydratedReplyIdsRef.current.has(latestTurn.id)) return;
     hydratedReplyIdsRef.current.add(latestTurn.id);
 
-    if (!autoSpeakReplies || typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(latestTurn.text);
-    utterance.rate = 1;
-    utterance.pitch = 1;
-    utterance.volume = 1;
-    window.speechSynthesis.speak(utterance);
-  }, [autoSpeakReplies, turns]);
+    if (!autoSpeakReplies) return;
 
-  const handleToggleListening = () => {
-    if (!speechSupported || !recognitionRef.current || isBusy || isProcessing) return;
+    const replyAudio = replyAudioRef.current;
+    if (replyAudio && latestTurn.audio_url) {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+      replyAudio.pause();
+      replyAudio.src = toBackendAssetUrl(latestTurn.audio_url);
+      replyAudio.currentTime = 0;
+      void replyAudio.play().catch(() => {
+        speakWithBrowserVoice(latestTurn.text);
+      });
+      return;
+    }
+
+    speakWithBrowserVoice(latestTurn.text);
+  }, [autoSpeakReplies, realtimeStatus, turns]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+      if (replyAudioRef.current) {
+        replyAudioRef.current.pause();
+        replyAudioRef.current.src = "";
+      }
+      void stopRealtimeCapture();
+      void realtimePlayerRef.current?.destroy();
+      realtimeSessionRef.current?.disconnect();
+    };
+  }, []);
+
+  const handleToggleListening = async () => {
+    if (isBusy || isProcessing) return;
+
+    if (realtimeEnabled) {
+      if (isListening) {
+        await stopRealtimeCapture();
+        return;
+      }
+
+      const connected = await ensureRealtimeSession();
+      if (!connected) return;
+
+      if (!realtimeCaptureRef.current) {
+        realtimeCaptureRef.current = new LiveDirectorAudioCapture();
+      }
+
+      currentInputSourceRef.current = "voice";
+      try {
+        await realtimeCaptureRef.current.start((base64Audio, mimeType) => {
+          realtimeSessionRef.current?.sendAudioChunk(base64Audio, mimeType);
+        });
+        setIsListening(true);
+      } catch (error) {
+        setRealtimeStatus("error");
+        setRealtimeError(error instanceof Error ? error.message : "Microphone access failed.");
+        realtimeCaptureRef.current = null;
+        setIsListening(false);
+      }
+      return;
+    }
+
+    if (!legacySpeechSupported || !recognitionRef.current) return;
     if (isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
+      stopLegacySpeechRecognition();
       return;
     }
 
@@ -257,17 +546,29 @@ export default function LiveDirectorPanel({
   };
 
   const handleSubmit = async () => {
-    const message = mergeDraftAndInterim(draft, interimTranscript);
+    const message = composerValue;
     if (!message) return;
-    const source: "text" | "voice" = speechSupported && (isListening || listeningSeedRef.current.length > 0) ? "voice" : "text";
-    if (isListening && recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-    }
+
     setDraft("");
-    setInterimTranscript("");
+    if (!realtimeEnabled) {
+      setInterimTranscript("");
+    }
     listeningSeedRef.current = "";
-    await onSubmit(message, source);
+
+    if (realtimeEnabled) {
+      const connected = await ensureRealtimeSession();
+      if (connected) {
+        currentInputSourceRef.current = "text";
+        realtimeSessionRef.current?.sendText(message);
+        return;
+      }
+    }
+
+    if (!realtimeEnabled && isListening) {
+      stopLegacySpeechRecognition();
+    }
+
+    await latestOnSubmitRef.current(message, isListening ? "voice" : "text", "standard");
   };
 
   const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -289,6 +590,7 @@ export default function LiveDirectorPanel({
         } ${isDragging ? "shadow-[0_30px_110px_rgba(34,211,238,0.28)]" : ""}`}
       style={windowStyle}
     >
+      <audio ref={replyAudioRef} hidden preload="none" />
       <div
         onPointerDown={handleWindowDragStart}
         className={`relative flex cursor-grab items-start justify-between gap-3 border-b border-cyan-400/15 bg-gradient-to-r from-cyan-500/14 via-cyan-400/8 to-transparent px-4 py-3 active:cursor-grabbing ${isDragging ? "cursor-grabbing" : ""}`}
@@ -337,8 +639,15 @@ export default function LiveDirectorPanel({
 
       {isOpen && (
         <div className="flex max-h-[min(34rem,calc(100vh-5.5rem))] flex-col">
-          <div className="border-b border-white/8 px-4 py-2 text-xs leading-relaxed text-surface-border">
-            Give direction in chat form. You can target the current selection or call out any shot by number, like "make shot 4 wider."
+          <div className="space-y-2 border-b border-white/8 px-4 py-2 text-xs leading-relaxed text-surface-border">
+            <div className={`rounded-xl border px-3 py-2 ${realtimeStatus === "connected"
+              ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-100/85"
+              : realtimeStatus === "error"
+                ? "border-amber-400/20 bg-amber-400/10 text-amber-100/85"
+                : "border-cyan-400/20 bg-cyan-400/8 text-cyan-100/75"
+              }`}>
+              {realtimeStatusLabel}
+            </div>
           </div>
 
           <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
@@ -383,28 +692,37 @@ export default function LiveDirectorPanel({
                 No live direction yet. Try “make shot 4 wider and moodier” or “mute the middle audio fragment.”
               </div>
             )}
+
+            {(interimTranscript || liveReplyTranscript) && (
+              <div className="space-y-2 rounded-[1.2rem] border border-white/10 bg-white/[0.04] px-3.5 py-3">
+                {interimTranscript && (
+                  <div className="text-xs text-cyan-100/80">
+                    <span className="font-medium text-cyan-200">Listening:</span> {interimTranscript}
+                  </div>
+                )}
+                {liveReplyTranscript && (
+                  <div className="text-xs text-white/75">
+                    <span className="font-medium text-white/90">Speaking:</span> {liveReplyTranscript}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="border-t border-white/8 bg-black/20 px-4 py-4">
-            {interimTranscript && (
-              <div className="mb-3 rounded-2xl border border-cyan-400/20 bg-cyan-400/8 px-3 py-2 text-xs text-cyan-100/80">
-                <span className="font-medium text-cyan-200">Listening:</span> {interimTranscript}
-              </div>
-            )}
-
             <div className="flex items-end gap-3">
               <button
                 type="button"
-                onClick={handleToggleListening}
-                disabled={!speechSupported || isBusy || isProcessing}
-                className={`flex h-14 w-14 shrink-0 items-center justify-center rounded-full border transition-colors ${speechSupported && !isBusy && !isProcessing
+                onClick={() => void handleToggleListening()}
+                disabled={(!realtimeEnabled && !legacySpeechSupported) || isBusy || isProcessing}
+                className={`flex h-14 w-14 shrink-0 items-center justify-center rounded-full border transition-colors ${((realtimeEnabled || legacySpeechSupported) && !isBusy && !isProcessing)
                   ? isListening
                     ? "border-rose-400/35 bg-rose-400/18 text-rose-100 hover:bg-rose-400/25"
                     : "border-cyan-400/35 bg-cyan-400/18 text-cyan-100 hover:bg-cyan-400/24"
                   : "cursor-not-allowed border-white/10 bg-white/5 text-white/30"
                   }`}
-                title={isListening ? "Stop voice capture" : "Start voice capture"}
-                aria-label={isListening ? "Stop voice capture" : "Start voice capture"}
+                title={isListening ? "Stop live voice direction" : "Start live voice direction"}
+                aria-label={isListening ? "Stop live voice direction" : "Start live voice direction"}
               >
                 {isListening ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
               </button>
@@ -420,7 +738,11 @@ export default function LiveDirectorPanel({
                 />
                 <div className="mt-2 flex items-center justify-between gap-3 text-[11px] text-surface-border">
                   <span>
-                    {speechSupported ? "Enter to send. Shift+Enter for a new line." : "Voice capture requires a supported browser."}
+                    {realtimeEnabled
+                      ? "Enter to send through realtime voice. Use the mic for direct speech."
+                      : legacySpeechSupported
+                        ? "Enter to send. Shift+Enter for a new line."
+                        : "Voice capture requires a supported browser or a configured realtime gateway."}
                   </span>
                   <button
                     type="button"

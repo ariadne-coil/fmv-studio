@@ -2,7 +2,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -204,6 +204,80 @@ def test_pipeline_defaults_to_distinct_orchestrator_and_critic_models():
     assert pipeline.orchestrator_model == "gemini-3-pro-preview"
     assert pipeline.critic_model == "gemini-3-flash-preview"
     assert pipeline.text_model == pipeline.orchestrator_model
+
+
+def test_project_context_block_includes_labeled_asset_registry_and_document_context():
+    pipeline = FMVAgentPipeline(api_key=None)
+    state = ProjectState(
+        project_id="proj_asset_context",
+        name="Asset Context",
+        additional_lore="Rain-soaked retro future",
+        assets=[
+            {
+                "id": "asset_img",
+                "url": "/projects/mira.png",
+                "type": "image",
+                "name": "mira_ref.png",
+                "label": "Mira",
+            },
+            {
+                "id": "asset_doc",
+                "url": "/projects/world.pdf",
+                "type": "document",
+                "name": "world.pdf",
+                "label": "World Bible",
+                "text_content": "The city floats above a toxic sea.",
+            },
+        ],
+    )
+
+    context = pipeline._project_context_block(state, max_document_chars=500)
+
+    assert 'image "Mira"' in context
+    assert 'document "World Bible"' in context
+    assert "World Bible:\nThe city floats above a toxic sea." in context
+
+
+@pytest.mark.asyncio
+async def test_asset_relevance_map_prompt_uses_asset_labels(monkeypatch, tmp_path):
+    image_path = tmp_path / "mira.png"
+    image_path.write_bytes(b"fake-image")
+
+    captured = {}
+
+    def fake_generate_content(*, model, contents, config):
+        captured["contents"] = contents
+        return SimpleNamespace(text="{}")
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=fake_generate_content)
+    )
+
+    clip = VideoClip(
+        id="clip_1",
+        timeline_start=0,
+        duration=6.0,
+        storyboard_text="Mira walks through the neon alley under rain.",
+    )
+    asset = SimpleNamespace(
+        id="asset_img",
+        url=str(image_path),
+        name="mira_ref.png",
+        label="Mira",
+    )
+
+    result = await pipeline._build_asset_relevance_map(
+        [asset],
+        [clip],
+        screenplay="Mira is the lead singer wandering through the alley.",
+    )
+
+    assert result == {}
+    prompt_text = "\n".join(part for part in captured["contents"] if isinstance(part, str))
+    assert "Label: Mira" in prompt_text
+    assert "canonical visual reference" in prompt_text
+    assert "Screenplay context:" in prompt_text
 
 
 def test_content_part_from_local_file_uses_inline_bytes_on_vertex(monkeypatch, tmp_path):
@@ -686,7 +760,7 @@ async def test_live_director_planning_update_clears_only_changed_shot_outputs():
     )
 
     assert result["target_clip_id"] == "clip_0"
-    assert updated_state.current_stage == AgentStage.STORYBOARDING
+    assert updated_state.current_stage == AgentStage.PLANNING
     assert updated_state.timeline[0].duration == 8.0
     assert updated_state.timeline[0].storyboard_text == action["clip_updates"]["storyboard_text"]
     assert updated_state.timeline[0].image_url is None
@@ -702,6 +776,405 @@ async def test_live_director_planning_update_clears_only_changed_shot_outputs():
     assert updated_state.director_log[0].source == "voice"
     assert updated_state.director_log[1].role == "agent"
     assert updated_state.director_log[1].applied_changes == action["change_summary"]
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_update_multiple_numbered_shots_in_one_turn():
+    action = {
+        "reply_text": "I refreshed both shots with moodier framing.",
+        "change_summary": ["Updated shots 1 and 2 for a darker, tighter storyboard pass."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [
+            {
+                "target_clip_id": "clip_0",
+                "storyboard_text": "A tighter, moodier opening tableau with longer shadows and colder dawn light.",
+                "duration": None,
+                "video_prompt": None,
+                "clear_target_image": False,
+                "clear_target_video": False,
+            },
+            {
+                "target_clip_id": "clip_1",
+                "storyboard_text": "A matching close, dramatic second frame with stronger contrast and denser haze.",
+                "duration": None,
+                "video_prompt": None,
+                "clear_target_image": False,
+                "clear_target_video": False,
+            },
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_multi_shot",
+        name="Live Director Multi Shot",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                image_score=9,
+                image_reference_ready=True,
+                video_prompt="opening video prompt",
+                video_url="/projects/clip_0.mp4",
+                video_score=8,
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+                image_url="/projects/clip_1.png",
+                image_approved=True,
+                image_score=8,
+                image_reference_ready=True,
+                video_prompt="second video prompt",
+                video_url="/projects/clip_1.mp4",
+                video_score=8,
+                video_approved=True,
+            ),
+        ],
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Make shots 1 and 2 moodier and more dramatic.",
+        display_stage=AgentStage.STORYBOARDING,
+    )
+
+    assert result["target_clip_id"] == "clip_0"
+    assert updated_state.timeline[0].storyboard_text == action["clip_operations"][0]["storyboard_text"]
+    assert updated_state.timeline[1].storyboard_text == action["clip_operations"][1]["storyboard_text"]
+    assert updated_state.current_stage == AgentStage.STORYBOARDING
+    assert updated_state.final_video_url is None
+    assert updated_state.production_timeline == []
+    assert set(updated_state.stage_summaries.keys()) == {"planning"}
+    assert updated_state.director_log[-1].applied_changes == action["change_summary"]
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_insert_and_delete_shots_in_storyboarding_review():
+    action = {
+        "reply_text": "I added a new opening shot and removed the redundant second shot.",
+        "change_summary": [],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [
+            {
+                "operation_type": "insert_before",
+                "target_clip_id": "clip_0",
+                "anchor_clip_id": None,
+                "storyboard_text": "A dawn establishing frame over the empty stadium before the singer enters.",
+                "duration": 4,
+                "video_prompt": None,
+                "clear_target_image": False,
+                "clear_target_video": False,
+            },
+            {
+                "operation_type": "delete",
+                "target_clip_id": "clip_1",
+                "anchor_clip_id": None,
+                "storyboard_text": None,
+                "duration": None,
+                "video_prompt": None,
+                "clear_target_image": False,
+                "clear_target_video": False,
+            },
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_insert_delete",
+        name="Live Director Insert Delete",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Original opening shot",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                image_score=9,
+                image_reference_ready=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Original second shot",
+                image_url="/projects/clip_1.png",
+                image_approved=True,
+                image_score=8,
+                image_reference_ready=True,
+                video_url="/projects/clip_1.mp4",
+                video_approved=True,
+            ),
+        ],
+        final_video_url="/projects/proj_live_director_insert_delete_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Add a new opening shot before shot 1 and delete shot 2.",
+        display_stage=AgentStage.STORYBOARDING,
+    )
+
+    assert updated_state.current_stage == AgentStage.STORYBOARDING
+    assert len(updated_state.timeline) == 2
+    assert updated_state.timeline[0].id != "clip_0"
+    assert updated_state.timeline[0].storyboard_text == action["clip_operations"][0]["storyboard_text"]
+    assert updated_state.timeline[0].image_url is None
+    assert updated_state.timeline[0].video_url is None
+    assert updated_state.timeline[1].id == "clip_0"
+    assert updated_state.timeline[1].image_url == "/projects/clip_0.png"
+    assert updated_state.timeline[1].video_url == "/projects/clip_0.mp4"
+    assert updated_state.timeline[1].timeline_start == 4.0
+    assert updated_state.final_video_url is None
+    assert set(updated_state.stage_summaries.keys()) <= {"planning", "lyria_prompting", "input"}
+    assert result["target_clip_id"] == updated_state.timeline[0].id
+    assert updated_state.director_log[-1].applied_changes == [
+        f"Added shot 1 before shot 1.",
+        "Deleted shot 2.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_reorder_shots():
+    action = {
+        "reply_text": "I moved shot 3 after shot 1.",
+        "change_summary": [],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [
+            {
+                "operation_type": "move_after",
+                "target_clip_id": "clip_2",
+                "anchor_clip_id": "clip_0",
+                "storyboard_text": None,
+                "duration": None,
+                "video_prompt": None,
+                "clear_target_image": False,
+                "clear_target_video": False,
+            }
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_reorder",
+        name="Live Director Reorder",
+        current_stage=AgentStage.PRODUCTION,
+        timeline=[
+            VideoClip(id="clip_0", timeline_start=0.0, duration=6.0, storyboard_text="Shot one", image_url="/projects/clip_0.png", image_approved=True, image_score=9, image_reference_ready=True, video_url="/projects/clip_0.mp4", video_approved=True),
+            VideoClip(id="clip_1", timeline_start=6.0, duration=6.0, storyboard_text="Shot two", image_url="/projects/clip_1.png", image_approved=True, image_score=8, image_reference_ready=True, video_url="/projects/clip_1.mp4", video_approved=True),
+            VideoClip(id="clip_2", timeline_start=12.0, duration=6.0, storyboard_text="Shot three", image_url="/projects/clip_2.png", image_approved=True, image_score=8, image_reference_ready=True, video_url="/projects/clip_2.mp4", video_approved=True),
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Move shot 3 after shot 1.",
+        display_stage=AgentStage.STORYBOARDING,
+    )
+
+    assert [clip.id for clip in updated_state.timeline] == ["clip_0", "clip_2", "clip_1"]
+    assert [clip.timeline_start for clip in updated_state.timeline] == [0.0, 6.0, 12.0]
+    assert updated_state.current_stage == AgentStage.STORYBOARDING
+    assert result["target_clip_id"] == "clip_2"
+    assert updated_state.director_log[-1].applied_changes == ["Moved shot 3 after shot 1."]
+
+
+@pytest.mark.asyncio
+async def test_live_director_returns_advance_navigation_intent_without_mutating_stage():
+    action = {
+        "reply_text": "Moving ahead to the next stage.",
+        "change_summary": ["Proceeding to the next stage."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "navigation_action": "advance",
+        "target_stage": None,
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_advance",
+        name="Live Director Advance",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            )
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Go to the next stage.",
+        display_stage=AgentStage.PLANNING,
+    )
+
+    assert updated_state.current_stage == AgentStage.PLANNING
+    assert result["navigation_action"] == "advance"
+    assert result["target_stage"] is None
+    assert updated_state.director_log[-1].text == action["reply_text"]
+
+
+@pytest.mark.asyncio
+async def test_live_director_realtime_mode_skips_reply_audio():
+    action = {
+        "reply_text": "I tightened the direction and updated the target shot.",
+        "change_summary": ["Updated shot 1."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "target_clip_id": "clip_0",
+        "clip_updates": {
+            "storyboard_text": "A tighter, moodier opening frame with more dramatic dawn haze.",
+            "duration": None,
+            "video_prompt": None,
+        },
+        "clear_target_image": False,
+        "clear_target_video": False,
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    async def _unexpected_tts(*args, **kwargs):
+        raise AssertionError("Realtime live director path should not synthesize fallback TTS audio.")
+
+    pipeline._synthesize_director_reply_audio = _unexpected_tts
+
+    state = ProjectState(
+        project_id="proj_live_director_realtime",
+        name="Live Director Realtime",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Original opening shot",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+            ),
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Make shot 1 tighter and moodier.",
+        display_stage=AgentStage.STORYBOARDING,
+        selected_clip_id="clip_0",
+        source="voice",
+        speech_mode="realtime",
+    )
+
+    assert result["target_clip_id"] == "clip_0"
+    assert updated_state.director_log[-1].role == "agent"
+    assert updated_state.director_log[-1].audio_url is None
+    assert updated_state.director_log[-1].text == action["reply_text"]
 
 
 @pytest.mark.asyncio
@@ -878,6 +1351,259 @@ async def test_live_director_explicit_shot_number_overrides_selected_clip():
     assert updated_state.timeline[0].storyboard_text == "Opening shot"
     assert updated_state.timeline[1].storyboard_text == action["clip_updates"]["storyboard_text"]
     assert updated_state.current_stage == AgentStage.STORYBOARDING
+
+
+@pytest.mark.asyncio
+async def test_live_director_enriches_literal_storyboard_update_before_applying():
+    user_message = "Add more description to this shot."
+    action = {
+        "reply_text": "I enriched the shot description.",
+        "change_summary": ["Expanded the selected storyboard frame."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "target_clip_id": "clip_0",
+        "clip_updates": {
+            "storyboard_text": user_message,
+            "duration": None,
+            "video_prompt": None,
+        },
+        "clear_target_image": False,
+        "clear_target_video": False,
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+    enriched_storyboard = (
+        "A medium-wide rooftop frame at blue hour, with the singer silhouetted against a glowing skyline, "
+        "wind tugging at the coat while distant neon reflections shimmer across the wet concrete."
+    )
+
+    class _SequencedResponder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(text=json.dumps(action))
+            return SimpleNamespace(text=enriched_storyboard)
+
+    responder = _SequencedResponder()
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=responder.generate_content)
+    )
+    async def _skip_director_audio(*args, **kwargs):
+        return None
+    pipeline._synthesize_director_reply_audio = _skip_director_audio
+
+    state = ProjectState(
+        project_id="proj_live_director_enrich",
+        name="Live Director Enrich",
+        current_stage=AgentStage.STORYBOARDING,
+        screenplay="A rooftop performance at dusk.",
+        instructions="Cinematic realism with moody city lighting.",
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Singer on a rooftop at dusk.",
+            )
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message=user_message,
+        display_stage=AgentStage.STORYBOARDING,
+        selected_clip_id="clip_0",
+    )
+
+    assert result["target_clip_id"] == "clip_0"
+    assert updated_state.timeline[0].storyboard_text == enriched_storyboard
+    assert len(responder.calls) == 2
+    assert "finished, richer project copy" in responder.calls[0]["contents"][0]
+    assert "Return ONLY the final field text" in responder.calls[1]["contents"][0]
+
+
+@pytest.mark.asyncio
+async def test_live_director_skips_enrichment_for_already_detailed_storyboard_update():
+    action = {
+        "reply_text": "I sharpened the shot direction.",
+        "change_summary": ["Refined the selected storyboard frame."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "target_clip_id": "clip_0",
+        "clip_updates": {
+            "storyboard_text": (
+                "A low-angle close shot of the singer under hard amber sidelighting, with drifting smoke, "
+                "rain flecks on the lens, and the skyline reduced to soft bokeh behind them."
+            ),
+            "duration": None,
+            "video_prompt": None,
+        },
+        "clear_target_image": False,
+        "clear_target_video": False,
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    class _SingleResponder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(text=json.dumps(action))
+
+    responder = _SingleResponder()
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=responder.generate_content)
+    )
+    async def _skip_director_audio(*args, **kwargs):
+        return None
+    pipeline._synthesize_director_reply_audio = _skip_director_audio
+
+    state = ProjectState(
+        project_id="proj_live_director_no_extra_rewrite",
+        name="Live Director No Extra Rewrite",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Singer on a rooftop at dusk.",
+            )
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Make this shot moodier and more cinematic.",
+        display_stage=AgentStage.STORYBOARDING,
+        selected_clip_id="clip_0",
+    )
+
+    assert result["target_clip_id"] == "clip_0"
+    assert updated_state.timeline[0].storyboard_text == action["clip_updates"]["storyboard_text"]
+    assert len(responder.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_director_writes_agent_reply_audio_with_stage_brief_voice_path(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_storage_roots(monkeypatch, tmp_path)
+
+    action = {
+        "reply_text": "I tightened the frame and deepened the lighting contrast.",
+        "change_summary": ["Refined the selected storyboard frame."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "target_clip_id": "clip_0",
+        "clip_updates": {
+            "storyboard_text": (
+                "A close profile frame with harder side light carving the singer out from the darkened skyline."
+            ),
+            "duration": None,
+            "video_prompt": None,
+        },
+        "clear_target_image": False,
+        "clear_target_video": False,
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+    fake_tts_response = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(
+                    parts=[
+                        SimpleNamespace(
+                            inline_data=SimpleNamespace(
+                                data=b"\x00\x00" * 300,
+                            )
+                        )
+                    ]
+                )
+            )
+        ]
+    )
+
+    class _SequencedResponder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(text=json.dumps(action))
+            return fake_tts_response
+
+    responder = _SequencedResponder()
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=responder.generate_content)
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_audio",
+        name="Live Director Audio",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Singer on a rooftop at dusk.",
+            )
+        ],
+    )
+
+    updated_state, _ = await pipeline.handle_live_director_mode(
+        state,
+        message="Make this frame tighter.",
+        display_stage=AgentStage.STORYBOARDING,
+        selected_clip_id="clip_0",
+    )
+
+    assert len(updated_state.director_log) == 2
+    assert updated_state.director_log[0].audio_url is None
+    assert updated_state.director_log[1].audio_url is not None
+    audio_path = Path(_local_media_path(updated_state.director_log[1].audio_url))
+    assert audio_path.exists()
+    assert audio_path.read_bytes()[:4] == b"RIFF"
+    assert responder.calls[1]["config"].speech_config.voice_config.prebuilt_voice_config.voice_name == pipeline.stage_brief_voice
 
 
 @pytest.mark.asyncio
@@ -1137,6 +1863,28 @@ async def test_generate_google_video_clip_respects_selected_video_resolution(mon
     assert pipeline.video_width == 1280
     assert pipeline.video_height == 720
     assert request["config"].resolution == "720p"
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_supports_4k_resolution(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"fake-image")
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_resolution="4k")
+    pipeline.client = _FakeClient(video_bytes=b"fake-video-bytes")
+
+    video_bytes = await pipeline._generate_google_video_clip(
+        prompt="Animate this scene in maximum detail.",
+        duration_seconds=6,
+        image_path=str(storyboard_path),
+    )
+
+    assert video_bytes == b"fake-video-bytes"
+    request = pipeline.client.models.calls[0]
+    assert pipeline.video_width == 3840
+    assert pipeline.video_height == 2160
+    assert request["config"].resolution == "4k"
 
 
 @pytest.mark.asyncio
@@ -1419,6 +2167,8 @@ async def test_node_music_prompting_for_automatic_provider_only_drafts_prompts(m
     assert result.music_url is None
     assert result.last_error is None
     assert calls[0]["model"] == pipeline.text_model
+    assert "instrumental-only" in calls[0]["contents"][0]
+    assert "Do not include vocal style instructions" in calls[0]["contents"][0]
 
 
 @pytest.mark.asyncio
@@ -1463,6 +2213,105 @@ async def test_node_music_prompting_manual_import_provider_only_drafts_prompts(m
     assert result.style_prompt == "Alt-pop, intimate, soaring hook"
     assert result.music_url is None
     assert result.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_generate_google_lyria_realtime_track_adapts_prompt_for_instrumental_provider(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_storage_roots(monkeypatch, tmp_path)
+
+    calls = []
+
+    pipeline = FMVAgentPipeline(api_key="dummy", music_model="lyria-realtime-exp")
+    pipeline.uses_vertex_ai = True
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(
+            generate_content=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+                text="Dark synthwave instrumental, pulsing analog bass, glassy arpeggios, nocturnal tension, cinematic rise"
+            )
+        )
+    )
+
+    captured_prompt = {}
+
+    def _fake_generate_vertex_audio(prompt: str):
+        captured_prompt["value"] = prompt
+        return (b"RIFFfake", "audio/wav")
+
+    pipeline._generate_vertex_lyria_track_bytes = _fake_generate_vertex_audio
+
+    state = ProjectState(
+        project_id="proj_music_adapt",
+        name="Music Adapt Test",
+        current_stage=AgentStage.LYRIA_PROMPTING,
+        screenplay="A lonely singer crosses a neon city.",
+        instructions="Cinematic and moody.",
+        lyrics_prompt="City lights call out your name.",
+        style_prompt="Synthwave ballad with soaring female vocals and a huge chorus.",
+    )
+
+    result = await pipeline._generate_google_lyria_realtime_track(state)
+
+    assert result is not None
+    assert captured_prompt["value"] == (
+        "Dark synthwave instrumental, pulsing analog bass, glassy arpeggios, nocturnal tension, cinematic rise"
+    )
+    assert "instrumental-only music generation model" in calls[0]["contents"][0]
+    assert "Use lyrics only as narrative context" in calls[0]["contents"][0]
+
+
+def test_generate_vertex_lyria_track_bytes_accepts_bytes_base64_encoded(monkeypatch):
+    import urllib.request
+
+    pipeline = FMVAgentPipeline(api_key="dummy", music_model="lyria-realtime-exp")
+
+    class _FakeCredentials:
+        token = "test-token"
+
+        def refresh(self, _request):
+            return None
+
+    google_module = ModuleType("google")
+    google_auth_module = ModuleType("google.auth")
+    google_auth_module.default = lambda scopes=None: (_FakeCredentials(), None)
+    google_module.auth = google_auth_module
+
+    google_auth_transport_module = ModuleType("google.auth.transport")
+    google_auth_transport_requests_module = ModuleType("google.auth.transport.requests")
+    google_auth_transport_requests_module.Request = lambda: object()
+    google_auth_transport_module.requests = google_auth_transport_requests_module
+
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.auth", google_auth_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", google_auth_transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", google_auth_transport_requests_module)
+    monkeypatch.setattr(graph_module, "get_gcp_project", lambda: "proj-test")
+    monkeypatch.setattr(graph_module, "get_vertex_media_location", lambda: "us-central1")
+
+    response_body = {
+        "predictions": [
+            {
+                "bytesBase64Encoded": "UklGRgAAAAA=",
+            }
+        ]
+    }
+
+    class _FakeHTTPResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(response_body).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=300: _FakeHTTPResponse())
+
+    music_bytes, mime_type = pipeline._generate_vertex_lyria_track_bytes("test prompt")
+
+    assert music_bytes == b"RIFF\x00\x00\x00\x00"
+    assert mime_type == "audio/wav"
 
 
 @pytest.mark.asyncio
@@ -2035,13 +2884,15 @@ async def test_node_production_accepts_cache_busted_local_paths(monkeypatch, tmp
 
     assert result.current_stage == AgentStage.COMPLETED
     assert result.final_video_url == "/projects/proj_test_final.mp4"
-    assert len(subprocess_calls) == 5
+    assert len(subprocess_calls) == 7
     assert str(clip_path) in subprocess_calls[0]
     assert str(projects_dir / "proj_test_clip_0_frag_0_video.mp4") in subprocess_calls[0]
     assert str(projects_dir / "proj_test_clip_0_frag_0_audio.m4a") in subprocess_calls[1]
     assert str(projects_dir / "proj_test_clip_0_frag_0_segment.mp4") in subprocess_calls[2]
     assert str(projects_dir / "proj_test_sequence.mp4") in subprocess_calls[3]
     assert _local_media_path(state.music_url) in subprocess_calls[4]
+    assert str(projects_dir / "proj_test_music_bed.m4a") in subprocess_calls[5]
+    assert str(projects_dir / "proj_test_final.mp4") in subprocess_calls[6]
 
 
 @pytest.mark.asyncio
@@ -2245,6 +3096,147 @@ async def test_run_pipeline_step_async_transitions_project_to_storyboarding_imme
 
 
 @pytest.mark.asyncio
+async def test_live_director_endpoint_can_advance_into_async_storyboarding(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+    job_queue_module.LOCAL_PIPELINE_TASKS.clear()
+    monkeypatch.setenv("FMV_JOB_DRIVER", "local")
+
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    class _FakePipeline:
+        def __init__(self, *args, **kwargs):
+            self.persist_state_callback = kwargs.get("persist_state_callback")
+
+        async def handle_live_director_mode(self, state, **kwargs):
+            return state.model_copy(deep=True), {
+                "reply_text": "Moving into storyboarding now.",
+                "applied_changes": ["Proceeding to storyboarding."],
+                "target_clip_id": None,
+                "target_fragment_id": None,
+                "stage": state.current_stage.value,
+                "navigation_action": "advance",
+                "target_stage": None,
+            }
+
+        async def run_pipeline(self, state):
+            started.set()
+            await finish.wait()
+            state.timeline[0].image_url = "/projects/proj_live_director_stage_nav_clip_0.png"
+            state.timeline[0].image_approved = True
+            state.current_stage = AgentStage.STORYBOARDING
+            if self.persist_state_callback:
+                await self.persist_state_callback(state)
+            return state
+
+    monkeypatch.setattr(endpoints_module, "FMVAgentPipeline", _FakePipeline)
+
+    state = ProjectState(
+        project_id="proj_live_director_stage_nav",
+        name="Live Director Stage Nav",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            )
+        ],
+    )
+    (projects_dir / "proj_live_director_stage_nav.fmv").write_text(state.model_dump_json())
+
+    response = await endpoints_module.live_director_mode(
+        "proj_live_director_stage_nav",
+        endpoints_module.LiveDirectorRequest(
+            message="Go to the next stage.",
+            display_stage=AgentStage.PLANNING,
+        ),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert response.project.current_stage == AgentStage.STORYBOARDING
+    assert response.project.active_run is not None
+    assert response.project.active_run.stage == AgentStage.STORYBOARDING
+
+    status = endpoints_module.get_project_run_status("proj_live_director_stage_nav")
+    assert status.is_running is True
+    assert status.stage == AgentStage.STORYBOARDING
+
+    finish.set()
+    await asyncio.sleep(0.05)
+
+    final_state = endpoints_module.get_project("proj_live_director_stage_nav")
+    assert final_state.timeline[0].image_url == "/projects/proj_live_director_stage_nav_clip_0.png"
+    assert final_state.active_run is None
+
+
+@pytest.mark.asyncio
+async def test_live_director_endpoint_can_rewind_to_previous_display_stage(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    class _FakePipeline:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def handle_live_director_mode(self, state, **kwargs):
+            return state.model_copy(deep=True), {
+                "reply_text": "Going back one stage for another pass.",
+                "applied_changes": ["Returned to the previous stage."],
+                "target_clip_id": None,
+                "target_fragment_id": None,
+                "stage": state.current_stage.value,
+                "navigation_action": "rewind",
+                "target_stage": None,
+            }
+
+    monkeypatch.setattr(endpoints_module, "FMVAgentPipeline", _FakePipeline)
+
+    state = ProjectState(
+        project_id="proj_live_director_rewind",
+        name="Live Director Rewind",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+                image_url="/projects/proj_live_director_rewind_clip_0.png",
+                image_prompt="opening frame",
+                image_critiques=["Solid continuity."],
+                image_approved=True,
+                video_url="/projects/proj_live_director_rewind_clip_0.mp4",
+                video_prompt="opening render",
+                video_critiques=["Rendered cleanly."],
+                video_approved=True,
+            )
+        ],
+        final_video_url="/projects/proj_live_director_rewind_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_live_director_rewind.fmv").write_text(state.model_dump_json())
+
+    response = await endpoints_module.live_director_mode(
+        "proj_live_director_rewind",
+        endpoints_module.LiveDirectorRequest(
+            message="Go back one stage.",
+            display_stage=AgentStage.STORYBOARDING,
+        ),
+    )
+
+    assert response.project.current_stage == AgentStage.PLANNING
+    assert response.project.timeline[0].image_url is None
+    assert response.project.timeline[0].video_url is None
+    assert response.project.final_video_url is None
+    assert set(response.project.stage_summaries.keys()) == {"planning"}
+
+
+@pytest.mark.asyncio
 async def test_run_pipeline_step_async_queues_cloud_task_and_persists_run_state(monkeypatch, tmp_path):
     projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
     job_queue_module.LOCAL_PIPELINE_TASKS.clear()
@@ -2365,10 +3357,11 @@ async def test_node_production_uses_silent_audio_for_muted_fragments(monkeypatch
     result = await pipeline.node_production(state)
 
     assert result.current_stage == AgentStage.COMPLETED
-    assert len(subprocess_calls) == 5
+    assert len(subprocess_calls) == 7
     assert "anullsrc=r=48000:cl=stereo" in subprocess_calls[1]
     assert str(clip_path) not in subprocess_calls[1]
     assert str(projects_dir / "proj_test_clip_0_frag_0_audio.m4a") in subprocess_calls[1]
+    assert _local_media_path(state.music_url) in subprocess_calls[4]
 
 
 @pytest.mark.asyncio
@@ -2433,7 +3426,7 @@ async def test_node_storyboarding_ignores_list_shaped_relevance_map(monkeypatch,
         )
     )
 
-    async def fake_build_asset_relevance_map(image_assets, clips):
+    async def fake_build_asset_relevance_map(image_assets, clips, *, screenplay):
         return []
 
     async def fake_select_previous_shots(current_clip, previous_clips, limit=6):

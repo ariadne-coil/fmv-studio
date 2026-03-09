@@ -11,6 +11,7 @@ This repo contains automated deployment code for FMV Studio on Google Cloud.
 - Service accounts and IAM bindings
 - Backend container build and Cloud Run deployment
 - Frontend container build and Cloud Run deployment
+- Live Director gateway build and Cloud Run deployment
 
 ## Infrastructure-as-Code
 
@@ -22,6 +23,7 @@ It provisions:
 - GCS bucket
 - Cloud Tasks queue
 - Runtime service accounts
+- Live Director runtime service account
 - Required IAM bindings
 - A generated internal task token for backend task dispatch
 
@@ -33,6 +35,8 @@ Cloud Build configs live in [`infra/cloudbuild`](../infra/cloudbuild):
 - [`frontend.yaml`](../infra/cloudbuild/frontend.yaml)
 
 The frontend container is runtime-configured with `FMV_BACKEND_ORIGIN` so its server-side proxy routes know how to reach the private Cloud Run backend.
+
+The deployment also builds and deploys the public `Live Director` websocket gateway, which proxies realtime browser audio sessions to Vertex AI Live.
 
 ## One-Command Deploy
 
@@ -52,6 +56,7 @@ Optional overrides:
 export ARTIFACT_REPOSITORY="fmv-studio"
 export BACKEND_SERVICE_NAME="fmv-studio-backend"
 export FRONTEND_SERVICE_NAME="fmv-studio-frontend"
+export LIVE_DIRECTOR_SERVICE_NAME="fmv-studio-live-director"
 export TASKS_QUEUE_NAME="fmv-pipeline"
 export STORAGE_BUCKET_NAME="${PROJECT_ID}-fmv-studio-assets"
 export VERTEX_LOCATION="global"
@@ -72,6 +77,7 @@ That means:
 - Gemini/Veo/Lyria requests use Vertex AI credentials instead of API keys
 - project JSON and generated media persist to GCS instead of local disk
 - long-running storyboard/filming runs are dispatched through Cloud Tasks instead of in-process asyncio jobs
+- realtime `Live Director` voice sessions run through a dedicated Cloud Run websocket gateway that proxies to Vertex AI Live
 
 ## Backend Hardening
 
@@ -84,6 +90,17 @@ The cloud deployment keeps the frontend public but makes the backend private.
 - the internal task endpoint still requires `X-Internal-Task-Token` as a second check
 
 This keeps public users on the frontend URL while removing direct anonymous access to the backend API.
+
+## Live Director Realtime Gateway
+
+The cloud deployment also exposes a separate public Cloud Run service for realtime `Live Director` voice:
+
+- the browser opens a websocket to the `Live Director` gateway
+- the gateway authenticates to Google Cloud with ADC
+- the gateway opens the upstream Vertex AI Live session
+- the frontend still sends actual project mutations through the main backend, so project state remains centralized
+
+This split keeps the private backend hardened while still allowing realtime browser audio for the directing experience.
 
 ## Local Testing
 
@@ -105,5 +122,6 @@ Then set the relevant environment variables from [`.env.example`](../.env.exampl
 
 - The backend serves media through `/projects/...` regardless of whether the underlying storage is local disk or GCS.
 - In cloud mode, media and API traffic flow through the frontend's same-origin proxy routes so the private backend URL does not need to be exposed to browsers.
+- Realtime Live Director voice is the one exception: it uses a dedicated public websocket gateway because browsers need direct low-latency audio streaming.
 - The current official cloud music path is instrumental-only.
-- Frontend and backend are deployed as separate Cloud Run services.
+- Frontend, backend, and the Live Director gateway are deployed as separate Cloud Run services.

@@ -7,20 +7,28 @@ import LiveDirectorPanel from "@/components/ui/LiveDirectorPanel";
 import ProductionTimelineEditor from "@/components/ui/ProductionTimelineEditor";
 import SettingsModal from "@/components/ui/SettingsModal";
 import ShotListEditor from "@/components/ui/ShotListEditor";
-import { Loader2, Music, ImageIcon, Play, Pause, SkipBack, SkipForward, Wand2, X, AlertCircle, Save, Video, Settings, ListPlus, Maximize2, GripVertical, Home } from 'lucide-react';
-import { api, getMusicProviderOption, getStoredModels, getStoredPreferences, isManualImportMusicProvider, normalizeMusicProviderId, ProductionTimelineFragment, ProjectRunStatus, ProjectState, toBackendAssetUrl, VideoClip } from "@/lib/api";
+import { Loader2, Music, ImageIcon, Play, Pause, SkipBack, SkipForward, Wand2, X, AlertCircle, Save, Video, Settings, ListPlus, Maximize2, GripVertical, Home, FileText } from 'lucide-react';
+import { api, getMusicProviderOption, getStoredModels, getStoredPreferences, isManualImportMusicProvider, LiveDirectorResponse, normalizeMusicProviderId, ProductionTimelineFragment, ProjectRunStatus, ProjectState, toBackendAssetUrl, VideoClip } from "@/lib/api";
 
 const MIN_PRODUCTION_FRAGMENT_DURATION = 0.25;
+const MIN_MUSIC_FRAGMENT_DURATION = 0.25;
 const DEFAULT_MUSIC_MIN_DURATION_SECONDS = 90;
 const DEFAULT_MUSIC_MAX_DURATION_SECONDS = 240;
 
-function buildDefaultProductionTimeline(clips: VideoClip[]): ProductionTimelineFragment[] {
+function buildDefaultProductionTimeline(
+    clips: VideoClip[],
+    options?: {
+        includeMusic?: boolean;
+        musicDuration?: number | null;
+    }
+): ProductionTimelineFragment[] {
     let currentTime = 0;
-    return [...clips]
+    const videoFragments = [...clips]
         .sort((left, right) => left.timeline_start - right.timeline_start)
         .map((clip) => {
             const fragment = {
                 id: `${clip.id}_frag_0`,
+                track_type: "video" as const,
                 source_clip_id: clip.id,
                 timeline_start: currentTime,
                 source_start: 0,
@@ -30,26 +38,97 @@ function buildDefaultProductionTimeline(clips: VideoClip[]): ProductionTimelineF
             currentTime += clip.duration;
             return fragment;
         });
+
+    if (!options?.includeMusic || currentTime <= 0) {
+        return videoFragments;
+    }
+
+    const musicDuration = Number.isFinite(options.musicDuration)
+        ? Number(options.musicDuration)
+        : currentTime;
+    const defaultMusicDuration = Math.max(
+        MIN_MUSIC_FRAGMENT_DURATION,
+        Math.min(currentTime, musicDuration || currentTime),
+    );
+
+    return [
+        ...videoFragments,
+        {
+            id: "music_frag_0",
+            track_type: "music",
+            source_clip_id: null,
+            timeline_start: 0,
+            source_start: 0,
+            duration: defaultMusicDuration,
+            audio_enabled: true,
+        },
+    ];
 }
 
-function normalizeProductionTimeline(fragments: ProductionTimelineFragment[]): ProductionTimelineFragment[] {
-    let currentTime = 0;
-    return fragments
-        .filter((fragment) => fragment.duration > 0)
+function normalizeProductionTimeline(
+    fragments: ProductionTimelineFragment[],
+    totalVideoDuration: number,
+    musicDuration?: number | null,
+): ProductionTimelineFragment[] {
+    let currentVideoTime = 0;
+    const normalizedVideo = fragments
+        .filter((fragment) => (fragment.track_type ?? "video") !== "music" && fragment.duration > 0)
+        .sort((left, right) => left.timeline_start - right.timeline_start)
         .map((fragment) => {
             const normalized = {
                 ...fragment,
+                track_type: "video" as const,
                 source_start: Math.max(0, Number(fragment.source_start.toFixed(3))),
                 duration: Math.max(MIN_PRODUCTION_FRAGMENT_DURATION, Number(fragment.duration.toFixed(3))),
-                timeline_start: Number(currentTime.toFixed(3)),
+                timeline_start: Number(currentVideoTime.toFixed(3)),
                 audio_enabled: fragment.audio_enabled ?? true,
             };
-            currentTime += normalized.duration;
+            currentVideoTime += normalized.duration;
             return normalized;
         });
+
+    const normalizedMusic: ProductionTimelineFragment[] = [];
+    let previousMusicEnd = 0;
+    for (const fragment of fragments
+        .filter((item) => (item.track_type ?? "video") === "music" && item.duration > 0)
+        .sort((left, right) => left.timeline_start - right.timeline_start)) {
+        let timelineStart = Math.max(0, Number(fragment.timeline_start.toFixed(3)));
+        timelineStart = Math.max(timelineStart, Number(previousMusicEnd.toFixed(3)));
+        if (totalVideoDuration > 0) {
+            timelineStart = Math.min(timelineStart, Math.max(0, totalVideoDuration - MIN_MUSIC_FRAGMENT_DURATION));
+        }
+
+        let sourceStart = Math.max(0, Number(fragment.source_start.toFixed(3)));
+        if (Number.isFinite(musicDuration) && (musicDuration ?? 0) > 0) {
+            sourceStart = Math.min(sourceStart, Math.max(0, (musicDuration ?? 0) - MIN_MUSIC_FRAGMENT_DURATION));
+        }
+
+        let duration = Math.max(MIN_MUSIC_FRAGMENT_DURATION, Number(fragment.duration.toFixed(3)));
+        if (totalVideoDuration > 0) {
+            duration = Math.min(duration, Math.max(MIN_MUSIC_FRAGMENT_DURATION, totalVideoDuration - timelineStart));
+        }
+        if (Number.isFinite(musicDuration) && (musicDuration ?? 0) > 0) {
+            duration = Math.min(duration, Math.max(MIN_MUSIC_FRAGMENT_DURATION, (musicDuration ?? 0) - sourceStart));
+        }
+        if (duration <= 0) continue;
+
+        const normalized = {
+            ...fragment,
+            track_type: "music" as const,
+            source_clip_id: null,
+            timeline_start: Number(timelineStart.toFixed(3)),
+            source_start: Number(sourceStart.toFixed(3)),
+            duration: Number(duration.toFixed(3)),
+            audio_enabled: true,
+        };
+        normalizedMusic.push(normalized);
+        previousMusicEnd = normalized.timeline_start + normalized.duration;
+    }
+
+    return [...normalizedVideo, ...normalizedMusic];
 }
 
-type ProductionTrackType = "video" | "audio";
+type ProductionTrackType = "video" | "audio" | "music";
 
 function getProductionFragmentAtTime(
     fragments: ProductionTimelineFragment[],
@@ -64,6 +143,23 @@ function getProductionFragmentAtTime(
         }
     }
     return fragments[fragments.length - 1] ?? null;
+}
+
+function getTrackFragments(
+    fragments: ProductionTimelineFragment[],
+    trackType: "video" | "music",
+): ProductionTimelineFragment[] {
+    return fragments
+        .filter((fragment) => (fragment.track_type ?? "video") === trackType)
+        .sort((left, right) => left.timeline_start - right.timeline_start);
+}
+
+function getTrackFragmentAtTime(
+    fragments: ProductionTimelineFragment[],
+    seconds: number,
+    trackType: "video" | "music",
+): ProductionTimelineFragment | null {
+    return getProductionFragmentAtTime(getTrackFragments(fragments, trackType), seconds);
 }
 
 function formatTransportTime(seconds: number): string {
@@ -143,6 +239,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const [musicStageCurrentTime, setMusicStageCurrentTime] = useState(0);
     const [musicStageDuration, setMusicStageDuration] = useState(0);
     const [isMusicStagePlaying, setIsMusicStagePlaying] = useState(false);
+    const [productionMusicDuration, setProductionMusicDuration] = useState(0);
 
     // Stage-specific UI states
     const [selectedPlanningShotId, setSelectedPlanningShotId] = useState<string | null>(null);
@@ -165,6 +262,19 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const timelineAnimationFrameRef = useRef<number | null>(null);
     const timelineLastFrameRef = useRef<number | null>(null);
     const playheadRef = useRef(0);
+
+    const applyCurrentInputTextFields = (baseProject: ProjectState): ProjectState => {
+        if (displayStage !== 'input') return baseProject;
+        const screenplay = (document.getElementById('screenplay-input') as HTMLTextAreaElement | null)?.value ?? baseProject.screenplay;
+        const instructions = (document.getElementById('instructions-input') as HTMLTextAreaElement | null)?.value ?? baseProject.instructions;
+        const lore = (document.getElementById('lore-input') as HTMLTextAreaElement | null)?.value ?? baseProject.additional_lore;
+        return {
+            ...baseProject,
+            screenplay,
+            instructions,
+            additional_lore: lore,
+        };
+    };
 
     const musicWorkflow = project?.music_workflow ?? 'lyria3';
     const shouldShowMusicPromptStage = musicWorkflow !== 'uploaded_track';
@@ -192,11 +302,30 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const displayStage = viewedStage || (project?.current_stage ?? 'input');
     const displayStageIndex = stageMap[displayStage] ?? 0;
     const isCurrentDisplayedStage = displayStage === (project?.current_stage ?? 'input');
+    const defaultVideoProgramDuration = project
+        ? project.timeline.reduce((sum, clip) => sum + clip.duration, 0)
+        : 0;
     const productionTimeline = project
         ? normalizeProductionTimeline(
             project.production_timeline.length > 0
-                ? project.production_timeline
-                : buildDefaultProductionTimeline(project.timeline)
+                ? (
+                    project.music_url
+                    && !project.production_timeline.some((fragment) => (fragment.track_type ?? "video") === "music")
+                )
+                    ? [
+                        ...project.production_timeline,
+                        ...buildDefaultProductionTimeline(project.timeline, {
+                            includeMusic: true,
+                            musicDuration: productionMusicDuration || undefined,
+                        }).filter((fragment) => fragment.track_type === "music"),
+                    ]
+                    : project.production_timeline
+                : buildDefaultProductionTimeline(project.timeline, {
+                    includeMusic: !!project.music_url,
+                    musicDuration: productionMusicDuration || undefined,
+                }),
+            defaultVideoProgramDuration,
+            productionMusicDuration || undefined,
         )
         : [];
     const liveDirectorFocusLabel = (() => {
@@ -216,6 +345,9 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         if (displayStage === 'production' && selectedProductionFragmentId) {
             const fragment = productionTimeline.find((item) => item.id === selectedProductionFragmentId);
             if (!fragment) return "Selected edit";
+            if ((fragment.track_type ?? "video") === "music") {
+                return "Selected music segment";
+            }
             const shotIndex = project.timeline.findIndex((clip) => clip.id === fragment.source_clip_id);
             return shotIndex >= 0 ? `Edit from Shot ${shotIndex + 1}` : "Selected edit";
         }
@@ -236,7 +368,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         (maxDuration, fragment) => Math.max(maxDuration, fragment.timeline_start + fragment.duration),
         0
     );
-    const activeProductionFragment = getProductionFragmentAtTime(productionTimeline, playheadSeconds);
+    const activeProductionFragment = getTrackFragmentAtTime(productionTimeline, playheadSeconds, "video");
     const activeProductionClip = project && activeProductionFragment
         ? project.timeline.find((clip) => clip.id === activeProductionFragment.source_clip_id) ?? null
         : null;
@@ -433,7 +565,9 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const canSplitSelected = !!selectedProductionFragment
         && playheadSeconds > selectedProductionFragment.timeline_start + MIN_PRODUCTION_FRAGMENT_DURATION
         && playheadSeconds < (selectedProductionFragment.timeline_start + selectedProductionFragment.duration - MIN_PRODUCTION_FRAGMENT_DURATION);
-    const canToggleSelectedAudio = !!selectedProductionFragment && selectedProductionTrack === "audio";
+    const canToggleSelectedAudio = !!selectedProductionFragment
+        && (selectedProductionFragment.track_type ?? "video") === "video"
+        && selectedProductionTrack === "audio";
     const canControlMusicStagePreview = displayStage === 'lyria_prompting' && !!project?.music_url;
     const musicTrackNeedsRegeneration = !usesManualMusicImport && !!project?.music_url && !hasCurrentAutomaticMusicTrack;
     const canContinueFromMusicStage = usesManualMusicImport ? !!project?.music_url : hasCurrentAutomaticMusicTrack;
@@ -496,19 +630,25 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         if (!project || !isProductionDisplay) return;
 
         const clampedSeconds = Math.max(0, Math.min(seconds, productionDuration));
-        const fragment = getProductionFragmentAtTime(productionTimeline, clampedSeconds);
+        const fragment = getTrackFragmentAtTime(productionTimeline, clampedSeconds, "video");
+        const musicFragment = getTrackFragmentAtTime(productionTimeline, clampedSeconds, "music");
         const clip = fragment
             ? project.timeline.find((timelineClip) => timelineClip.id === fragment.source_clip_id) ?? null
             : null;
 
         const musicElement = productionMusicRef.current;
         if (musicElement && project.music_url) {
-            const drift = Math.abs(musicElement.currentTime - clampedSeconds);
-            if (drift > 0.25) {
-                musicElement.currentTime = clampedSeconds;
-            }
-            if (autoplay) {
-                void musicElement.play().catch(() => {});
+            if (musicFragment) {
+                const musicSeconds = musicFragment.source_start + Math.max(0, clampedSeconds - musicFragment.timeline_start);
+                const drift = Math.abs(musicElement.currentTime - musicSeconds);
+                if (drift > 0.25) {
+                    musicElement.currentTime = musicSeconds;
+                }
+                if (autoplay) {
+                    void musicElement.play().catch(() => {});
+                } else {
+                    musicElement.pause();
+                }
             } else {
                 musicElement.pause();
             }
@@ -545,7 +685,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
 
     const handleProductionSeek = (seconds: number) => {
         const clampedSeconds = Math.max(0, Math.min(seconds, productionDuration));
-        const activeFragment = getProductionFragmentAtTime(productionTimeline, clampedSeconds);
+        const activeFragment = getTrackFragmentAtTime(productionTimeline, clampedSeconds, "video");
         setSelectedProductionFragmentId(activeFragment?.id ?? null);
         playheadRef.current = clampedSeconds;
         setPlayheadSeconds(clampedSeconds);
@@ -560,7 +700,14 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         }
     ) => {
         if (!project) return;
-        const normalizedTimeline = normalizeProductionTimeline(fragments);
+        const nextVideoDuration = fragments
+            .filter((fragment) => (fragment.track_type ?? "video") !== "music")
+            .reduce((sum, fragment) => sum + fragment.duration, 0);
+        const normalizedTimeline = normalizeProductionTimeline(
+            fragments,
+            nextVideoDuration,
+            productionMusicDuration || undefined,
+        );
         const nextProject: ProjectState = {
             ...project,
             current_stage: 'production',
@@ -593,10 +740,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         setSelectedProductionTrack(track);
     };
 
-    const handleMoveProductionFragment = (draggedFragmentId: string, beforeFragmentId: string | null) => {
+    const handleMoveVideoProductionFragment = (draggedFragmentId: string, beforeFragmentId: string | null) => {
         if (displayStage !== 'production' || isBusy) return;
         if (beforeFragmentId === draggedFragmentId) return;
-        const reorderedTimeline = [...productionTimeline];
+        const videoFragments = getTrackFragments(productionTimeline, "video");
+        const musicFragments = getTrackFragments(productionTimeline, "music");
+        const reorderedTimeline = [...videoFragments];
         const draggedIndex = reorderedTimeline.findIndex((fragment) => fragment.id === draggedFragmentId);
         if (draggedIndex === -1) return;
 
@@ -606,9 +755,27 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
             : reorderedTimeline.length;
         if (targetIndex < 0) targetIndex = reorderedTimeline.length;
         reorderedTimeline.splice(targetIndex, 0, draggedFragment);
-        updateProductionTimeline(reorderedTimeline, {
+        updateProductionTimeline([...reorderedTimeline, ...musicFragments], {
             selectedFragmentId: draggedFragmentId,
             selectedTrack: "video",
+        });
+    };
+
+    const handleMoveMusicProductionFragment = (draggedFragmentId: string, timelineStartSeconds: number) => {
+        if (displayStage !== 'production' || isBusy) return;
+        const videoFragments = getTrackFragments(productionTimeline, "video");
+        const musicFragments = getTrackFragments(productionTimeline, "music");
+        const movedTimeline = musicFragments.map((fragment) =>
+            fragment.id === draggedFragmentId
+                ? {
+                    ...fragment,
+                    timeline_start: Math.max(0, Number(timelineStartSeconds.toFixed(3))),
+                }
+                : fragment
+        );
+        updateProductionTimeline([...videoFragments, ...movedTimeline], {
+            selectedFragmentId: draggedFragmentId,
+            selectedTrack: "music",
         });
     };
 
@@ -620,15 +787,18 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         const firstDuration = Number(splitOffset.toFixed(3));
         const secondDuration = Number((selectedProductionFragment.duration - splitOffset).toFixed(3));
         const splitSeed = Date.now();
+        const fragmentPrefix = selectedProductionFragment.track_type === "music"
+            ? "music_frag"
+            : `${selectedProductionFragment.source_clip_id ?? "clip"}_frag`;
 
         const firstFragment: ProductionTimelineFragment = {
             ...selectedProductionFragment,
-            id: `${selectedProductionFragment.source_clip_id}_frag_${splitSeed}_a`,
+            id: `${fragmentPrefix}_${splitSeed}_a`,
             duration: firstDuration,
         };
         const secondFragment: ProductionTimelineFragment = {
             ...selectedProductionFragment,
-            id: `${selectedProductionFragment.source_clip_id}_frag_${splitSeed}_b`,
+            id: `${fragmentPrefix}_${splitSeed}_b`,
             source_start: Number((selectedProductionFragment.source_start + splitOffset).toFixed(3)),
             duration: secondDuration,
         };
@@ -708,6 +878,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     useEffect(() => {
         playheadRef.current = playheadSeconds;
     }, [playheadSeconds]);
+
+    useEffect(() => {
+        if (!project?.music_url) {
+            setProductionMusicDuration(0);
+        }
+    }, [project?.music_url]);
 
     useEffect(() => {
         if (!isProductionDisplay) {
@@ -798,33 +974,39 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
 
         let serverUrl: string;
         let serverName: string;
+        let uploadedAsset: Awaited<ReturnType<typeof api.uploadAsset>>;
         try {
-            const data = await api.uploadAsset(project.project_id, file);
-            serverUrl = data.url;
-            serverName = data.name;
+            uploadedAsset = await api.uploadAsset(project.project_id, file);
+            serverUrl = uploadedAsset.url;
+            serverName = uploadedAsset.name;
         } catch (e) {
             console.error("Upload failed", e);
             alert("Failed to upload file to backend.");
             return;
         }
 
+        const resolvedAssetType = uploadedAsset.asset_type || type;
         const newAsset = {
             id: `asset_${Date.now()}`,
             url: serverUrl,
-            type: type,
+            type: resolvedAssetType,
             name: serverName,
+            label: uploadedAsset.label ?? serverName,
+            mime_type: uploadedAsset.mime_type ?? file.type,
+            text_content: uploadedAsset.text_content ?? undefined,
         };
 
-        const isAudioUpload = type === 'audio';
+        const projectWithCurrentInputs = applyCurrentInputTextFields(project);
+        const isAudioUpload = resolvedAssetType === 'audio';
         const nextAssets = isAudioUpload
-            ? [...project.assets.filter((asset) => asset.type !== 'audio'), newAsset]
-            : [...project.assets, newAsset];
+            ? [...projectWithCurrentInputs.assets.filter((asset) => asset.type !== 'audio'), newAsset]
+            : [...projectWithCurrentInputs.assets, newAsset];
         const nextMusicWorkflow = isAudioUpload
-            ? (project.current_stage === 'input' ? 'uploaded_track' : 'lyria3')
-            : project.music_workflow;
+            ? (projectWithCurrentInputs.current_stage === 'input' ? 'uploaded_track' : 'lyria3')
+            : projectWithCurrentInputs.music_workflow;
 
         const updatedProjectState = {
-            ...project,
+            ...projectWithCurrentInputs,
             assets: nextAssets,
             ...(isAudioUpload ? {
                 music_url: serverUrl,
@@ -937,19 +1119,21 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
 
     const removeAsset = async (assetId: string) => {
         if (!project) return;
-        const newAssets = project.assets.filter(a => a.id !== assetId);
+        const projectWithCurrentInputs = applyCurrentInputTextFields(project);
+        const newAssets = projectWithCurrentInputs.assets.filter(a => a.id !== assetId);
 
         // If we removed the audio track, clear music_url
-        const assetToRemove = project.assets.find(a => a.id === assetId);
-        const clearedMusicUrl = assetToRemove?.type === 'audio' ? undefined : project.music_url;
-        const nextMusicWorkflow = assetToRemove?.type === 'audio' && project.music_workflow === 'uploaded_track'
+        const assetToRemove = projectWithCurrentInputs.assets.find(a => a.id === assetId);
+        const clearedMusicUrl = assetToRemove?.type === 'audio' ? undefined : projectWithCurrentInputs.music_url;
+        const nextMusicWorkflow = assetToRemove?.type === 'audio' && projectWithCurrentInputs.music_workflow === 'uploaded_track'
             ? 'lyria3'
-            : project.music_workflow;
+            : projectWithCurrentInputs.music_workflow;
 
         const updatedProjectState = {
-            ...project,
+            ...projectWithCurrentInputs,
             assets: newAssets,
             music_url: clearedMusicUrl,
+            production_timeline: assetToRemove?.type === 'audio' ? [] : projectWithCurrentInputs.production_timeline,
             music_workflow: nextMusicWorkflow,
             ...(assetToRemove?.type === 'audio' ? {
                 generated_music_provider: undefined,
@@ -1117,6 +1301,39 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         } finally {
             setIsRunning(false);
             abortControllerRef.current = null;
+        }
+    };
+
+    const handleAssetLabelChange = (assetId: string, nextLabel: string) => {
+        if (!project) return;
+        const projectWithCurrentInputs = applyCurrentInputTextFields(project);
+        setProject({
+            ...projectWithCurrentInputs,
+            assets: projectWithCurrentInputs.assets.map((asset) =>
+                asset.id === assetId ? { ...asset, label: nextLabel } : asset
+            ),
+        });
+    };
+
+    const handleAssetLabelCommit = async (assetId: string) => {
+        if (!project) return;
+        const projectWithCurrentInputs = applyCurrentInputTextFields(project);
+        const nextProject = {
+            ...projectWithCurrentInputs,
+            assets: projectWithCurrentInputs.assets.map((asset) =>
+                asset.id === assetId
+                    ? { ...asset, label: asset.label?.trim() || null }
+                    : asset
+            ),
+        };
+        setProject(nextProject);
+
+        try {
+            const serverProject = await api.updateProject(nextProject.project_id, nextProject);
+            setProject(serverProject);
+        } catch (e) {
+            console.error("Failed to save asset label", e);
+            alert("Failed to save asset label.");
         }
     };
 
@@ -1312,17 +1529,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         if (!project) return;
         try {
             setIsRunning(true);
-            project.name = project.name.trim() || "Untitled Project";
-            project.music_provider = selectedMusicProviderId;
-            if (displayStage === 'input') {
-                const screenplay = (document.getElementById('screenplay-input') as HTMLTextAreaElement)?.value || '';
-                const instructions = (document.getElementById('instructions-input') as HTMLTextAreaElement)?.value || '';
-                const lore = (document.getElementById('lore-input') as HTMLTextAreaElement)?.value || '';
-                project.screenplay = screenplay;
-                project.instructions = instructions;
-                project.additional_lore = lore;
-            }
-            const updated = await api.updateProject(project.project_id, project);
+            const nextProject = {
+                ...applyCurrentInputTextFields(project),
+                name: project.name.trim() || "Untitled Project",
+                music_provider: selectedMusicProviderId,
+            };
+            const updated = await api.updateProject(nextProject.project_id, nextProject);
             setProject(updated);
             alert("Project saved.");
         } catch (e) {
@@ -1333,8 +1545,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         }
     };
 
-    const handleLiveDirector = async (message: string, source: "text" | "voice") => {
-        if (!project || isBusy || isDirectorProcessing) return;
+    const handleLiveDirector = async (
+        message: string,
+        source: "text" | "voice",
+        speechMode: "standard" | "realtime" = "standard",
+    ): Promise<LiveDirectorResponse | null> => {
+        if (!project || isBusy || isDirectorProcessing) return null;
 
         try {
             setIsDirectorProcessing(true);
@@ -1354,9 +1570,24 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                         : null
                 ) ?? undefined,
                 source,
+                speech_mode: speechMode,
             });
 
             setProject(response.project);
+            if (
+                response.project.active_run
+                && (response.project.active_run.status === 'queued' || response.project.active_run.status === 'running')
+            ) {
+                setPipelineRunStatus({
+                    is_running: true,
+                    stage: response.project.active_run.stage,
+                    started_at: response.project.active_run.started_at,
+                    status: response.project.active_run.status,
+                    driver: response.project.active_run.driver,
+                });
+            } else {
+                setPipelineRunStatus({ is_running: false });
+            }
             setViewedStage(null);
 
             if (response.target_clip_id) {
@@ -1372,9 +1603,11 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                 setSelectedProductionFragmentId(response.target_fragment_id);
                 setSelectedProductionTrack("audio");
             }
+            return response;
         } catch (error) {
             console.error("Live Director Mode failed", error);
             alert(error instanceof Error ? error.message : "Live Director Mode failed.");
+            return null;
         } finally {
             setIsDirectorProcessing(false);
         }
@@ -1410,7 +1643,10 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                             video_approved: false
                         }));
                     } else if (newState.current_stage === 'production') {
-                        newState.production_timeline = buildDefaultProductionTimeline(newState.timeline);
+                        newState.production_timeline = buildDefaultProductionTimeline(newState.timeline, {
+                            includeMusic: !!newState.music_url,
+                            musicDuration: productionMusicDuration || undefined,
+                        });
                         newState.final_video_url = undefined;
                     }
 
@@ -1631,18 +1867,23 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                                     className="w-full h-24 bg-background border border-surface-border rounded-lg p-3 text-sm focus:outline-none focus:border-primary/50 resize-none"
                                                     placeholder="Background details for the agent..."
                                                 />
+                                                <p className="mt-2 text-[11px] text-surface-border">
+                                                    Upload PDF or DOCX references below if you want to give the agent richer story or world context without cramming everything into lore.
+                                                </p>
                                             </div>
                                         </div>
                                     </div>
 
-                                    {/* Assets Strip */}
+                                    {/* Assets */}
                                     <div className="mt-6 pt-4 border-t border-surface-border">
                                         <h3 className="text-sm font-medium mb-3 text-white/80 flex items-center">
                                             <ImageIcon className="w-4 h-4 mr-2 text-primary" />
                                             Uploaded Assets
                                         </h3>
-                                        <div className="flex gap-4 overflow-x-auto pb-2">
-                                            {/* Upload Audio Card */}
+                                        <p className="mb-4 text-xs text-surface-border">
+                                            Give each asset a meaningful label like a character, prop, or location name. Gemini uses those labels as semantic references across planning and storyboarding.
+                                        </p>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                                             <input
                                                 type="file"
                                                 id="audio-upload"
@@ -1653,15 +1894,17 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                             />
                                             <div
                                                 onClick={() => document.getElementById('audio-upload')?.click()}
-                                                className="w-48 shrink-0 h-28 border border-dashed border-surface-border rounded-xl bg-background/50 hover:bg-surface-hover/50 transition-colors cursor-pointer flex flex-col items-center justify-center text-center group"
+                                                className="relative overflow-hidden rounded-2xl border border-dashed border-surface-border bg-background/50 hover:bg-surface-hover/50 transition-colors cursor-pointer group"
                                             >
-                                                <div className="w-8 h-8 rounded-full bg-surface-border flex items-center justify-center mb-1 group-hover:bg-primary/20 group-hover:text-primary transition-colors text-white/50">
-                                                    <Music className="w-4 h-4" />
+                                                <div className="aspect-video flex flex-col items-center justify-center text-center p-4">
+                                                    <div className="w-10 h-10 rounded-full bg-surface-border flex items-center justify-center mb-2 group-hover:bg-primary/20 group-hover:text-primary transition-colors text-white/50">
+                                                        <Music className="w-5 h-5" />
+                                                    </div>
+                                                    <span className="text-sm font-medium text-white/90">Add Audio</span>
+                                                    <span className="text-xs text-surface-border mt-1">Song, stem, or music reference</span>
                                                 </div>
-                                                <span className="text-sm font-medium text-white/90">Add Audio</span>
                                             </div>
 
-                                            {/* Upload Image Card */}
                                             <input
                                                 type="file"
                                                 id="image-upload"
@@ -1672,32 +1915,105 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                             />
                                             <div
                                                 onClick={() => document.getElementById('image-upload')?.click()}
-                                                className="w-48 shrink-0 h-28 border border-dashed border-surface-border rounded-xl bg-background/50 hover:bg-surface-hover/50 transition-colors cursor-pointer flex flex-col items-center justify-center text-center group"
+                                                className="relative overflow-hidden rounded-2xl border border-dashed border-surface-border bg-background/50 hover:bg-surface-hover/50 transition-colors cursor-pointer group"
                                             >
-                                                <div className="w-8 h-8 rounded-full bg-surface-border flex items-center justify-center mb-1 group-hover:bg-primary/20 group-hover:text-primary transition-colors text-white/50">
-                                                    <ImageIcon className="w-4 h-4" />
+                                                <div className="aspect-video flex flex-col items-center justify-center text-center p-4">
+                                                    <div className="w-10 h-10 rounded-full bg-surface-border flex items-center justify-center mb-2 group-hover:bg-primary/20 group-hover:text-primary transition-colors text-white/50">
+                                                        <ImageIcon className="w-5 h-5" />
+                                                    </div>
+                                                    <span className="text-sm font-medium text-white/90">Add Image</span>
+                                                    <span className="text-xs text-surface-border mt-1">Character, prop, vehicle, or location reference</span>
                                                 </div>
-                                                <span className="text-sm font-medium text-white/90">Add Image</span>
                                             </div>
 
-                                            {/* Map Existing Assets */}
-                                            {project.assets.map(asset => (
-                                                <div key={asset.id} className="w-48 shrink-0 h-28 relative rounded-xl border border-surface-border bg-background flex flex-col items-center justify-center overflow-hidden group">
-                                                    {asset.type === 'image' && (
-                                                        <img src={toBackendAssetUrl(asset.url)} alt={asset.name} className="absolute inset-0 w-full h-full object-cover opacity-50" />
-                                                    )}
-                                                    {asset.type === 'audio' && (
-                                                        <Music className="absolute text-white/20 w-16 h-16" />
-                                                    )}
-                                                    <div className="z-10 bg-black/50 p-2 text-center w-full mt-auto backdrop-blur-sm">
-                                                        <span className="truncate text-sm block">{asset.name}</span>
+                                            <input
+                                                type="file"
+                                                id="document-upload"
+                                                title="Upload Context Document"
+                                                className="hidden"
+                                                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                                onChange={(e) => handleFileUpload(e, 'document')}
+                                            />
+                                            <div
+                                                onClick={() => document.getElementById('document-upload')?.click()}
+                                                className="relative overflow-hidden rounded-2xl border border-dashed border-surface-border bg-background/50 hover:bg-surface-hover/50 transition-colors cursor-pointer group"
+                                            >
+                                                <div className="aspect-video flex flex-col items-center justify-center text-center p-4">
+                                                    <div className="w-10 h-10 rounded-full bg-surface-border flex items-center justify-center mb-2 group-hover:bg-primary/20 group-hover:text-primary transition-colors text-white/50">
+                                                        <FileText className="w-5 h-5" />
                                                     </div>
-                                                    <button
-                                                        onClick={(e) => { e.stopPropagation(); removeAsset(asset.id); }}
-                                                        className="absolute top-2 right-2 w-6 h-6 rounded-full bg-red-500/80 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-500 backdrop-blur-sm"
-                                                    >
-                                                        <X className="w-3.5 h-3.5" />
-                                                    </button>
+                                                    <span className="text-sm font-medium text-white/90">Add Document</span>
+                                                    <span className="text-xs text-surface-border mt-1">PDF or DOCX story and world reference</span>
+                                                </div>
+                                            </div>
+
+                                            {project.assets.map(asset => (
+                                                <div key={asset.id} className="relative overflow-hidden rounded-2xl border border-surface-border bg-surface/40 backdrop-blur group">
+                                                    <div className="relative aspect-video overflow-hidden border-b border-surface-border bg-background/70">
+                                                        {asset.type === 'image' && (
+                                                            <img
+                                                                src={toBackendAssetUrl(asset.url)}
+                                                                alt={asset.label?.trim() || asset.name}
+                                                                className="absolute inset-0 w-full h-full object-cover"
+                                                            />
+                                                        )}
+                                                        {asset.type === 'audio' && (
+                                                            <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-4 bg-gradient-to-br from-emerald-500/10 via-background to-background">
+                                                                <Music className="w-12 h-12 text-emerald-300/60 mb-2" />
+                                                                <span className="text-xs uppercase tracking-[0.22em] text-emerald-200/70">Audio</span>
+                                                            </div>
+                                                        )}
+                                                        {asset.type === 'document' && (
+                                                            <div className="absolute inset-0 p-4 flex flex-col justify-between bg-gradient-to-br from-slate-900/90 via-slate-900/70 to-slate-800/50">
+                                                                <FileText className="w-10 h-10 text-white/25" />
+                                                                <p className="text-[11px] leading-relaxed text-white/60 line-clamp-4">
+                                                                    {asset.text_content || "Document uploaded for contextual reference."}
+                                                                </p>
+                                                            </div>
+                                                        )}
+                                                        <div className="absolute left-3 top-3 rounded-full border border-white/10 bg-black/45 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-white/75 backdrop-blur-sm">
+                                                            {asset.type}
+                                                        </div>
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); removeAsset(asset.id); }}
+                                                            className="absolute top-3 right-3 w-7 h-7 rounded-full bg-red-500/80 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-500 backdrop-blur-sm"
+                                                        >
+                                                            <X className="w-4 h-4" />
+                                                        </button>
+                                                    </div>
+                                                    <div className="p-3 space-y-2">
+                                                        <div>
+                                                            <label className="text-[11px] uppercase tracking-[0.18em] text-surface-border block mb-1">
+                                                                AI Label
+                                                            </label>
+                                                            <input
+                                                                value={asset.label ?? ""}
+                                                                onChange={(e) => handleAssetLabelChange(asset.id, e.target.value)}
+                                                                onBlur={() => handleAssetLabelCommit(asset.id)}
+                                                                onKeyDown={(e) => {
+                                                                    if (e.key === "Enter") {
+                                                                        e.preventDefault();
+                                                                        (e.currentTarget as HTMLInputElement).blur();
+                                                                    }
+                                                                }}
+                                                                placeholder="e.g. Mira, Neon Alley, Red Motorcycle"
+                                                                className="w-full rounded-lg border border-surface-border bg-background/60 px-3 py-2 text-sm text-white/90 focus:outline-none focus:border-primary/50"
+                                                            />
+                                                        </div>
+                                                        <div className="text-xs text-surface-border">
+                                                            <div className="truncate">{asset.name}</div>
+                                                            {asset.type === 'document' && (
+                                                                <p className="mt-1 text-[11px] leading-relaxed text-white/55 line-clamp-2">
+                                                                    {asset.text_content || "Supplemental document context"}
+                                                                </p>
+                                                            )}
+                                                            {asset.type === 'image' && (
+                                                                <p className="mt-1 text-[11px] leading-relaxed text-white/55">
+                                                                    Use labels for named characters, props, creatures, vehicles, or locations so the agent can route this reference automatically.
+                                                                </p>
+                                                            )}
+                                                        </div>
+                                                    </div>
                                                 </div>
                                             ))}
                                         </div>
@@ -1892,9 +2208,16 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                     <p className="text-xs text-surface-border mt-1">
                                         {isStoryboardingRunActive
                                             ? `${readyStoryboardClipCount} of ${totalStoryboardClipCount} frames are ready. Stay here while new shots appear automatically as they finish generating.`
-                                            : "Review the exact starting frames for Veo 3.1. Drag and drop cards to reorder shots. Approve them, leave them unapproved to regenerate, or upload your own replacement frame for any shot."}
+                                            : "Review the exact starting frames for Veo 3.1. You can still add or delete shots, change durations, and rewrite descriptions here before rerunning storyboards or moving forward."}
                                     </p>
                                 </div>
+                                <ShotListEditor
+                                    clips={project.timeline}
+                                    projectId={project.project_id}
+                                    expandedShotId={selectedPlanningShotId}
+                                    onChange={(clips) => setProject({ ...project, timeline: clips })}
+                                    onExpand={(id) => setSelectedPlanningShotId(prev => prev === id ? null : id)}
+                                />
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-6 pb-12">
                                     {project.timeline.map((clip, index) => (
                                         <div
@@ -2176,7 +2499,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                             <div className="space-y-4 mb-6">
                                 <div className="p-3 bg-surface-hover/30 border border-primary/20 rounded-xl">
                                     <p className="text-sm text-white/80 font-medium">Production Timeline Ready.</p>
-                                    <p className="text-xs text-surface-border mt-1">Split clips at the playhead, drag fragments on `V1` to reorder them, then click `A1` to delete or restore source audio on any fragment before rendering.</p>
+                                    <p className="text-xs text-surface-border mt-1">Split clips or music at the playhead, drag `V1` to reorder picture, drag `M1` to position music, then click `A1` to delete or restore source audio on any fragment before rendering.</p>
                                 </div>
                                 {project.last_error && (
                                     <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl">
@@ -2188,7 +2511,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                     <div className="flex items-center justify-between gap-4">
                                         <div>
                                             <h3 className="text-sm font-semibold text-white/90">Selected Edit</h3>
-                                            <p className="text-xs text-surface-border mt-1">`V1` and `A1` stay time-linked, but you can now remove source audio from any selected `A1` fragment.</p>
+                                            <p className="text-xs text-surface-border mt-1">`V1` and `A1` stay time-linked, while `M1` is independently draggable and splittable.</p>
                                         </div>
                                         <div className="text-xs text-surface-border font-mono">
                                             Program Length: {productionDuration.toFixed(1)}s
@@ -2204,7 +2527,11 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                             <div className="grid grid-cols-2 gap-3 text-xs">
                                                 <div className="rounded-lg border border-surface-border bg-background/50 p-3">
                                                     <div className="text-surface-border uppercase tracking-[0.18em] mb-1">Source Shot</div>
-                                                    <div className="text-white/90 font-medium">{selectedProductionFragment.source_clip_id}</div>
+                                                    <div className="text-white/90 font-medium">
+                                                        {(selectedProductionFragment.track_type ?? "video") === "music"
+                                                            ? "Music Track"
+                                                            : selectedProductionFragment.source_clip_id}
+                                                    </div>
                                                 </div>
                                                 <div className="rounded-lg border border-surface-border bg-background/50 p-3">
                                                     <div className="text-surface-border uppercase tracking-[0.18em] mb-1">Timeline In</div>
@@ -2220,12 +2547,24 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                                 </div>
                                                 <div className="rounded-lg border border-surface-border bg-background/50 p-3">
                                                     <div className="text-surface-border uppercase tracking-[0.18em] mb-1">Selected Track</div>
-                                                    <div className="text-white/90 font-medium">{selectedProductionTrack === "audio" ? "A1 Source Audio" : "V1 Picture"}</div>
+                                                    <div className="text-white/90 font-medium">
+                                                        {selectedProductionTrack === "audio"
+                                                            ? "A1 Source Audio"
+                                                            : selectedProductionTrack === "music"
+                                                                ? "M1 Music"
+                                                                : "V1 Picture"}
+                                                    </div>
                                                 </div>
                                                 <div className="rounded-lg border border-surface-border bg-background/50 p-3">
-                                                    <div className="text-surface-border uppercase tracking-[0.18em] mb-1">A1 Status</div>
+                                                    <div className="text-surface-border uppercase tracking-[0.18em] mb-1">
+                                                        {selectedProductionTrack === "music" ? "Music Status" : "A1 Status"}
+                                                    </div>
                                                     <div className={`font-medium ${(selectedProductionFragment.audio_enabled ?? true) ? "text-emerald-300" : "text-rose-300"}`}>
-                                                        {(selectedProductionFragment.audio_enabled ?? true) ? "Source audio enabled" : "Source audio removed"}
+                                                        {selectedProductionTrack === "music"
+                                                            ? "Music segment active"
+                                                            : (selectedProductionFragment.audio_enabled ?? true)
+                                                                ? "Source audio enabled"
+                                                                : "Source audio removed"}
                                                     </div>
                                                 </div>
                                             </div>
@@ -2243,7 +2582,9 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                                     {(selectedProductionFragment.audio_enabled ?? true) ? "Delete Audio From Selection" : "Restore Audio To Selection"}
                                                 </button>
                                                 <div className="text-xs text-surface-border self-center">
-                                                    {selectedProductionTrack === "audio"
+                                                    {selectedProductionTrack === "music"
+                                                        ? "Split or drag the `M1` block to reposition the music bed against your picture edit."
+                                                        : selectedProductionTrack === "audio"
                                                         ? "Editing A1: this only affects the selected fragment's source audio."
                                                         : "Select the `A1` fragment below to remove or restore audio independently of picture."}
                                                 </div>
@@ -2563,6 +2904,18 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                                 ref={productionMusicRef}
                                                 src={toBackendAssetUrl(project.music_url)}
                                                 preload="auto"
+                                                onLoadedMetadata={(event) => {
+                                                    const duration = Number.isFinite(event.currentTarget.duration)
+                                                        ? event.currentTarget.duration
+                                                        : 0;
+                                                    setProductionMusicDuration(duration);
+                                                }}
+                                                onDurationChange={(event) => {
+                                                    const duration = Number.isFinite(event.currentTarget.duration)
+                                                        ? event.currentTarget.duration
+                                                        : 0;
+                                                    setProductionMusicDuration(duration);
+                                                }}
                                             />
                                         )}
                                     </div>
@@ -2610,7 +2963,8 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                         onJumpNext={handleJumpToNextEdit}
                         onSplitSelected={handleSplitProductionFragment}
                         onToggleSelectedAudio={handleToggleSelectedProductionAudio}
-                        onMoveFragment={handleMoveProductionFragment}
+                        onMoveVideoFragment={handleMoveVideoProductionFragment}
+                        onMoveMusicFragment={handleMoveMusicProductionFragment}
                     />
                 ) : displayStage === 'lyria_prompting' ? (
                     <React.Fragment>

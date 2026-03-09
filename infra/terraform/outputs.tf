@@ -22,6 +22,10 @@ output "frontend_service_account_email" {
   value = google_service_account.frontend_runtime.email
 }
 
+output "live_director_service_account_email" {
+  value = google_service_account.live_director_runtime.email
+}
+
 output "tasks_service_account_email" {
   value = google_service_account.tasks_invoker.email
 }
@@ -32,6 +36,10 @@ output "backend_service_name" {
 
 output "frontend_service_name" {
   value = var.frontend_service_name
+}
+
+output "live_director_service_name" {
+  value = var.live_director_service_name
 }
 
 output "internal_task_token" {

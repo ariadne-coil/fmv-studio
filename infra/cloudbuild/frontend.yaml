@@ -2,6 +2,14 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args:
       - build
+      - --build-arg
+      - NEXT_PUBLIC_LIVE_DIRECTOR_WS_ORIGIN=${_NEXT_PUBLIC_LIVE_DIRECTOR_WS_ORIGIN}
+      - --build-arg
+      - NEXT_PUBLIC_GCP_PROJECT_ID=${_NEXT_PUBLIC_GCP_PROJECT_ID}
+      - --build-arg
+      - NEXT_PUBLIC_VERTEX_MEDIA_LOCATION=${_NEXT_PUBLIC_VERTEX_MEDIA_LOCATION}
+      - --build-arg
+      - NEXT_PUBLIC_LIVE_DIRECTOR_MODEL=${_NEXT_PUBLIC_LIVE_DIRECTOR_MODEL}
       - -t
       - ${_IMAGE}
       - .

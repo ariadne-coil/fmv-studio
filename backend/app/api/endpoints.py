@@ -9,6 +9,12 @@ from pydantic import BaseModel, Field
 
 from app.agent.models import ProjectState, AgentStage, PipelineRunState, PipelineRunStatus
 from app.agent.graph import FMVAgentPipeline
+from app.core.document_context import (
+    display_asset_label,
+    extract_document_text,
+    infer_asset_type,
+    suggest_asset_label,
+)
 from app.genai_runtime import build_genai_client, uses_vertex_ai
 from app.job_queue import (
     cancel_local_pipeline_task,
@@ -122,6 +128,10 @@ def _collect_project_asset_paths(state: ProjectState) -> list[str]:
         if summary.audio_url:
             asset_paths.add(summary.audio_url)
 
+    for turn in state.director_log:
+        if turn.audio_url:
+            asset_paths.add(turn.audio_url)
+
     for clip in state.timeline:
         if clip.image_url:
             asset_paths.add(clip.image_url)
@@ -134,6 +144,30 @@ def _collect_project_asset_paths(state: ProjectState) -> list[str]:
 def _stage_index(stage: AgentStage | str) -> int:
     value = stage.value if isinstance(stage, AgentStage) else stage
     return STAGE_ORDER.index(value)
+
+
+def _coerce_agent_stage(value: AgentStage | str | None) -> AgentStage | None:
+    if value is None:
+        return None
+    if isinstance(value, AgentStage):
+        return value
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    try:
+        return AgentStage(normalized)
+    except ValueError:
+        return None
+
+
+def _previous_review_stage(stage: AgentStage | str | None) -> AgentStage | None:
+    resolved = _coerce_agent_stage(stage)
+    if resolved is None:
+        return None
+    index = _stage_index(resolved)
+    if index <= 0:
+        return None
+    return AgentStage(STAGE_ORDER[index - 1])
 
 
 def _planning_signature(state: ProjectState) -> list[tuple[str, float, float, str]]:
@@ -157,6 +191,55 @@ def _trim_stage_summaries_to(state: ProjectState, max_stage: AgentStage) -> None
     }
 
 
+def _document_context_for_state(state: ProjectState, *, max_chars: int = 6000) -> str:
+    snippets: list[str] = []
+    current_length = 0
+    for asset in state.assets:
+        if asset.type != "document" or not asset.text_content:
+            continue
+        snippet = f"{display_asset_label(asset.label, asset.name)}:\n{asset.text_content.strip()}"
+        if current_length + len(snippet) > max_chars:
+            remaining = max_chars - current_length
+            if remaining <= 0:
+                break
+            snippet = snippet[:remaining].rstrip() + "…"
+        snippets.append(snippet)
+        current_length += len(snippet)
+        if current_length >= max_chars:
+            break
+    return "\n\n".join(snippets)
+
+
+def _asset_reference_registry_for_state(state: ProjectState, *, max_chars: int = 2000) -> str:
+    entries: list[str] = []
+    current_length = 0
+    for asset in state.assets:
+        label = display_asset_label(asset.label, asset.name)
+        if asset.type == "image":
+            entry = (
+                f'- image "{label}" (file: {asset.name}). '
+                f"If this label names a character, creature, hero prop, vehicle, or location from the screenplay, "
+                f"treat this image as the canonical visual reference for that named entity."
+            )
+        elif asset.type == "document":
+            entry = f'- document "{label}" (file: {asset.name}). Supplemental written context for the screenplay, lore, and world details.'
+        elif asset.type == "audio":
+            entry = f'- audio "{label}" (file: {asset.name}). Music or sound reference available to the project.'
+        else:
+            entry = f'- {asset.type} "{label}" (file: {asset.name}).'
+
+        if current_length + len(entry) > max_chars:
+            remaining = max_chars - current_length
+            if remaining <= 0:
+                break
+            entry = entry[:remaining].rstrip() + "…"
+        entries.append(entry)
+        current_length += len(entry)
+        if current_length >= max_chars:
+            break
+    return "\n".join(entries) or "(none)"
+
+
 def _clear_clip_storyboard_outputs(clip) -> None:
     clip.image_prompt = None
     clip.image_url = None
@@ -169,6 +252,14 @@ def _clear_clip_storyboard_outputs(clip) -> None:
     clip.video_critiques = []
     clip.video_score = None
     clip.video_approved = False
+
+
+def _preserve_music_production_fragments(state: ProjectState) -> None:
+    state.production_timeline = [
+        fragment
+        for fragment in state.production_timeline
+        if state.music_url and (fragment.track_type or "video") == "music"
+    ]
 
 
 def _reconcile_after_planning_edits(previous: ProjectState, state: ProjectState) -> None:
@@ -185,7 +276,7 @@ def _reconcile_after_planning_edits(previous: ProjectState, state: ProjectState)
         if storyboard_changed or duration_changed:
             _clear_clip_storyboard_outputs(clip)
 
-    state.production_timeline = []
+    _preserve_music_production_fragments(state)
     state.final_video_url = None
     state.last_error = None
     state.stage_summaries = {
@@ -207,6 +298,45 @@ def _reconcile_after_planning_edits(previous: ProjectState, state: ProjectState)
         return
 
     state.current_stage = AgentStage.STORYBOARDING
+
+
+def _apply_revert_to_state(state: ProjectState, target_stage: AgentStage | str) -> ProjectState:
+    target = _coerce_agent_stage(target_stage)
+    if target is None or target.value not in {"input", "lyria_prompting", "planning", "storyboarding", "filming", "production"}:
+        raise HTTPException(status_code=400, detail=f"Invalid target_stage '{target_stage}'")
+
+    target_idx = _stage_index(target)
+
+    if target == AgentStage.INPUT:
+        state.timeline = []
+        state.lyrics_prompt = ""
+        state.style_prompt = ""
+
+    if target_idx <= _stage_index(AgentStage.PLANNING) and target != AgentStage.INPUT:
+        for clip in state.timeline:
+            clip.image_url = None
+            clip.image_prompt = None
+            clip.image_critiques = []
+            clip.image_approved = False
+
+    if target_idx <= _stage_index(AgentStage.STORYBOARDING):
+        for clip in state.timeline:
+            clip.video_url = None
+            clip.video_prompt = None
+            clip.video_critiques = []
+            clip.video_approved = False
+        _preserve_music_production_fragments(state)
+
+    if target_idx <= _stage_index(AgentStage.FILMING):
+        _preserve_music_production_fragments(state)
+
+    if target_idx <= _stage_index(AgentStage.PRODUCTION):
+        state.final_video_url = None
+
+    _trim_stage_summaries_to(state, target)
+    state.last_error = None
+    state.current_stage = target
+    return state
 
 
 def _get_project_run_state(project_id: str) -> PipelineRunState | None:
@@ -419,12 +549,30 @@ async def upload_asset(project_id: str, file: UploadFile = File(...)):
     unique_name = f"{uuid.uuid4().hex}{ext}"
     content = await file.read()
     relative_path = f"uploads/{project_id}/{unique_name}"
+    asset_type = infer_asset_type(file.filename, file.content_type)
+    text_content = None
+    if asset_type == "document":
+        try:
+            text_content = extract_document_text(
+                filename=file.filename,
+                content=content,
+                mime_type=file.content_type,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to read uploaded document: {str(exc)}") from exc
     url = storage.write_project_asset_bytes(
         relative_path,
         content,
         content_type=file.content_type,
     )
-    return {"url": url, "name": file.filename or unique_name}
+    return {
+        "url": url,
+        "name": file.filename or unique_name,
+        "label": suggest_asset_label(file.filename or unique_name),
+        "asset_type": asset_type,
+        "mime_type": file.content_type,
+        "text_content": text_content,
+    }
 
 
 @router.post("/projects/{project_id}/regenerate-music", response_model=ProjectState)
@@ -661,58 +809,7 @@ def revert_pipeline(project_id: str, body: RevertRequest):
     if state.active_run:
         cancel_local_pipeline_task(project_id)
         state.active_run = None
-
-    VALID_TARGETS = {"input", "lyria_prompting", "planning", "storyboarding", "filming", "production"}
-    if target not in VALID_TARGETS:
-        raise HTTPException(status_code=400, detail=f"Invalid target_stage '{target}'")
-
-    STAGE_ORDER = ["input", "lyria_prompting", "planning", "storyboarding", "filming", "production", "completed"]
-    target_idx = STAGE_ORDER.index(target)
-
-    # Reverting all the way to 'input' is a full reset — clear everything
-    if target == "input":
-        state.timeline = []
-        state.lyrics_prompt = ""
-        state.style_prompt = ""
-
-    # Reverting to lyria_prompting: just change stage so the user can re-edit
-    # the music prompts. Keep lyrics_prompt and style_prompt intact so they
-    # can tweak them rather than losing their work.
-    # (No data cleared here — only the stage changes.)
-
-    # Clear storyboard images when going back to planning or earlier (but not input)
-    if target_idx <= STAGE_ORDER.index("planning") and target != "input":
-        for clip in state.timeline:
-            clip.image_url = None
-            clip.image_prompt = None
-            clip.image_critiques = []
-            clip.image_approved = False
-
-    # Clear videos when going back to storyboarding or earlier
-    if target_idx <= STAGE_ORDER.index("storyboarding"):
-        for clip in state.timeline:
-            clip.video_url = None
-            clip.video_prompt = None
-            clip.video_critiques = []
-            clip.video_approved = False
-        state.production_timeline = []
-
-    # Rebuild production edits after leaving filming.
-    if target_idx <= STAGE_ORDER.index("filming"):
-        state.production_timeline = []
-
-    # Clear final video when reverting from completed/production/filming
-    if target_idx <= STAGE_ORDER.index("production"):
-        state.final_video_url = None
-
-    state.stage_summaries = {
-        stage_name: summary
-        for stage_name, summary in state.stage_summaries.items()
-        if stage_name in STAGE_ORDER and STAGE_ORDER.index(stage_name) <= target_idx
-    }
-
-    state.last_error = None
-    state.current_stage = AgentStage(target)
+    _apply_revert_to_state(state, target)
     _write_project(project_id, state)
     return state
 
@@ -731,6 +828,7 @@ class LiveDirectorRequest(BaseModel):
     selected_clip_id: Optional[str] = None
     selected_fragment_id: Optional[str] = None
     source: str = "text"
+    speech_mode: str = "standard"
 
 
 class LiveDirectorResponse(BaseModel):
@@ -777,6 +875,9 @@ This is shot {body.clip_index + 1} of {body.total_clips}, and it should last {bo
 Project context:
 - Screenplay: {state.screenplay[:600]}
 - Style instructions: {state.instructions[:300]}
+- Additional lore: {state.additional_lore[:400]}
+- Uploaded asset registry: {_asset_reference_registry_for_state(state, max_chars=1600)}
+- Uploaded document context: {_document_context_for_state(state, max_chars=2000) or "(none)"}
 
 Nearby shots for context:
 {body.surrounding_context or "(no adjacent shots yet)"}
@@ -787,6 +888,7 @@ Write a single, vivid storyboard description for this shot. Be specific about:
 - Lighting and color palette
 - Environment / background
 - Overall mood
+- If the project has labeled reference images for named characters, props, creatures, vehicles, or locations, preserve those names verbatim in the description when they are present in this shot.
 
 Return ONLY the storyboard description text, no bullet points, no JSON, no extra commentary. 2-4 sentences max."""
 
@@ -804,19 +906,37 @@ Return ONLY the storyboard description text, no bullet points, no JSON, no extra
 async def live_director_mode(
     project_id: str,
     body: LiveDirectorRequest,
+    request: Request = None,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     x_orchestrator_model: Optional[str] = Header(default=None, alias="X-Orchestrator-Model"),
+    x_critic_model: Optional[str] = Header(default=None, alias="X-Critic-Model"),
     x_text_model: Optional[str] = Header(default=None, alias="X-Text-Model"),
+    x_image_model: Optional[str] = Header(default=None, alias="X-Image-Model"),
+    x_image_resolution: Optional[str] = Header(default=None, alias="X-Image-Resolution"),
+    x_video_model: Optional[str] = Header(default=None, alias="X-Video-Model"),
+    x_video_resolution: Optional[str] = Header(default=None, alias="X-Video-Resolution"),
+    x_music_model: Optional[str] = Header(default=None, alias="X-Music-Model"),
+    x_stage_voice_briefs_enabled: Optional[str] = Header(default=None, alias="X-Stage-Voice-Briefs-Enabled"),
 ):
     if _get_project_run_state(project_id):
         raise HTTPException(status_code=409, detail="Live Director Mode is unavailable while a background pipeline run is active")
 
     state = get_project(project_id)
+    x_api_key = _coerce_optional_header(x_api_key)
+    x_orchestrator_model = _coerce_optional_header(x_orchestrator_model)
+    x_critic_model = _coerce_optional_header(x_critic_model)
+    x_text_model = _coerce_optional_header(x_text_model)
+    x_image_model = _coerce_optional_header(x_image_model)
+    x_image_resolution = _coerce_optional_header(x_image_resolution)
+    x_video_model = _coerce_optional_header(x_video_model)
+    x_video_resolution = _coerce_optional_header(x_video_resolution)
+    x_music_model = _coerce_optional_header(x_music_model)
+    stage_voice_briefs_enabled = _coerce_optional_bool_header(x_stage_voice_briefs_enabled)
     pipeline = FMVAgentPipeline(
-        api_key=_coerce_optional_header(x_api_key),
+        api_key=x_api_key,
         orchestrator_model=_resolve_orchestrator_model(
-            _coerce_optional_header(x_orchestrator_model),
-            _coerce_optional_header(x_text_model),
+            x_orchestrator_model,
+            x_text_model,
         ),
     )
 
@@ -828,18 +948,75 @@ async def live_director_mode(
             selected_clip_id=body.selected_clip_id,
             selected_fragment_id=body.selected_fragment_id,
             source=body.source,
+            speech_mode=body.speech_mode,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Live Director Mode failed: {str(exc)}") from exc
 
-    _write_project(project_id, updated_state)
+    navigation_action = str(result.get("navigation_action") or "").strip().lower()
+    requested_target_stage = _coerce_agent_stage(result.get("target_stage"))
+    display_stage = _coerce_agent_stage(body.display_stage) or updated_state.current_stage
+    response_state = updated_state
+
+    if navigation_action == "advance" and requested_target_stage and _stage_index(requested_target_stage) < _stage_index(display_stage):
+        navigation_action = "rewind"
+
+    if navigation_action == "rewind":
+        rewind_target = requested_target_stage or _previous_review_stage(display_stage)
+        if rewind_target is not None:
+            response_state = _apply_revert_to_state(updated_state, rewind_target)
+        _write_project(project_id, response_state)
+    elif navigation_action == "advance":
+        if display_stage != updated_state.current_stage:
+            updated_state = _apply_revert_to_state(updated_state, display_stage)
+        _write_project(project_id, updated_state)
+        if updated_state.current_stage == AgentStage.COMPLETED:
+            response_state = updated_state
+        elif (
+            updated_state.current_stage in {AgentStage.PLANNING, AgentStage.STORYBOARDING}
+            or (
+                updated_state.current_stage == AgentStage.FILMING
+                and not all(clip.video_approved and clip.video_url for clip in updated_state.timeline)
+            )
+        ):
+            response_state = await run_pipeline_step_async(
+                project_id,
+                request=request,
+                x_api_key=x_api_key,
+                x_orchestrator_model=x_orchestrator_model,
+                x_critic_model=x_critic_model,
+                x_text_model=x_text_model,
+                x_image_model=x_image_model,
+                x_image_resolution=x_image_resolution,
+                x_video_model=x_video_model,
+                x_video_resolution=x_video_resolution,
+                x_music_model=x_music_model,
+                x_stage_voice_briefs_enabled=x_stage_voice_briefs_enabled,
+            )
+        else:
+            response_state = await run_pipeline_step(
+                project_id,
+                x_api_key=x_api_key,
+                x_orchestrator_model=x_orchestrator_model,
+                x_critic_model=x_critic_model,
+                x_text_model=x_text_model,
+                x_image_model=x_image_model,
+                x_image_resolution=x_image_resolution,
+                x_video_model=x_video_model,
+                x_video_resolution=x_video_resolution,
+                x_music_model=x_music_model,
+                x_stage_voice_briefs_enabled=x_stage_voice_briefs_enabled,
+            )
+    else:
+        _write_project(project_id, updated_state)
+
     return LiveDirectorResponse(
-        project=updated_state,
+        project=response_state,
         reply_text=result["reply_text"],
         applied_changes=result.get("applied_changes", []),
         target_clip_id=result.get("target_clip_id"),
         target_fragment_id=result.get("target_fragment_id"),
-        stage=updated_state.current_stage,
+        stage=response_state.current_stage,
     )
 
 

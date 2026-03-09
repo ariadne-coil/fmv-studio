@@ -27,18 +27,19 @@ type ProductionTimelineEditorProps = {
     isPlaying: boolean;
     isEditable: boolean;
     selectedFragmentId: string | null;
-    selectedTrack: "video" | "audio";
+    selectedTrack: "video" | "audio" | "music";
     canSplitSelected: boolean;
     canToggleSelectedAudio: boolean;
     selectedFragmentAudioEnabled: boolean;
-    onSelectFragment: (fragmentId: string, track: "video" | "audio") => void;
+    onSelectFragment: (fragmentId: string, track: "video" | "audio" | "music") => void;
     onSeek: (seconds: number) => void;
     onTogglePlay: () => void;
     onJumpPrevious: () => void;
     onJumpNext: () => void;
     onSplitSelected: () => void;
     onToggleSelectedAudio: () => void;
-    onMoveFragment: (draggedFragmentId: string, beforeFragmentId: string | null) => void;
+    onMoveVideoFragment: (draggedFragmentId: string, beforeFragmentId: string | null) => void;
+    onMoveMusicFragment: (draggedFragmentId: string, timelineStartSeconds: number) => void;
 };
 
 export default function ProductionTimelineEditor({
@@ -61,9 +62,15 @@ export default function ProductionTimelineEditor({
     onJumpNext,
     onSplitSelected,
     onToggleSelectedAudio,
-    onMoveFragment,
+    onMoveVideoFragment,
+    onMoveMusicFragment,
 }: ProductionTimelineEditorProps) {
-    const sortedFragments = [...fragments].sort((left, right) => left.timeline_start - right.timeline_start);
+    const sortedVideoFragments = [...fragments]
+        .filter((fragment) => (fragment.track_type ?? "video") !== "music")
+        .sort((left, right) => left.timeline_start - right.timeline_start);
+    const sortedMusicFragments = [...fragments]
+        .filter((fragment) => (fragment.track_type ?? "video") === "music")
+        .sort((left, right) => left.timeline_start - right.timeline_start);
     const totalWidth = Math.max(720, totalDuration * PX_PER_SEC);
 
     const clipLookup = Object.fromEntries(
@@ -77,7 +84,7 @@ export default function ProductionTimelineEditor({
         ])
     );
 
-    const selectedFragment = sortedFragments.find((fragment) => fragment.id === selectedFragmentId) ?? null;
+    const selectedFragment = [...sortedVideoFragments, ...sortedMusicFragments].find((fragment) => fragment.id === selectedFragmentId) ?? null;
 
     const handleTrackSeek = (event: React.MouseEvent<HTMLDivElement>) => {
         const rect = event.currentTarget.getBoundingClientRect();
@@ -95,7 +102,7 @@ export default function ProductionTimelineEditor({
         const offsetX = event.clientX - rect.left;
 
         let beforeFragmentId: string | null = null;
-        for (const fragment of sortedFragments) {
+        for (const fragment of sortedVideoFragments) {
             const midpoint = (fragment.timeline_start + fragment.duration / 2) * PX_PER_SEC;
             if (offsetX < midpoint) {
                 beforeFragmentId = fragment.id;
@@ -103,7 +110,18 @@ export default function ProductionTimelineEditor({
             }
         }
 
-        onMoveFragment(draggedFragmentId, beforeFragmentId);
+        onMoveVideoFragment(draggedFragmentId, beforeFragmentId);
+    };
+
+    const handleMusicTrackDrop = (event: React.DragEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        if (!isEditable) return;
+        const draggedFragmentId = event.dataTransfer.getData("text/fragment-id");
+        if (!draggedFragmentId) return;
+
+        const rect = event.currentTarget.getBoundingClientRect();
+        const offsetX = event.clientX - rect.left;
+        onMoveMusicFragment(draggedFragmentId, Math.max(0, offsetX / PX_PER_SEC));
     };
 
     return (
@@ -163,12 +181,14 @@ export default function ProductionTimelineEditor({
             <div className="px-3 py-1.5 border-b border-surface-border bg-background/60 flex items-center justify-between gap-3 text-[11px] leading-tight">
                 <div className="text-surface-border">
                     {isEditable
-                        ? "Drag `V1` to reorder, split at the playhead, then click `A1` to delete or restore source audio on any fragment."
+                        ? "Drag `V1` to reorder picture, drag `M1` to reposition music, split either track at the playhead, then click `A1` to delete or restore source audio on any fragment."
                         : "Review mode only. Rewind to Production to split or reorder this edit."}
                 </div>
                 {selectedFragment ? (
                     <div className="text-white/80 font-mono shrink-0 text-[11px]">
-                        {clipLookup[selectedFragment.source_clip_id]?.label ?? selectedFragment.source_clip_id} | {selectedTrack === "audio" ? "A1" : "V1"} | In {selectedFragment.source_start.toFixed(1)}s | Dur {selectedFragment.duration.toFixed(1)}s
+                        {(selectedFragment.track_type ?? "video") === "music"
+                            ? `Music Segment | M1 | In ${selectedFragment.source_start.toFixed(1)}s | Dur ${selectedFragment.duration.toFixed(1)}s`
+                            : `${clipLookup[selectedFragment.source_clip_id ?? ""]?.label ?? selectedFragment.source_clip_id} | ${selectedTrack === "audio" ? "A1" : "V1"} | In ${selectedFragment.source_start.toFixed(1)}s | Dur ${selectedFragment.duration.toFixed(1)}s`}
                     </div>
                 ) : (
                     <div className="text-surface-border shrink-0 text-[11px]">No fragment selected</div>
@@ -219,8 +239,8 @@ export default function ProductionTimelineEditor({
                                 onDragOver={(event) => event.preventDefault()}
                                 onDrop={handleVideoTrackDrop}
                             >
-                                {sortedFragments.map((fragment) => {
-                                    const clipMeta = clipLookup[fragment.source_clip_id];
+                                {sortedVideoFragments.map((fragment) => {
+                                    const clipMeta = clipLookup[fragment.source_clip_id ?? ""];
                                     const isSelected = fragment.id === selectedFragmentId && selectedTrack === "video";
                                     return (
                                         <button
@@ -269,8 +289,8 @@ export default function ProductionTimelineEditor({
                                 style={{ width: `${totalWidth}px` }}
                                 onClick={handleTrackSeek}
                             >
-                                {sortedFragments.map((fragment) => {
-                                    const clipMeta = clipLookup[fragment.source_clip_id];
+                                {sortedVideoFragments.map((fragment) => {
+                                    const clipMeta = clipLookup[fragment.source_clip_id ?? ""];
                                     const audioEnabled = fragment.audio_enabled ?? true;
                                     const isSelected = fragment.id === selectedFragmentId && selectedTrack === "audio";
                                     return (
@@ -317,22 +337,50 @@ export default function ProductionTimelineEditor({
                                 <div className="w-[120px] shrink-0 rounded-xl bg-surface/80 border border-surface-border px-3 py-2 flex flex-col justify-center">
                                     <span className="text-[10px] uppercase tracking-[0.2em] text-fuchsia-300 flex items-center gap-1.5">
                                         <Music2 className="w-3 h-3" />
-                                        Score
+                                        M1
                                     </span>
-                                    <span className="text-[10px] text-surface-border mt-0.5">Project music bed</span>
+                                    <span className="text-[10px] text-surface-border mt-0.5">Music track</span>
                                 </div>
                                 <div
                                     className="relative h-10 rounded-xl border border-surface-border bg-black/25 overflow-hidden"
                                     style={{ width: `${totalWidth}px` }}
                                     onClick={handleTrackSeek}
+                                    onDragOver={(event) => event.preventDefault()}
+                                    onDrop={handleMusicTrackDrop}
                                 >
-                                    <div
-                                        className="absolute inset-y-1.5 left-0 rounded-lg border border-fuchsia-400/30 bg-fuchsia-500/14 px-2.5 flex items-center justify-between text-[11px] text-fuchsia-100/80"
-                                        style={{ width: `${Math.max(120, totalWidth)}px` }}
-                                    >
-                                        <span>Music Track</span>
-                                        <span className="font-mono">{totalDuration.toFixed(1)}s</span>
-                                    </div>
+                                    {sortedMusicFragments.map((fragment) => {
+                                        const isSelected = fragment.id === selectedFragmentId && selectedTrack === "music";
+                                        return (
+                                            <button
+                                                key={fragment.id}
+                                                draggable={isEditable}
+                                                onDragStart={(event) => {
+                                                    if (!isEditable) {
+                                                        event.preventDefault();
+                                                        return;
+                                                    }
+                                                    event.dataTransfer.effectAllowed = "move";
+                                                    event.dataTransfer.setData("text/fragment-id", fragment.id);
+                                                }}
+                                                onClick={(event) => {
+                                                    event.stopPropagation();
+                                                    onSelectFragment(fragment.id, "music");
+                                                }}
+                                                className={`absolute inset-y-1.5 rounded-lg border px-2.5 flex items-center justify-between gap-2 text-[11px] transition-all ${isSelected
+                                                    ? "border-fuchsia-300 bg-fuchsia-500/22 shadow-[0_0_0_1px_rgba(244,114,182,0.35)]"
+                                                    : "border-fuchsia-400/30 bg-fuchsia-500/14 hover:bg-fuchsia-500/20"
+                                                    } ${isEditable ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"}`}
+                                                style={{
+                                                    left: `${fragment.timeline_start * PX_PER_SEC}px`,
+                                                    width: `${Math.max(40, fragment.duration * PX_PER_SEC)}px`,
+                                                }}
+                                                title={`Music segment | In ${fragment.source_start.toFixed(1)}s | Duration ${fragment.duration.toFixed(1)}s`}
+                                            >
+                                                <span className="truncate text-fuchsia-100/85">Music Segment</span>
+                                                <span className="font-mono text-fuchsia-100/65">{fragment.duration.toFixed(1)}s</span>
+                                            </button>
+                                        );
+                                    })}
                                 </div>
                             </div>
                         )}

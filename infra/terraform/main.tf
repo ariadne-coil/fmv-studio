@@ -67,6 +67,11 @@ resource "google_service_account" "frontend_runtime" {
   display_name = "FMV Studio Frontend Runtime"
 }
 
+resource "google_service_account" "live_director_runtime" {
+  account_id   = "fmv-live-director-run"
+  display_name = "FMV Studio Live Director Runtime"
+}
+
 resource "google_service_account" "tasks_invoker" {
   account_id   = "fmv-tasks-invoker"
   display_name = "FMV Studio Cloud Tasks Invoker"
@@ -94,6 +99,18 @@ resource "google_project_iam_member" "frontend_log_writer" {
   project = var.project_id
   role    = "roles/logging.logWriter"
   member  = "serviceAccount:${google_service_account.frontend_runtime.email}"
+}
+
+resource "google_project_iam_member" "live_director_vertex_user" {
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.live_director_runtime.email}"
+}
+
+resource "google_project_iam_member" "live_director_log_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.live_director_runtime.email}"
 }
 
 resource "google_service_account_iam_member" "backend_can_act_as_tasks_invoker" {

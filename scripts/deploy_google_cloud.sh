@@ -11,6 +11,7 @@ VERTEX_MEDIA_LOCATION="${VERTEX_MEDIA_LOCATION:-${REGION}}"
 ARTIFACT_REPOSITORY="${ARTIFACT_REPOSITORY:-fmv-studio}"
 BACKEND_SERVICE_NAME="${BACKEND_SERVICE_NAME:-fmv-studio-backend}"
 FRONTEND_SERVICE_NAME="${FRONTEND_SERVICE_NAME:-fmv-studio-frontend}"
+LIVE_DIRECTOR_SERVICE_NAME="${LIVE_DIRECTOR_SERVICE_NAME:-fmv-studio-live-director}"
 TASKS_QUEUE_NAME="${TASKS_QUEUE_NAME:-fmv-pipeline}"
 STORAGE_BUCKET_NAME="${STORAGE_BUCKET_NAME:-${PROJECT_ID}-fmv-studio-assets}"
 IMAGE_TAG="${IMAGE_TAG:-$(date +%Y%m%d-%H%M%S)}"
@@ -22,12 +23,14 @@ terraform -chdir="${TF_DIR}" apply -auto-approve \
   -var="artifact_registry_repository=${ARTIFACT_REPOSITORY}" \
   -var="backend_service_name=${BACKEND_SERVICE_NAME}" \
   -var="frontend_service_name=${FRONTEND_SERVICE_NAME}" \
+  -var="live_director_service_name=${LIVE_DIRECTOR_SERVICE_NAME}" \
   -var="tasks_queue_name=${TASKS_QUEUE_NAME}" \
   -var="storage_bucket_name=${STORAGE_BUCKET_NAME}"
 
 REPOSITORY_URL="$(terraform -chdir="${TF_DIR}" output -raw artifact_registry_repository_url)"
 BACKEND_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw backend_service_account_email)"
 FRONTEND_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw frontend_service_account_email)"
+LIVE_DIRECTOR_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw live_director_service_account_email)"
 TASKS_SERVICE_ACCOUNT="$(terraform -chdir="${TF_DIR}" output -raw tasks_service_account_email)"
 INTERNAL_TASK_TOKEN="$(terraform -chdir="${TF_DIR}" output -raw internal_task_token)"
 
@@ -68,9 +71,23 @@ gcloud run services add-iam-policy-binding "${BACKEND_SERVICE_NAME}" \
   --member "serviceAccount:${TASKS_SERVICE_ACCOUNT}" \
   --role "roles/run.invoker" >/dev/null
 
+gcloud run deploy "${LIVE_DIRECTOR_SERVICE_NAME}" \
+  --image "${BACKEND_IMAGE}" \
+  --region "${REGION}" \
+  --allow-unauthenticated \
+  --service-account "${LIVE_DIRECTOR_SERVICE_ACCOUNT}" \
+  --command uvicorn \
+  --args "app.live_gateway:app,--host,0.0.0.0,--port,8080" \
+  --cpu 1 \
+  --memory 1Gi \
+  --timeout 3600 \
+  --set-env-vars "FMV_GCP_PROJECT=${PROJECT_ID},FMV_VERTEX_MEDIA_LOCATION=${VERTEX_MEDIA_LOCATION}"
+
+LIVE_DIRECTOR_URL="$(gcloud run services describe "${LIVE_DIRECTOR_SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+
 gcloud builds submit "${ROOT_DIR}/frontend" \
   --config "${ROOT_DIR}/infra/cloudbuild/frontend.yaml" \
-  --substitutions "_IMAGE=${FRONTEND_IMAGE}"
+  --substitutions "_IMAGE=${FRONTEND_IMAGE},_NEXT_PUBLIC_LIVE_DIRECTOR_WS_ORIGIN=${LIVE_DIRECTOR_URL},_NEXT_PUBLIC_GCP_PROJECT_ID=${PROJECT_ID},_NEXT_PUBLIC_VERTEX_MEDIA_LOCATION=${VERTEX_MEDIA_LOCATION},_NEXT_PUBLIC_LIVE_DIRECTOR_MODEL=gemini-live-2.5-flash-native-audio"
 
 gcloud run deploy "${FRONTEND_SERVICE_NAME}" \
   --image "${FRONTEND_IMAGE}" \
@@ -83,10 +100,15 @@ gcloud run deploy "${FRONTEND_SERVICE_NAME}" \
 
 FRONTEND_URL="$(gcloud run services describe "${FRONTEND_SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
 
+gcloud run services update "${LIVE_DIRECTOR_SERVICE_NAME}" \
+  --region "${REGION}" \
+  --update-env-vars "FMV_LIVE_DIRECTOR_ALLOWED_ORIGINS=${FRONTEND_URL}" >/dev/null
+
 cat <<EOF
 Deployment complete.
 Frontend: ${FRONTEND_URL}
 Backend:  ${BACKEND_URL}
+Live Director Gateway: ${LIVE_DIRECTOR_URL}
 Images:
   ${BACKEND_IMAGE}
   ${FRONTEND_IMAGE}

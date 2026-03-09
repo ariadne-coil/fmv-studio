@@ -20,8 +20,11 @@ class PipelineRunStatus(str, Enum):
 class MediaAsset(BaseModel):
     id: str
     url: str # Path to local or uploaded file
-    type: str # "image", "audio", "video"
+    type: str # "image", "audio", "video", "document"
     name: str
+    label: Optional[str] = None
+    mime_type: Optional[str] = None
+    text_content: Optional[str] = None
 
 class VideoClip(BaseModel):
     id: str
@@ -48,7 +51,8 @@ class VideoClip(BaseModel):
 
 class ProductionTimelineFragment(BaseModel):
     id: str
-    source_clip_id: str
+    track_type: str = "video" # "video" | "music"
+    source_clip_id: Optional[str] = None
     timeline_start: float
     source_start: float = 0.0
     duration: float
@@ -74,6 +78,7 @@ class DirectorTurn(BaseModel):
     id: str
     role: str
     text: str
+    audio_url: Optional[str] = None
     stage: str
     created_at: str
     source: Optional[str] = None

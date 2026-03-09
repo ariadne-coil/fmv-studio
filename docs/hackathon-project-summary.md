@@ -2,7 +2,7 @@
 
 ## What FMV Studio Does
 
-FMV Studio is an AI-assisted music video production environment. It is designed to compress the time required to produce a high-quality AI-generated music video from days of manual prompt chaining, file passing, and tool switching down to minutes inside one guided workflow. Instead of forcing the user to juggle separate tools for music generation, planning, image generation, video generation, review, and editing, FMV Studio keeps the whole creative process in one place and moves the user from an initial song idea to a finished edited video through a staged workflow:
+FMV Studio is an AI-assisted music video production environment. It is designed to compress the time required to produce a high-quality AI-generated music video from days of manual prompt chaining, file passing, and tool switching down to minutes inside one guided workflow. Instead of forcing the user to juggle separate tools for music generation, planning, image generation, video generation, review, and editing, FMV Studio keeps the whole creative process in one place and moves the user from an initial song idea to a finished edited video through a staged workflow. On top of that structured pipeline, it adds a `Live Director` agent the user can talk to in chat or realtime voice to reshape the project while it is underway:
 
 1. `Input`: provide concept, screenplay direction, audio, and reference assets.
 2. `Music`: generate or import the song and align the creative direction.
@@ -16,11 +16,13 @@ The goal is not only to generate assets, but to give the user a controllable cre
 ## Core Features and Functionality
 
 - AI-generated shot planning from user input and music context
+- Realtime `Live Director` control with typed chat and direct voice interaction
 - Storyboard image generation with review and regeneration loops
 - Video clip generation from storyboard frames
 - Separate orchestrator and critic model roles
 - Multi-critic validation for storyboard and filming review
 - Background async generation so the UI updates live as frames and clips arrive
+- Conversational editing of shot text, shot order, shot timing, stage navigation, and production audio decisions
 - Editable production timeline with split, reorder, and separate audio muting per fragment
 - Export of final renders and project resources
 - Saved projects with rename, reopen, and delete flows
@@ -36,7 +38,7 @@ The goal is not only to generate assets, but to give the user a controllable cre
 - `TypeScript`
 - `Tailwind CSS 4`
 
-The frontend provides the studio workflow, stage transitions, live polling during long-running jobs, and the production timeline/editor interface.
+The frontend provides the studio workflow, stage transitions, live polling during long-running jobs, the floating Live Director window, and the production timeline/editor interface.
 
 ### Backend
 
@@ -46,11 +48,12 @@ The frontend provides the studio workflow, stage transitions, live polling durin
 - `ffmpeg`
 - `pydantic`
 
-The backend acts as the central agent runtime. It owns project state, orchestration, generation retries, critique, production rendering, and media persistence.
+The backend acts as the central agent runtime. It owns project state, orchestration, generation retries, critique, Live Director command handling, production rendering, and media persistence.
 
 ### Google Cloud and Google AI
 
 - `Cloud Run` for frontend and backend deployment
+- `Cloud Run` for the public Live Director realtime gateway
 - `Cloud Tasks` for durable async pipeline jobs
 - `Google Cloud Storage` for project state and generated assets
 - `Artifact Registry` and `Cloud Build` for container builds and deployment
@@ -65,6 +68,7 @@ The backend acts as the central agent runtime. It owns project state, orchestrat
 - `Veo 3.1`: video generation
 - `Lyria 2`: music
 - `Gemini TTS`: spoken stage summaries
+- `Gemini Live native audio`: realtime Live Director speech input/output
 
 ## Other Data Sources Used
 
@@ -76,6 +80,7 @@ The main runtime data sources are:
   - screenplay and instruction text
   - uploaded music or test audio
   - uploaded reference images and replacement media
+  - typed and spoken Live Director instructions
 - generated assets:
   - storyboard frames
   - video clips
@@ -108,7 +113,11 @@ The local prototype could rely on in-memory job tracking and local files. The cl
 
 Generation alone was not enough. The production stage became much stronger once the user could split clips, reorder them, mute audio fragments independently, export assets, and revise the cut without rerunning the entire pipeline.
 
-### 6. Provider abstraction is worth doing early
+### 6. Live interaction changes how agent tooling should feel
+
+Once the `Live Director` existed, the product stopped feeling like a sequence of forms and started feeling like a collaborator. That only worked once the director could do real work: rewrite shots, add/delete/reorder them, move the project between stages, and speak back in realtime instead of only returning text or pre-rendered TTS.
+
+### 7. Provider abstraction is worth doing early
 
 As model access paths changed, provider abstraction for music, image, and video generation became important. It made the system easier to adapt to Vertex AI and keeps the codebase ready for future provider additions without rewriting the whole pipeline.
 
@@ -117,12 +126,13 @@ As model access paths changed, provider abstraction for music, image, and video 
 The result is a cloud-deployed, agent-driven music video studio that combines:
 
 - multi-stage orchestration
+- realtime multimodal directing
 - live generation workflows
 - human review checkpoints
 - editable post-generation production tools
 - automated Google Cloud deployment
 
-That combination is the main technical contribution of FMV Studio: not just generating assets, but turning multiple Google AI systems into a usable end-to-end creative production workflow.
+That combination is the main technical contribution of FMV Studio: not just generating assets, but turning multiple Google AI systems into a usable end-to-end creative production workflow with both structured stages and live conversational control.
 
 ## How This Differs From Flow
 
@@ -132,6 +142,8 @@ Google describes [Flow](https://labs.google/flow/about) as an AI filmmaking tool
   - The workflow starts from song, lyrics, pacing, and beat-aligned visual planning rather than from open-ended scene generation.
 - FMV Studio is stage-driven and agentic.
   - Instead of a single creation surface, it moves the user through `Music`, `Planning`, `Storyboarding`, `Filming`, and `Production`, with orchestration and critique happening between stages.
+- FMV Studio also includes a persistent directing agent.
+  - The user can talk to `Live Director` in chat or realtime voice and ask for changes in natural language without dropping out of the main workflow.
 - FMV Studio treats review and regeneration as first-class workflow steps.
   - Storyboards and clips are critiqued, retried, and approved before they become inputs to later stages.
 - FMV Studio includes an integrated post-generation production pass.

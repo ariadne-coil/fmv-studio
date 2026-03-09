@@ -10,11 +10,13 @@ import time
 import tempfile
 import uuid
 import wave
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from typing import Callable, Dict, Any, List
 from urllib.parse import urlsplit
 from google import genai
 from .models import AgentStage, DirectorTurn, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
+from app.core.document_context import display_asset_label, normalize_document_text
 from app.image.providers import (
     DEFAULT_IMAGE_PROVIDER,
     get_image_provider,
@@ -94,6 +96,7 @@ IMAGE_SIZE_DIMENSIONS = {
 VIDEO_RESOLUTION_DIMENSIONS = {
     "720p": (1280, 720),
     "1080p": (1920, 1080),
+    "4k": (3840, 2160),
 }
 STORYBOARD_PASS_SCORE = 8
 STORYBOARD_MAX_ATTEMPTS = 5
@@ -116,6 +119,52 @@ DEFAULT_CRITIC_MODEL = "gemini-3-flash-preview"
 LEGACY_TEXT_MODEL_ALIASES = {
     "gemini-3.1-pro-preview": "gemini-3-pro-preview",
 }
+
+LIVE_DIRECTOR_CREATIVE_FIELDS = {
+    "screenplay",
+    "instructions",
+    "additional_lore",
+    "lyrics_prompt",
+    "style_prompt",
+    "storyboard_text",
+    "video_prompt",
+}
+
+
+def _normalize_director_similarity_text(text: str) -> str:
+    lowered = re.sub(r"[^a-z0-9\s]+", " ", text.lower())
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _looks_like_literal_director_text(requested_message: str, candidate_text: str) -> bool:
+    requested = _normalize_director_similarity_text(requested_message)
+    candidate = _normalize_director_similarity_text(candidate_text)
+    if not requested or not candidate:
+        return False
+
+    requested_words = requested.split()
+    candidate_words = candidate.split()
+    if not requested_words or not candidate_words:
+        return False
+
+    if candidate == requested:
+        return True
+
+    if candidate in requested or requested in candidate:
+        if len(candidate_words) <= len(requested_words) + 10:
+            return True
+
+    similarity = SequenceMatcher(None, requested, candidate).ratio()
+    if similarity >= 0.84 and len(candidate_words) <= len(requested_words) + 12:
+        return True
+
+    requested_vocab = set(requested_words)
+    candidate_vocab = set(candidate_words)
+    overlap_ratio = len(requested_vocab & candidate_vocab) / max(1, len(requested_vocab))
+    if overlap_ratio >= 0.9 and len(candidate_words) <= len(requested_words) + 8:
+        return True
+
+    return False
 
 
 def _looks_like_windows_abs_path(path: str) -> bool:
@@ -828,6 +877,178 @@ class FMVAgentPipeline:
         shot_number = shot_lookup.get(clip.id)
         return f"shot {shot_number}" if shot_number is not None else clip.id
 
+    def _document_context_text(self, state: ProjectState, *, max_chars: int = 6000) -> str:
+        snippets: list[str] = []
+        current_length = 0
+        for asset in state.assets:
+            if asset.type != "document" or not asset.text_content:
+                continue
+            snippet = (
+                f"{display_asset_label(asset.label, asset.name)}:\n"
+                f"{normalize_document_text(asset.text_content, max_chars=max_chars)}"
+            )
+            if current_length + len(snippet) > max_chars:
+                remaining = max_chars - current_length
+                if remaining <= 0:
+                    break
+                snippet = snippet[:remaining].rstrip() + "…"
+            snippets.append(snippet)
+            current_length += len(snippet)
+            if current_length >= max_chars:
+                break
+        return "\n\n".join(snippets)
+
+    def _asset_reference_registry_text(self, state: ProjectState, *, max_chars: int = 2000) -> str:
+        entries: list[str] = []
+        current_length = 0
+        for asset in state.assets:
+            label = display_asset_label(asset.label, asset.name)
+            if asset.type == "image":
+                entry = (
+                    f'- image "{label}" (file: {asset.name}). '
+                    f"If this label names a character, creature, hero prop, vehicle, or location from the screenplay, "
+                    f"treat this image as the canonical visual reference for that named entity anywhere it appears."
+                )
+            elif asset.type == "document":
+                entry = f'- document "{label}" (file: {asset.name}). Supplemental written context for the screenplay, lore, and world details.'
+            elif asset.type == "audio":
+                entry = f'- audio "{label}" (file: {asset.name}). Music or sound reference available to the project.'
+            else:
+                entry = f'- {asset.type} "{label}" (file: {asset.name}).'
+
+            if current_length + len(entry) > max_chars:
+                remaining = max_chars - current_length
+                if remaining <= 0:
+                    break
+                entry = entry[:remaining].rstrip() + "…"
+            entries.append(entry)
+            current_length += len(entry)
+            if current_length >= max_chars:
+                break
+        return "\n".join(entries) or "(none)"
+
+    def _project_context_block(self, state: ProjectState, *, max_document_chars: int = 6000) -> str:
+        document_context = self._document_context_text(state, max_chars=max_document_chars) or "(none)"
+        asset_registry = self._asset_reference_registry_text(state, max_chars=2000)
+        lore_text = state.additional_lore.strip() or "(none)"
+        return (
+            f"Additional Lore:\n{lore_text}\n\n"
+            f"Uploaded Asset Registry:\n{asset_registry}\n\n"
+            f"Uploaded Document Context:\n{document_context}"
+        )
+
+    def _music_production_fragments(self, state: ProjectState) -> list[ProductionTimelineFragment]:
+        return [
+            fragment
+            for fragment in state.production_timeline
+            if (fragment.track_type or "video") == "music"
+        ]
+
+    def _preserve_music_production_fragments(self, state: ProjectState) -> None:
+        state.production_timeline = self._music_production_fragments(state) if state.music_url else []
+
+    def _build_live_director_field_context(
+        self,
+        *,
+        field_name: str,
+        state: ProjectState,
+        review_stage: AgentStage,
+        target_clip: VideoClip | None,
+        shot_lookup: dict[str, int],
+    ) -> str:
+        field_label_map = {
+            "screenplay": "project screenplay",
+            "instructions": "global visual instructions",
+            "additional_lore": "world and character lore",
+            "lyrics_prompt": "lyrics prompt",
+            "style_prompt": "music style prompt",
+            "storyboard_text": "single-shot storyboard frame description",
+            "video_prompt": "single-shot motion and camera prompt",
+        }
+        context_lines = [
+            f"Field being written: {field_label_map.get(field_name, field_name)}",
+            f"Review stage: {review_stage.value}",
+            f"Project screenplay: {state.screenplay}",
+            f"Project instructions: {state.instructions}",
+            f"Additional lore: {state.additional_lore}",
+            f"Uploaded asset registry: {self._asset_reference_registry_text(state, max_chars=1200)}",
+            f"Uploaded document context: {self._document_context_text(state, max_chars=2000) or '(none)'}",
+            f"Lyrics prompt: {state.lyrics_prompt}",
+            f"Style prompt: {state.style_prompt}",
+        ]
+        if target_clip:
+            context_lines.extend(
+                [
+                    f"Target shot: {self._shot_label(target_clip, shot_lookup)}",
+                    f"Target shot storyboard text: {target_clip.storyboard_text}",
+                    f"Target shot video prompt: {target_clip.video_prompt}",
+                    f"Target shot duration: {target_clip.duration}",
+                ]
+            )
+        return "\n".join(context_lines)
+
+    def _enrich_live_director_creative_text(
+        self,
+        *,
+        field_name: str,
+        requested_message: str,
+        candidate_text: str,
+        current_value: str,
+        state: ProjectState,
+        review_stage: AgentStage,
+        target_clip: VideoClip | None,
+        shot_lookup: dict[str, int],
+    ) -> str:
+        if field_name not in LIVE_DIRECTOR_CREATIVE_FIELDS:
+            return candidate_text.strip()
+        if not _looks_like_literal_director_text(requested_message, candidate_text):
+            return candidate_text.strip()
+
+        prompt = f"""
+You are polishing a Live Director edit for FMV Studio.
+
+The user instruction expresses creative intent, not the final text that should be stored in the project.
+Rewrite the candidate update into finished, production-ready copy that preserves the requested meaning while adding concrete detail, atmosphere, specificity, and creative enhancement grounded in the project context.
+
+Rules:
+- Do not echo or lightly paraphrase the user instruction.
+- Do not mention the user, editing actions, shot numbers, or revision language.
+- Keep the meaning aligned with the request and the existing project context.
+- Return ONLY the final field text. No JSON. No quotes. No markdown.
+
+{self._build_live_director_field_context(
+    field_name=field_name,
+    state=state,
+    review_stage=review_stage,
+    target_clip=target_clip,
+    shot_lookup=shot_lookup,
+)}
+
+Current field value:
+{current_value}
+
+Literal candidate update:
+{candidate_text}
+
+User instruction:
+{requested_message}
+"""
+
+        response = self.client.models.generate_content(
+            model=self.orchestrator_model,
+            contents=[prompt],
+            config=self._orchestrator_config(
+                thinking_budget=1024,
+                temperature=0.5,
+            ),
+        )
+        enriched_text = str(response.text or "").strip()
+        if not enriched_text:
+            return candidate_text.strip()
+        if _looks_like_literal_director_text(requested_message, enriched_text):
+            return candidate_text.strip()
+        return enriched_text
+
     def _resolve_director_shot_reference(self, state: ProjectState, message: str) -> tuple[int | None, str | None]:
         match = re.search(r"\b(?:shot|scene|clip|frame)\s+(\d{1,3})\b", message, flags=re.IGNORECASE)
         if not match:
@@ -844,12 +1065,65 @@ class FMVAgentPipeline:
         }
         return shot_number, clip_id_by_shot_number.get(shot_number)
 
+    def _expand_director_shot_number_phrase(self, phrase: str) -> list[int]:
+        normalized = phrase.lower()
+        results: list[int] = []
+
+        for start_text, end_text in re.findall(r"(\d{1,3})\s*(?:-|to|through)\s*(\d{1,3})", normalized):
+            start = int(start_text)
+            end = int(end_text)
+            if start < 1 or end < 1:
+                continue
+            step = 1 if end >= start else -1
+            for value in range(start, end + step, step):
+                if value not in results:
+                    results.append(value)
+
+        normalized = re.sub(r"(\d{1,3})\s*(?:-|to|through)\s*(\d{1,3})", " ", normalized)
+        for value_text in re.findall(r"\d{1,3}", normalized):
+            value = int(value_text)
+            if value >= 1 and value not in results:
+                results.append(value)
+
+        return results
+
+    def _resolve_director_shot_references(self, state: ProjectState, message: str) -> list[tuple[int, str | None]]:
+        shot_lookup = self._shot_lookup(state)
+        clip_id_by_shot_number = {
+            clip_number: clip_id
+            for clip_id, clip_number in shot_lookup.items()
+        }
+
+        resolved_numbers: list[int] = []
+        for match in re.finditer(r"\b(?:shot|scene|clip|frame)\s+(\d{1,3})\b", message, flags=re.IGNORECASE):
+            shot_number = int(match.group(1))
+            if shot_number >= 1 and shot_number not in resolved_numbers:
+                resolved_numbers.append(shot_number)
+
+        for match in re.finditer(
+            r"\b(?:shots|scenes|clips|frames)\s+([\d,\sandthroughto-]+)\b",
+            message,
+            flags=re.IGNORECASE,
+        ):
+            for shot_number in self._expand_director_shot_number_phrase(match.group(1)):
+                if shot_number not in resolved_numbers:
+                    resolved_numbers.append(shot_number)
+
+        return [
+            (shot_number, clip_id_by_shot_number.get(shot_number))
+            for shot_number in resolved_numbers
+        ]
+
     def _resolve_director_fragment_reference_for_clip(self, state: ProjectState, clip_id: str | None) -> str | None:
         if not clip_id:
             return None
 
         matching_fragments = sorted(
-            [fragment for fragment in state.production_timeline if fragment.source_clip_id == clip_id],
+            [
+                fragment
+                for fragment in state.production_timeline
+                if (fragment.track_type or "video") != "music" and fragment.source_clip_id == clip_id
+            ],
             key=lambda fragment: fragment.timeline_start,
         )
         if len(matching_fragments) == 1:
@@ -877,8 +1151,10 @@ class FMVAgentPipeline:
         self,
         state: ProjectState,
         *,
+        turn_id: str | None = None,
         role: str,
         text: str,
+        audio_url: str | None = None,
         stage: AgentStage | str,
         source: str | None = None,
         applied_changes: list[str] | None = None,
@@ -888,9 +1164,10 @@ class FMVAgentPipeline:
 
         state.director_log.append(
             DirectorTurn(
-                id=f"director_{uuid.uuid4().hex}",
+                id=turn_id or f"director_{uuid.uuid4().hex}",
                 role=role,
                 text=text.strip(),
+                audio_url=audio_url,
                 stage=stage.value if isinstance(stage, AgentStage) else str(stage),
                 created_at=datetime.now(timezone.utc).isoformat(),
                 source=source,
@@ -939,6 +1216,137 @@ class FMVAgentPipeline:
             clip.timeline_start = current_time
             current_time += clip.duration
 
+    def _next_director_clip_id(self, state: ProjectState) -> str:
+        max_index = -1
+        for clip in state.timeline:
+            match = re.search(r"(\d+)$", clip.id)
+            if match:
+                max_index = max(max_index, int(match.group(1)))
+
+        candidate_index = max_index + 1
+        while True:
+            candidate_id = f"clip_{candidate_index}"
+            if all(existing.id != candidate_id for existing in state.timeline):
+                return candidate_id
+            candidate_index += 1
+
+    def _insert_director_clip(
+        self,
+        state: ProjectState,
+        *,
+        anchor_clip_id: str | None,
+        position: str,
+        storyboard_text: str,
+        duration: float | None,
+    ) -> VideoClip | None:
+        if not storyboard_text.strip():
+            return None
+
+        new_clip = VideoClip(
+            id=self._next_director_clip_id(state),
+            timeline_start=0.0,
+            duration=float(_closest_valid_veo_duration(duration or 4.0)),
+            storyboard_text=storyboard_text.strip(),
+        )
+
+        insert_index = len(state.timeline) if position == "after" else 0
+        if anchor_clip_id:
+            anchor_index = next(
+                (index for index, clip in enumerate(state.timeline) if clip.id == anchor_clip_id),
+                None,
+            )
+            if anchor_index is not None:
+                insert_index = anchor_index + 1 if position == "after" else anchor_index
+
+        state.timeline.insert(insert_index, new_clip)
+        return new_clip
+
+    def _delete_director_clip(self, state: ProjectState, *, clip_id: str) -> VideoClip | None:
+        for index, clip in enumerate(state.timeline):
+            if clip.id == clip_id:
+                return state.timeline.pop(index)
+        return None
+
+    def _move_director_clip(
+        self,
+        state: ProjectState,
+        *,
+        clip_id: str,
+        anchor_clip_id: str,
+        position: str,
+    ) -> VideoClip | None:
+        if clip_id == anchor_clip_id:
+            return None
+
+        source_index = next(
+            (index for index, clip in enumerate(state.timeline) if clip.id == clip_id),
+            None,
+        )
+        anchor_index = next(
+            (index for index, clip in enumerate(state.timeline) if clip.id == anchor_clip_id),
+            None,
+        )
+        if source_index is None or anchor_index is None:
+            return None
+
+        moved_clip = state.timeline.pop(source_index)
+        if source_index < anchor_index:
+            anchor_index -= 1
+        insert_index = anchor_index + 1 if position == "after" else anchor_index
+        state.timeline.insert(insert_index, moved_clip)
+        return moved_clip
+
+    def _normalize_music_production_fragments(
+        self,
+        fragments: list[ProductionTimelineFragment],
+        *,
+        program_duration: float,
+    ) -> list[ProductionTimelineFragment]:
+        if program_duration <= 0:
+            return []
+        normalized_fragments: list[ProductionTimelineFragment] = []
+        working_fragments = [fragment for fragment in fragments if fragment.duration > 0]
+        if not working_fragments:
+            return [
+                ProductionTimelineFragment(
+                    id="music_frag_0",
+                    track_type="music",
+                    source_clip_id=None,
+                    timeline_start=0.0,
+                    source_start=0.0,
+                    duration=round(program_duration, 3),
+                    audio_enabled=True,
+                )
+            ]
+
+        current_end = 0.0
+        for index, fragment in enumerate(
+            sorted(working_fragments, key=lambda item: (item.timeline_start, item.id))
+        ):
+            timeline_start = max(0.0, round(float(fragment.timeline_start), 3))
+            timeline_start = max(timeline_start, round(current_end, 3))
+            max_start = max(0.0, program_duration - 0.1)
+            timeline_start = min(timeline_start, max_start)
+
+            duration = max(0.1, round(float(fragment.duration), 3))
+            duration = min(duration, max(0.1, program_duration - timeline_start))
+            source_start = max(0.0, round(float(fragment.source_start), 3))
+
+            normalized_fragments.append(
+                ProductionTimelineFragment(
+                    id=fragment.id or f"music_frag_{index}",
+                    track_type="music",
+                    source_clip_id=None,
+                    timeline_start=round(timeline_start, 3),
+                    source_start=source_start,
+                    duration=round(duration, 3),
+                    audio_enabled=True,
+                )
+            )
+            current_end = timeline_start + duration
+
+        return normalized_fragments
+
     def _reconcile_after_planning_edits(self, previous: ProjectState, state: ProjectState) -> None:
         previous_clips = {clip.id: clip for clip in previous.timeline}
         self._recalculate_timeline_starts(state)
@@ -954,7 +1362,7 @@ class FMVAgentPipeline:
             if storyboard_changed or duration_changed:
                 self._clear_clip_storyboard_outputs(clip)
 
-        state.production_timeline = []
+        self._preserve_music_production_fragments(state)
         state.final_video_url = None
         state.last_error = None
         self._trim_stage_summaries_to_stage(state, AgentStage.LYRIA_PROMPTING)
@@ -1006,10 +1414,10 @@ class FMVAgentPipeline:
                 clip.video_score = None
                 clip.video_approved = False
                 clip.video_prompt = None
-            state.production_timeline = []
+            self._preserve_music_production_fragments(state)
 
         if target_idx <= stage_order.index(AgentStage.FILMING):
-            state.production_timeline = []
+            self._preserve_music_production_fragments(state)
 
         if target_idx <= stage_order.index(AgentStage.PRODUCTION):
             state.final_video_url = None
@@ -1027,6 +1435,7 @@ class FMVAgentPipeline:
         selected_clip_id: str | None = None,
         selected_fragment_id: str | None = None,
         source: str = "text",
+        speech_mode: str = "standard",
     ) -> tuple[ProjectState, dict[str, Any]]:
         if not self.client:
             raise RuntimeError("Live Director Mode requires Google model access.")
@@ -1047,7 +1456,10 @@ class FMVAgentPipeline:
         selected_clip = next((clip for clip in updated_state.timeline if clip.id == selected_clip_id), None)
         selected_fragment = next((fragment for fragment in updated_state.production_timeline if fragment.id == selected_fragment_id), None)
         shot_lookup = self._shot_lookup(updated_state)
-        explicit_shot_number, explicit_target_clip_id = self._resolve_director_shot_reference(updated_state, requested_message)
+        explicit_shot_references = self._resolve_director_shot_references(updated_state, requested_message)
+        explicit_shot_number = explicit_shot_references[0][0] if explicit_shot_references else None
+        explicit_target_clip_id = explicit_shot_references[0][1] if explicit_shot_references else None
+        explicit_target_clip_ids = [clip_id for _, clip_id in explicit_shot_references if clip_id]
         explicit_target_fragment_id = self._resolve_director_fragment_reference_for_clip(updated_state, explicit_target_clip_id)
 
         clip_context = [
@@ -1066,6 +1478,7 @@ class FMVAgentPipeline:
         ]
         fragment_context = [
             {
+                "track_type": fragment.track_type or "video",
                 "fragment_id": fragment.id,
                 "source_clip_id": fragment.source_clip_id,
                 "source_shot_number": shot_lookup.get(fragment.source_clip_id),
@@ -1088,7 +1501,9 @@ Actual saved pipeline stage: {updated_state.current_stage.value}
 Selected clip id: {selected_clip.id if selected_clip else ""}
 Selected fragment id: {selected_fragment.id if selected_fragment else ""}
 Explicitly referenced shot number: {explicit_shot_number if explicit_shot_number is not None else ""}
+Explicitly referenced shot numbers: {json.dumps([shot_number for shot_number, _ in explicit_shot_references], ensure_ascii=True)}
 Resolved explicit clip id: {explicit_target_clip_id or ""}
+Resolved explicit clip ids: {json.dumps(explicit_target_clip_ids, ensure_ascii=True)}
 Resolved explicit fragment id: {explicit_target_fragment_id or ""}
 
 Project summary:
@@ -1096,6 +1511,7 @@ Project summary:
 - Screenplay: {updated_state.screenplay}
 - Instructions: {updated_state.instructions}
 - Additional lore: {updated_state.additional_lore}
+- Uploaded document context: {self._document_context_text(updated_state, max_chars=2000) or "(none)"}
 - Lyrics prompt: {updated_state.lyrics_prompt}
 - Style prompt: {updated_state.style_prompt}
 
@@ -1107,21 +1523,31 @@ Production fragments:
 
 Supported operations:
 - global_updates: screenplay, instructions, additional_lore, lyrics_prompt, style_prompt, music_min_duration_seconds, music_max_duration_seconds
-- one clip update: target_clip_id + clip_updates.storyboard_text and/or clip_updates.duration
-- one filming update: target_clip_id + clip_updates.video_prompt
-- force regeneration on the target clip: clear_target_image and/or clear_target_video
+- one or more clip operations: each clip operation may update, insert, delete, or move a shot
 - one production audio toggle: target_fragment_id + fragment_updates.audio_enabled
-- optional rewind_to_stage when the requested change requires revisiting an earlier stage
+- optional stage navigation when the user asks to move forward or backward in the pipeline
 
 Rules:
 - If the user explicitly names a shot number, that exact shot is the primary target. Do not switch to a different shot.
+- If the user explicitly names multiple shot numbers, you may update multiple shots in one reply. Return one clip_operations entry per affected shot.
+- If the user asks to proceed, continue, move on, or go to the next stage, set navigation_action to "advance".
+- If the user asks to go back, return, rewind, or revisit an earlier stage, set navigation_action to "rewind".
+- If the user explicitly names a stage like planning, storyboarding, filming, production, or music, set target_stage to that stage value.
+- Use clip operation types:
+  - "update": modify an existing shot's storyboard_text and/or duration and/or video_prompt
+  - "insert_before" / "insert_after": create a new shot relative to target_clip_id
+  - "delete": remove target_clip_id
+  - "move_before" / "move_after": move target_clip_id relative to anchor_clip_id
 - In production, use fragment source_shot_number to match numbered shot requests when you need target_fragment_id.
 - If the user says "this shot", "this clip", "this frame", or "this edit", prefer the selected ids.
 - duration must be one of 4, 6, or 8 seconds.
-- storyboard_text is only for planning/storyboarding-level changes.
+- storyboard_text is required for insert operations and is only for planning/storyboarding-level changes.
 - video_prompt is only for filming-level changes.
 - fragment_updates.audio_enabled is only for production.
-- Do not invent unsupported multi-shot timeline edits, multi-fragment edits, or batch operations.
+- For screenplay, instructions, additional_lore, lyrics_prompt, style_prompt, storyboard_text, and video_prompt, treat brief user phrasing as intent. Return finished, richer project copy, not a paraphrase of the instruction.
+- When updating creative text, add grounded detail and make the output more vivid or production-ready than the user's wording.
+- Multi-shot clip edits are supported, but keep each clip operation explicit and targeted to a real clip id from the timeline.
+- Do not invent unsupported multi-fragment production edits or arbitrary timeline restructuring outside of the supported move/insert/delete shot operations.
 - If the request is unsupported, explain that briefly in reply_text and leave the update fields empty.
 - Keep reply_text concise and director-facing.
 
@@ -1138,18 +1564,24 @@ Return STRICTLY as JSON matching this schema:
     "music_min_duration_seconds": number | null,
     "music_max_duration_seconds": number | null
   }},
-  "target_clip_id": string | null,
-  "clip_updates": {{
-    "storyboard_text": string | null,
-    "duration": number | null,
-    "video_prompt": string | null
-  }},
-  "clear_target_image": boolean,
-  "clear_target_video": boolean,
+  "clip_operations": [
+    {{
+      "operation_type": "update" | "insert_before" | "insert_after" | "delete" | "move_before" | "move_after",
+      "target_clip_id": string | null,
+      "anchor_clip_id": string | null,
+      "storyboard_text": string | null,
+      "duration": number | null,
+      "video_prompt": string | null,
+      "clear_target_image": boolean,
+      "clear_target_video": boolean
+    }}
+  ],
   "target_fragment_id": string | null,
   "fragment_updates": {{
     "audio_enabled": boolean | null
   }},
+  "navigation_action": "stay" | "advance" | "rewind",
+  "target_stage": string | null,
   "rewind_to_stage": string | null
 }}
 
@@ -1183,11 +1615,26 @@ User instruction:
             source=source,
         )
 
+        target_clip = None
+
         global_updates = action.get("global_updates") or {}
         for field_name in ("screenplay", "instructions", "additional_lore", "lyrics_prompt", "style_prompt"):
             value = global_updates.get(field_name)
             if isinstance(value, str):
-                setattr(updated_state, field_name, value.strip())
+                setattr(
+                    updated_state,
+                    field_name,
+                    self._enrich_live_director_creative_text(
+                        field_name=field_name,
+                        requested_message=requested_message,
+                        candidate_text=value.strip(),
+                        current_value=str(getattr(updated_state, field_name) or "").strip(),
+                        state=updated_state,
+                        review_stage=review_stage,
+                        target_clip=target_clip,
+                        shot_lookup=shot_lookup,
+                    ),
+                )
 
         min_duration = global_updates.get("music_min_duration_seconds")
         max_duration = global_updates.get("music_max_duration_seconds")
@@ -1205,44 +1652,179 @@ User instruction:
                 updated_state.music_min_duration_seconds,
             )
 
-        target_clip_id = str(
+        raw_clip_operations = action.get("clip_operations")
+        clip_operations: list[dict[str, Any]] = []
+        if isinstance(raw_clip_operations, list):
+            clip_operations = [item for item in raw_clip_operations if isinstance(item, dict)]
+
+        legacy_target_clip_id = str(
             explicit_target_clip_id
             or action.get("target_clip_id")
             or selected_clip_id
             or ""
         ).strip() or None
-        clip_updates = action.get("clip_updates") or {}
-        target_clip = next((clip for clip in updated_state.timeline if clip.id == target_clip_id), None)
-        target_clip_changed_for_planning = False
-        target_clip_changed_for_storyboarding = False
-        target_clip_changed_for_filming = False
+        legacy_clip_updates = action.get("clip_updates") or {}
+        if not clip_operations and (
+            legacy_target_clip_id
+            or isinstance(legacy_clip_updates, dict)
+            or bool(action.get("clear_target_image"))
+            or bool(action.get("clear_target_video"))
+        ):
+            clip_operations = [
+                {
+                    "target_clip_id": legacy_target_clip_id,
+                    "storyboard_text": legacy_clip_updates.get("storyboard_text"),
+                    "duration": legacy_clip_updates.get("duration"),
+                    "video_prompt": legacy_clip_updates.get("video_prompt"),
+                    "clear_target_image": bool(action.get("clear_target_image")),
+                    "clear_target_video": bool(action.get("clear_target_video")),
+                }
+            ]
 
-        if target_clip:
-            storyboard_text = clip_updates.get("storyboard_text")
+        planning_changed_clip_ids: set[str] = set()
+        storyboarding_changed_clip_ids: set[str] = set()
+        filming_changed_clip_ids: set[str] = set()
+        structural_change_summary: list[str] = []
+
+        def resolve_clip_by_id(clip_id: str | None) -> VideoClip | None:
+            if not clip_id:
+                return None
+            return next((clip for clip in updated_state.timeline if clip.id == clip_id), None)
+
+        for operation_index, clip_operation in enumerate(clip_operations):
+            operation_type = str(clip_operation.get("operation_type") or "update").strip().lower() or "update"
+            operation_target_clip_id = str(
+                clip_operation.get("target_clip_id")
+                or (
+                    legacy_target_clip_id
+                    if len(clip_operations) == 1 and operation_type == "update"
+                    else ""
+                )
+                or ""
+            ).strip() or None
+            if operation_target_clip_id is None and len(explicit_target_clip_ids) > operation_index:
+                operation_target_clip_id = explicit_target_clip_ids[operation_index]
+            if operation_target_clip_id is None and len(clip_operations) == 1:
+                operation_target_clip_id = explicit_target_clip_id or selected_clip_id
+
+            operation_anchor_clip_id = str(clip_operation.get("anchor_clip_id") or "").strip() or None
+            if (
+                operation_anchor_clip_id is None
+                and len(clip_operations) == 1
+                and len(explicit_target_clip_ids) >= 2
+                and operation_type in {"move_before", "move_after"}
+            ):
+                operation_anchor_clip_id = explicit_target_clip_ids[1]
+
+            if operation_type in {"insert_before", "insert_after"}:
+                inserted_storyboard_text = str(clip_operation.get("storyboard_text") or "").strip()
+                inserted_clip = self._insert_director_clip(
+                    updated_state,
+                    anchor_clip_id=operation_target_clip_id,
+                    position="after" if operation_type.endswith("after") else "before",
+                    storyboard_text=inserted_storyboard_text,
+                    duration=clip_operation.get("duration") if isinstance(clip_operation.get("duration"), (int, float)) else None,
+                )
+                if inserted_clip is None:
+                    continue
+                planning_changed_clip_ids.add(inserted_clip.id)
+                if target_clip is None:
+                    target_clip = inserted_clip
+                if not change_summary:
+                    anchor_label = self._shot_label(resolve_clip_by_id(operation_target_clip_id), shot_lookup)
+                    relation = "after" if operation_type.endswith("after") else "before"
+                    structural_change_summary.append(f"Added {self._shot_label(inserted_clip, self._shot_lookup(updated_state))} {relation} {anchor_label}.")
+                continue
+
+            operation_target_clip = resolve_clip_by_id(operation_target_clip_id)
+
+            if operation_type == "delete":
+                if operation_target_clip is None:
+                    continue
+                deleted_label = self._shot_label(operation_target_clip, shot_lookup)
+                deleted_clip = self._delete_director_clip(updated_state, clip_id=operation_target_clip.id)
+                if deleted_clip is None:
+                    continue
+                planning_changed_clip_ids.add(operation_target_clip.id)
+                if target_clip is None:
+                    target_clip = operation_target_clip
+                if not change_summary:
+                    structural_change_summary.append(f"Deleted {deleted_label}.")
+                continue
+
+            if operation_type in {"move_before", "move_after"}:
+                if operation_target_clip is None or not operation_anchor_clip_id:
+                    continue
+                moved_label = self._shot_label(operation_target_clip, shot_lookup)
+                anchor_clip = resolve_clip_by_id(operation_anchor_clip_id)
+                if anchor_clip is None:
+                    continue
+                moved_clip = self._move_director_clip(
+                    updated_state,
+                    clip_id=operation_target_clip.id,
+                    anchor_clip_id=anchor_clip.id,
+                    position="after" if operation_type.endswith("after") else "before",
+                )
+                if moved_clip is None:
+                    continue
+                planning_changed_clip_ids.add(moved_clip.id)
+                if target_clip is None:
+                    target_clip = moved_clip
+                if not change_summary:
+                    relation = "after" if operation_type.endswith("after") else "before"
+                    structural_change_summary.append(
+                        f"Moved {moved_label} {relation} {self._shot_label(anchor_clip, shot_lookup)}."
+                    )
+                continue
+
+            if operation_target_clip is None:
+                continue
+            if target_clip is None:
+                target_clip = operation_target_clip
+
+            storyboard_text = clip_operation.get("storyboard_text")
             if isinstance(storyboard_text, str) and storyboard_text.strip():
-                target_clip.storyboard_text = storyboard_text.strip()
+                operation_target_clip.storyboard_text = self._enrich_live_director_creative_text(
+                    field_name="storyboard_text",
+                    requested_message=requested_message,
+                    candidate_text=storyboard_text.strip(),
+                    current_value=str(operation_target_clip.storyboard_text or "").strip(),
+                    state=updated_state,
+                    review_stage=review_stage,
+                    target_clip=operation_target_clip,
+                    shot_lookup=shot_lookup,
+                )
                 if review_stage == AgentStage.PLANNING:
-                    target_clip_changed_for_planning = True
+                    planning_changed_clip_ids.add(operation_target_clip.id)
                 else:
-                    target_clip_changed_for_storyboarding = True
+                    storyboarding_changed_clip_ids.add(operation_target_clip.id)
 
-            duration = clip_updates.get("duration")
+            duration = clip_operation.get("duration")
             if isinstance(duration, (int, float)):
-                target_clip.duration = float(_closest_valid_veo_duration(duration))
-                target_clip_changed_for_planning = True
+                operation_target_clip.duration = float(_closest_valid_veo_duration(duration))
+                planning_changed_clip_ids.add(operation_target_clip.id)
 
-            video_prompt = clip_updates.get("video_prompt")
+            video_prompt = clip_operation.get("video_prompt")
             if isinstance(video_prompt, str) and video_prompt.strip():
-                target_clip.video_prompt = video_prompt.strip()
-                target_clip_changed_for_filming = True
+                operation_target_clip.video_prompt = self._enrich_live_director_creative_text(
+                    field_name="video_prompt",
+                    requested_message=requested_message,
+                    candidate_text=video_prompt.strip(),
+                    current_value=str(operation_target_clip.video_prompt or "").strip(),
+                    state=updated_state,
+                    review_stage=review_stage,
+                    target_clip=operation_target_clip,
+                    shot_lookup=shot_lookup,
+                )
+                filming_changed_clip_ids.add(operation_target_clip.id)
 
-            if bool(action.get("clear_target_image")):
-                self._clear_clip_storyboard_outputs(target_clip)
-                target_clip_changed_for_storyboarding = True
+            if bool(clip_operation.get("clear_target_image")):
+                self._clear_clip_storyboard_outputs(operation_target_clip)
+                storyboarding_changed_clip_ids.add(operation_target_clip.id)
 
-            if bool(action.get("clear_target_video")):
-                self._clear_clip_video_outputs(target_clip, preserve_prompt=True)
-                target_clip_changed_for_filming = True
+            if bool(clip_operation.get("clear_target_video")):
+                self._clear_clip_video_outputs(operation_target_clip, preserve_prompt=True)
+                filming_changed_clip_ids.add(operation_target_clip.id)
 
         target_fragment_id = str(
             explicit_target_fragment_id
@@ -1265,28 +1847,55 @@ User instruction:
             except ValueError:
                 rewind_to_stage = None
 
-        if target_clip_changed_for_planning:
+        navigation_action = str(action.get("navigation_action") or "stay").strip().lower() or "stay"
+        if navigation_action not in {"stay", "advance", "rewind"}:
+            navigation_action = "stay"
+        target_stage_raw = str(action.get("target_stage") or "").strip().lower()
+        target_stage: AgentStage | None = None
+        if target_stage_raw:
+            try:
+                target_stage = AgentStage(target_stage_raw)
+            except ValueError:
+                target_stage = None
+        if rewind_to_stage and navigation_action == "stay":
+            navigation_action = "rewind"
+            target_stage = rewind_to_stage
+
+        if planning_changed_clip_ids:
             self._reconcile_after_planning_edits(previous_state, updated_state)
+            if review_stage in {AgentStage.PLANNING, AgentStage.STORYBOARDING} and not rewind_to_stage:
+                updated_state.current_stage = review_stage
             if not change_summary:
-                change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and reconciled downstream outputs.")
+                if structural_change_summary:
+                    change_summary.extend(structural_change_summary)
+                elif len(planning_changed_clip_ids) == 1 and target_clip is not None:
+                    change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and reconciled downstream outputs.")
+                else:
+                    change_summary.append(f"Updated {len(planning_changed_clip_ids)} shots and reconciled downstream outputs.")
         else:
-            if target_clip_changed_for_storyboarding:
-                updated_state.production_timeline = []
+            if storyboarding_changed_clip_ids:
+                self._preserve_music_production_fragments(updated_state)
                 updated_state.final_video_url = None
                 updated_state.last_error = None
                 updated_state.current_stage = AgentStage.STORYBOARDING
                 self._trim_stage_summaries_to_stage(updated_state, AgentStage.PLANNING)
                 if not change_summary:
-                    change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and cleared its frame/video outputs.")
+                    if len(storyboarding_changed_clip_ids) == 1 and target_clip is not None:
+                        change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and cleared its frame/video outputs.")
+                    else:
+                        change_summary.append(f"Updated {len(storyboarding_changed_clip_ids)} shots and cleared their frame/video outputs.")
 
-            if target_clip_changed_for_filming:
-                updated_state.production_timeline = []
+            if filming_changed_clip_ids and not storyboarding_changed_clip_ids:
+                self._preserve_music_production_fragments(updated_state)
                 updated_state.final_video_url = None
                 updated_state.last_error = None
                 updated_state.current_stage = AgentStage.FILMING
                 self._trim_stage_summaries_to_stage(updated_state, AgentStage.STORYBOARDING)
                 if not change_summary:
-                    change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and cleared its rendered clip.")
+                    if len(filming_changed_clip_ids) == 1 and target_clip is not None:
+                        change_summary.append(f"Updated {self._shot_label(target_clip, shot_lookup)} and cleared its rendered clip.")
+                    else:
+                        change_summary.append(f"Updated {len(filming_changed_clip_ids)} shots and cleared their rendered clips.")
 
             if fragment_changed:
                 updated_state.final_video_url = None
@@ -1301,10 +1910,20 @@ User instruction:
             if not change_summary:
                 change_summary.append(f"Rewound the project to {rewind_to_stage.value}.")
 
+        agent_turn_id = f"director_{uuid.uuid4().hex}"
+        agent_audio_url = None
+        if speech_mode != "realtime":
+            agent_audio_url = await self._synthesize_director_reply_audio(
+                updated_state,
+                turn_id=agent_turn_id,
+                reply_text=reply_text,
+            )
         self._append_director_turn(
             updated_state,
+            turn_id=agent_turn_id,
             role="agent",
             text=reply_text,
+            audio_url=agent_audio_url,
             stage=updated_state.current_stage,
             source="agent",
             applied_changes=change_summary,
@@ -1316,6 +1935,8 @@ User instruction:
             "target_clip_id": target_clip.id if target_clip else None,
             "target_fragment_id": target_fragment.id if target_fragment else None,
             "stage": updated_state.current_stage.value,
+            "navigation_action": navigation_action,
+            "target_stage": target_stage.value if target_stage else None,
         }
 
     def _build_stage_summary_text(self, state: ProjectState, stage: AgentStage) -> str:
@@ -1489,15 +2110,21 @@ User instruction:
             wav_file.setframerate(24000)
             wav_file.writeframes(pcm_bytes)
 
-    async def _synthesize_stage_summary_audio(self, state: ProjectState, stage: AgentStage, summary_text: str) -> str | None:
-        if not self.stage_voice_briefs_enabled or not self.client:
+    async def _synthesize_project_voice_audio(
+        self,
+        *,
+        state: ProjectState,
+        text: str,
+        relative_filename: str,
+    ) -> str | None:
+        if not self.client:
             return None
 
         try:
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.speech_model,
-                contents=summary_text,
+                contents=text,
                 config=genai.types.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=genai.types.SpeechConfig(
@@ -1513,7 +2140,7 @@ User instruction:
             if not audio_bytes:
                 return None
 
-            output_path = PROJECTS_DIR / f"{state.project_id}_{stage.value}_brief.wav"
+            output_path = PROJECTS_DIR / relative_filename
             self._write_stage_summary_wave_file(str(output_path), audio_bytes)
             return self._sync_local_project_artifact(
                 output_path,
@@ -1521,8 +2148,35 @@ User instruction:
                 content_type="audio/wav",
             )
         except Exception as e:
+            print(f"[tts] Audio generation failed for {relative_filename}: {e}")
+            return None
+
+    async def _synthesize_stage_summary_audio(self, state: ProjectState, stage: AgentStage, summary_text: str) -> str | None:
+        if not self.stage_voice_briefs_enabled:
+            return None
+
+        try:
+            return await self._synthesize_project_voice_audio(
+                state=state,
+                text=summary_text,
+                relative_filename=f"{state.project_id}_{stage.value}_brief.wav",
+            )
+        except Exception as e:
             print(f"[stage_summary] TTS generation failed for {stage.value}: {e}")
             return None
+
+    async def _synthesize_director_reply_audio(
+        self,
+        state: ProjectState,
+        *,
+        turn_id: str,
+        reply_text: str,
+    ) -> str | None:
+        return await self._synthesize_project_voice_audio(
+            state=state,
+            text=reply_text,
+            relative_filename=f"{state.project_id}_{turn_id}.wav",
+        )
 
     async def _update_stage_summary(self, state: ProjectState, stage: AgentStage) -> None:
         if stage not in STAGE_SUMMARY_STAGES:
@@ -2365,6 +3019,60 @@ Return only the rewritten motion prompt.
             self._apply_generated_music_signature(state)
         return music_url
 
+    async def _build_music_generation_prompt(self, state: ProjectState) -> str:
+        style_prompt = (state.style_prompt or "").strip()
+        lyrics_prompt = (state.lyrics_prompt or "").strip()
+
+        if self.music_provider.definition.uses_lyrics:
+            prompt_parts = []
+            if lyrics_prompt:
+                prompt_parts.append(lyrics_prompt)
+            if style_prompt:
+                prompt_parts.append(f"Style: {style_prompt}")
+            prompt = "\n\n".join(prompt_parts).strip()
+            if not prompt:
+                raise RuntimeError("Cannot generate music without lyrics or style prompts.")
+            return prompt
+
+        if not style_prompt and not lyrics_prompt:
+            raise RuntimeError(
+                f"{self.music_provider.definition.label} requires a style prompt because lyrics are ignored by this provider."
+            )
+
+        if not self.client:
+            return style_prompt
+
+        adaptation_prompt = f"""
+You are preparing a prompt for an instrumental-only music generation model.
+
+Preserve the intended genre, mood, tempo, energy, instrumentation, era, and production texture.
+Use lyrics only as narrative context and emotional guidance. Do not write a sung performance prompt.
+Return one concise instrumental production prompt only. No JSON. No bullets. No quotes.
+
+Project screenplay:
+{state.screenplay}
+
+Project instructions:
+{state.instructions}
+
+Narrative lyric context:
+{lyrics_prompt}
+
+Existing style prompt:
+{style_prompt}
+"""
+
+        response = self.client.models.generate_content(
+            model=self.orchestrator_model,
+            contents=[adaptation_prompt],
+            config=self._orchestrator_config(
+                thinking_budget=1024,
+                temperature=0.3,
+            ),
+        )
+        adapted_prompt = str(response.text or "").strip()
+        return adapted_prompt or style_prompt
+
     def _generate_vertex_lyria_track_bytes(self, prompt: str) -> tuple[bytes, str]:
         try:
             import google.auth
@@ -2410,10 +3118,14 @@ Return only the rewritten motion prompt.
             body = json.loads(response.read().decode("utf-8"))
 
         prediction = (body.get("predictions") or [None])[0]
-        if not isinstance(prediction, dict) or not prediction.get("audioContent"):
-            raise RuntimeError("Vertex AI Lyria returned no audio content.")
+        audio_content = None
+        if isinstance(prediction, dict):
+            audio_content = prediction.get("audioContent") or prediction.get("bytesBase64Encoded")
+        if not isinstance(prediction, dict) or not audio_content:
+            body_preview = json.dumps(body, ensure_ascii=True)[:600]
+            raise RuntimeError(f"Vertex AI Lyria returned no audio content. Response preview: {body_preview}")
         return (
-            base64.b64decode(prediction["audioContent"]),
+            base64.b64decode(audio_content),
             str(prediction.get("mimeType") or "audio/wav"),
         )
 
@@ -2437,16 +3149,7 @@ Return only the rewritten motion prompt.
             )
             return state.music_url
 
-        prompt_parts = []
-        if self.music_provider.definition.uses_lyrics and state.lyrics_prompt.strip():
-            prompt_parts.append(state.lyrics_prompt.strip())
-        if state.style_prompt.strip():
-            prompt_parts.append(f"Style: {state.style_prompt.strip()}")
-        lyria_prompt = "\n\n".join(prompt_parts).strip()
-        if not lyria_prompt:
-            if self.music_provider.definition.uses_lyrics:
-                raise RuntimeError("Cannot generate music without lyrics or style prompts.")
-            raise RuntimeError(f"{self.music_provider.definition.label} requires a style prompt because lyrics are ignored by this provider.")
+        lyria_prompt = await self._build_music_generation_prompt(state)
 
         if self.uses_vertex_ai:
             audio_bytes, mime_type = await asyncio.to_thread(
@@ -2539,6 +3242,7 @@ Return only the rewritten motion prompt.
             fragments.append(
                 ProductionTimelineFragment(
                     id=f"{clip.id}_frag_0",
+                    track_type="video",
                     source_clip_id=clip.id,
                     timeline_start=current_time,
                     source_start=0.0,
@@ -2547,11 +3251,15 @@ Return only the rewritten motion prompt.
                 )
             )
             current_time += duration
-        state.production_timeline = fragments
+        music_fragments = self._normalize_music_production_fragments(
+            self._music_production_fragments(state) if state.music_url else [],
+            program_duration=current_time,
+        ) if state.music_url else []
+        state.production_timeline = fragments + music_fragments
 
     def _reconcile_production_timeline(self, state: ProjectState) -> None:
         if not state.timeline:
-            state.production_timeline = []
+            self._preserve_music_production_fragments(state)
             return
 
         if not state.production_timeline:
@@ -2561,9 +3269,14 @@ Return only the rewritten motion prompt.
         ordered_clips = sorted(state.timeline, key=lambda item: item.timeline_start)
         clip_lookup = {clip.id: clip for clip in ordered_clips}
         clip_ids = {clip.id for clip in ordered_clips}
+        video_fragments = [
+            fragment
+            for fragment in state.production_timeline
+            if (fragment.track_type or "video") != "music"
+        ]
         fragment_clip_ids = {
             fragment.source_clip_id
-            for fragment in state.production_timeline
+            for fragment in video_fragments
             if fragment.duration > 0
         }
 
@@ -2576,7 +3289,7 @@ Return only the rewritten motion prompt.
         normalized_fragments: list[ProductionTimelineFragment] = []
         current_time = 0.0
         for fragment in sorted(
-            state.production_timeline,
+            video_fragments,
             key=lambda item: (item.timeline_start, item.id),
         ):
             clip = clip_lookup.get(fragment.source_clip_id)
@@ -2599,6 +3312,7 @@ Return only the rewritten motion prompt.
             normalized_fragments.append(
                 ProductionTimelineFragment(
                     id=fragment.id,
+                    track_type="video",
                     source_clip_id=fragment.source_clip_id,
                     timeline_start=current_time,
                     source_start=round(source_start, 3),
@@ -2608,7 +3322,11 @@ Return only the rewritten motion prompt.
             )
             current_time += duration
 
-        state.production_timeline = normalized_fragments
+        music_fragments = self._normalize_music_production_fragments(
+            self._music_production_fragments(state) if state.music_url else [],
+            program_duration=current_time,
+        ) if state.music_url else []
+        state.production_timeline = normalized_fragments + music_fragments
 
     async def _normalize_timeline_for_veo(self, state: ProjectState) -> None:
         if not state.timeline:
@@ -2692,16 +3410,24 @@ Return only the rewritten motion prompt.
         This step uses Gemini to read the screenplay and draft the inputs
         (lyrics and style) for the selected music provider, which the user can then review.
         """
+        provider_generates_lyrics = self.music_provider.definition.uses_lyrics
         if not self.client:
             state.lyrics_prompt = "(Mock) A silent breeze blows through the neon trees\nDigital hearts beat to an analog freeze..."
-            state.style_prompt = "(Mock) Synthwave, cyberpunk, 80s retrowave, driving beat, ethereal female vocals"
+            state.style_prompt = "(Mock) Synthwave, cyberpunk, 80s retrowave, driving beat, shimmering analog synth textures"
         else:
+            music_prompting_task = (
+                "1. 'lyrics_prompt': A few stanzas of poetic lyrics that capture the narrative.\n"
+                "            2. 'style_prompt': A comma-separated list of musical genres, moods, instrumentation, tempo, and production qualities."
+                if provider_generates_lyrics
+                else "1. 'lyrics_prompt': A short narrative lyric sketch for user reference only.\n"
+                "            2. 'style_prompt': A comma-separated list of instrumental genres, moods, instrumentation, tempo, and production qualities. "
+                "Do not include vocal style instructions because the active provider is instrumental-only."
+            )
             prompt = f"""
             You are an expert music producer and lyricist. 
             The user wants to generate a song for a music video.
-            Analyze the following screenplay, instructions, and lore to draft two things:
-            1. 'lyrics_prompt': A few stanzas of poetic lyrics that capture the narrative.
-            2. 'style_prompt': A comma-separated list of musical genres, moods, and vocal styles.
+            Analyze the following screenplay, instructions, lore, and uploaded document context to draft two things:
+            {music_prompting_task}
 
             ### Inputs:
             Screenplay:
@@ -2710,8 +3436,7 @@ Return only the rewritten motion prompt.
             Instructions:
             {state.instructions}
 
-            Additional Lore:
-            {state.additional_lore}
+            {self._project_context_block(state, max_document_chars=3000)}
             
             ### Task:
             Provide the output STRICTLY as a JSON object matching this schema: 
@@ -2785,7 +3510,8 @@ Return only the rewritten motion prompt.
             CRITICAL: 
             - The storyboard image provider will generate the starting frames, and the video provider will animate them.
             - The storyboard image provider requires highly descriptive, specific visual prompts (lighting, camera angle, subject, style).
-            - Consider the provided "Instructions" and "Additional Lore" carefully to ensure stylistic consistency across all clips.
+            - Consider the provided "Instructions", "Additional Lore", and uploaded document context carefully to ensure stylistic consistency across all clips.
+            - If uploaded reference images are labeled with a character, creature, prop, vehicle, or location name, preserve that name verbatim in any storyboard descriptions where that entity appears so downstream reference routing can attach the correct asset.
             - If an audio track was provided (which you are currently listening to), align the clip transitions with major musical shifts or beats.
 
             ### Inputs:
@@ -2795,8 +3521,7 @@ Return only the rewritten motion prompt.
             Instructions:
             {state.instructions}
 
-            Additional Lore:
-            {state.additional_lore}
+            {self._project_context_block(state, max_document_chars=4000)}
             
             ### Task:
             Provide the output STRICTLY as a JSON list of objects matching this schema: 
@@ -2845,6 +3570,8 @@ Return only the rewritten motion prompt.
         self,
         image_assets: list,
         clips: list,
+        *,
+        screenplay: str,
     ) -> dict:
         """
         Orchestrator call: shows Gemini all reference images + all storyboard texts in one
@@ -2860,11 +3587,16 @@ Return only the rewritten motion prompt.
 
         # ── Build the multimodal prompt ──────────────────────────────────────
         # Label each asset image so Gemini can refer to it by ID in the JSON output.
-        parts: list = ["You are a film production asset coordinator.\n\n"
-                        "The following labeled reference images have been provided by the director:\n"]
+        parts: list = [
+            "You are a film production asset coordinator.\n\n"
+            "The following labeled reference images have been provided by the director. "
+            "Labels are semantic ground truth. If a label names a character, creature, prop, vehicle, or location from the screenplay, "
+            "treat that image as the canonical visual reference for that named entity.\n"
+        ]
 
         for asset in image_assets:
-            parts.append(f"[ASSET_ID: {asset.id}  |  Name: {asset.name}]")
+            asset_label = display_asset_label(getattr(asset, "label", None), asset.name)
+            parts.append(f"[ASSET_ID: {asset.id}  |  Label: {asset_label}  |  File: {asset.name}]")
             asset_path = _local_media_path(asset.url)
             if not asset_path or not os.path.exists(asset_path):
                 continue
@@ -2878,11 +3610,13 @@ Return only the rewritten motion prompt.
             for clip in clips
         )
         parts.append(
+            f"\nScreenplay context:\n{screenplay}\n\n"
             f"\nHere are the storyboard descriptions for each shot (clip_id → description):\n"
             f"{{\n{clips_json}\n}}\n\n"
             "For EACH clip, decide which of the reference assets are visually relevant to that shot.\n"
-            "An asset is relevant ONLY if the shot features the same person, creature, or location shown in the asset image.\n"
+            "An asset is relevant ONLY if the shot features the same labeled person, creature, prop, vehicle, or location shown in the asset image.\n"
             "It is NOT relevant if the shot does not feature that subject.\n\n"
+            "If a label matches a named entity in the screenplay or storyboard text, route that asset to every shot where that named entity appears.\n\n"
             "CRITICAL: For every relevant asset you select, you must explicitly classify it as either a 'subject' (e.g., a character, vehicle, or specific object) or a 'background' (e.g., a room, landscape, or environment).\n\n"
             "Return a JSON object mapping each clip_id to a list of relevant asset objects:\n"
             '{"clip_id": [{"id": "asset_id1", "type": "subject"}, {"id": "asset_id2", "type": "background"}], ...}\n'
@@ -3010,6 +3744,7 @@ Return your answer STRICTLY as a JSON object:
 
         # Build a reusable bytes cache keyed by asset id
         asset_bytes: dict[str, tuple[bytes, str]] = {}
+        asset_lookup = {asset.id: asset for asset, _ in image_assets}
         for asset, asset_path in image_assets:
             with open(asset_path, "rb") as f:
                 img_bytes = f.read()
@@ -3020,7 +3755,11 @@ Return your answer STRICTLY as a JSON object:
 
         relevance_map: dict[str, Any] = {}
         if image_assets:
-            raw_relevance_map = await self._build_asset_relevance_map([asset for asset, _ in image_assets], unapproved_clips)
+            raw_relevance_map = await self._build_asset_relevance_map(
+                [asset for asset, _ in image_assets],
+                unapproved_clips,
+                screenplay=state.screenplay,
+            )
             if isinstance(raw_relevance_map, dict):
                 relevance_map = raw_relevance_map
             else:
@@ -3066,13 +3805,21 @@ Return your answer STRICTLY as a JSON object:
                     asset_type = asset.get("type")
                     if asset_id in asset_bytes:
                         img_bytes, mime = asset_bytes[asset_id]
+                        asset_label = display_asset_label(
+                            getattr(asset_lookup.get(asset_id), "label", None),
+                            getattr(asset_lookup.get(asset_id), "name", asset_id),
+                        )
                         if asset_type == "subject":
                             clip_ref_parts.append(
-                                f"REFERENCE: Subject '{asset_id}'. CRITICAL CONSTRAINT: Use this image ONLY for the subject's likeness/appearance. DO NOT copy or use the background from this image. Ensure the subject is placed entirely in the environment described in the main prompt or continuity references."
+                                f"REFERENCE: Subject '{asset_label}' [{asset_id}]. "
+                                f"Treat this image as the canonical appearance reference for that named subject. "
+                                f"Use this image ONLY for the subject's likeness/appearance. DO NOT copy or use the background from this image. "
+                                f"Ensure the subject is placed entirely in the environment described in the main prompt or continuity references."
                             )
                         else:
                             clip_ref_parts.append(
-                                f"REFERENCE: Background/Location '{asset_id}'. Use this image to define the environmental setting."
+                                f"REFERENCE: Background/Location '{asset_label}' [{asset_id}]. "
+                                f"Use this image as the canonical environmental reference for that named setting."
                             )
                         clip_ref_parts.append(
                             genai.types.Part.from_bytes(data=img_bytes, mime_type=mime)
@@ -3098,6 +3845,7 @@ Return your answer STRICTLY as a JSON object:
                             continuity_reference_shots=previous_shots,
                             relevant_assets=relevant_assets,
                             asset_bytes=asset_bytes,
+                            asset_lookup=asset_lookup,
                         )
                     )
 
@@ -3339,7 +4087,9 @@ Return your answer STRICTLY as a JSON object:
         continuity_reference_shots: list[VideoClip],
         relevant_assets: list[dict[str, str]],
         asset_bytes: dict[str, tuple[bytes, str]],
+        asset_lookup: dict[str, Any] | None = None,
     ) -> list[Any]:
+        asset_lookup = asset_lookup or {}
         contents: list[Any] = [
             "GENERATED FRAME UNDER REVIEW:",
             genai.types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type),
@@ -3368,8 +4118,12 @@ Return your answer STRICTLY as a JSON object:
             if asset_id not in asset_bytes:
                 continue
             asset_img_bytes, asset_mime = asset_bytes[asset_id]
+            asset_label = display_asset_label(
+                getattr(asset_lookup.get(asset_id), "label", None),
+                getattr(asset_lookup.get(asset_id), "name", asset_id),
+            )
             contents.append(
-                f"GENERATION REFERENCE ASSET ({asset_type.upper()}): {asset_id}"
+                f"GENERATION REFERENCE ASSET ({asset_type.upper()}): {asset_label} [{asset_id}]"
             )
             contents.append(
                 genai.types.Part.from_bytes(data=asset_img_bytes, mime_type=asset_mime)
@@ -3468,6 +4222,7 @@ Return a single JSON object:
         continuity_reference_shots: list[VideoClip],
         relevant_assets: list[dict[str, str]],
         asset_bytes: dict[str, tuple[bytes, str]],
+        asset_lookup: dict[str, Any] | None = None,
     ) -> dict:
         """
         Uses a 3-critic panel to evaluate a provider-generated storyboard image.
@@ -3481,6 +4236,7 @@ Return a single JSON object:
                 continuity_reference_shots=continuity_reference_shots,
                 relevant_assets=relevant_assets,
                 asset_bytes=asset_bytes,
+                asset_lookup=asset_lookup,
             )
             panel_critiques = [
                 await self._single_image_critic_pass(
@@ -3860,6 +4616,31 @@ Return a single JSON object:
                 f"ffmpeg failed while extracting audio from '{input_path}': {stderr.decode()}"
             )
 
+    async def _concatenate_audio_segments_for_production(
+        self,
+        *,
+        segment_paths: list[str],
+        output_path: str,
+    ) -> None:
+        concat_list_path = f"{output_path}.concat.txt"
+        with open(concat_list_path, "w", encoding="utf-8") as handle:
+            for path in segment_paths:
+                handle.write(f"file '{os.path.abspath(path)}'\n")
+
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG, "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-c", "copy",
+            output_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError(
+                f"ffmpeg failed while concatenating audio into '{output_path}': {stderr.decode()}"
+            )
+
     async def _create_silent_audio_for_production(
         self,
         *,
@@ -3928,20 +4709,28 @@ Return a single JSON object:
 
         self._reconcile_production_timeline(state)
 
-        edited_fragments = [
+        video_fragments = [
             fragment
             for fragment in sorted(
                 state.production_timeline,
                 key=lambda item: (item.timeline_start, item.id),
             )
-            if fragment.duration > 0
+            if fragment.duration > 0 and (fragment.track_type or "video") != "music"
         ]
-        edited_total_duration = sum(fragment.duration for fragment in edited_fragments)
+        music_fragments = [
+            fragment
+            for fragment in sorted(
+                state.production_timeline,
+                key=lambda item: (item.timeline_start, item.id),
+            )
+            if fragment.duration > 0 and (fragment.track_type or "video") == "music"
+        ]
+        edited_total_duration = sum(fragment.duration for fragment in video_fragments)
         clip_lookup = {clip.id: clip for clip in state.timeline}
 
         missing_outputs = sorted({
             fragment.source_clip_id
-            for fragment in edited_fragments
+            for fragment in video_fragments
             if (
                 fragment.source_clip_id not in clip_lookup
                 or not clip_lookup[fragment.source_clip_id].video_approved
@@ -3963,7 +4752,7 @@ Return a single JSON object:
         # ── Step 2: Build the edited source sequence from production fragments ─
         video_sources: list[tuple[ProductionTimelineFragment, VideoClip, str]] = []
         missing_local_videos = []
-        for fragment in edited_fragments:
+        for fragment in video_fragments:
             clip = clip_lookup.get(fragment.source_clip_id)
             if not clip or not clip.video_url:
                 missing_local_videos.append(fragment.id)
@@ -4057,21 +4846,85 @@ Return a single JSON object:
 
             music_path = _local_media_path(state.music_url)
             if music_path and os.path.exists(music_path):
-                # Mix the edited clip audio with the project score.
-                proc = await asyncio.create_subprocess_exec(
-                    FFMPEG, "-y",
-                    "-i", str(sequence_path),
-                    "-i", music_path,
-                    "-filter_complex", "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-                    "-map", "0:v:0",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-shortest",
-                    str(final_video_path),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+                effective_music_fragments = music_fragments or [
+                    ProductionTimelineFragment(
+                        id="music_frag_0",
+                        track_type="music",
+                        source_clip_id=None,
+                        timeline_start=0.0,
+                        source_start=0.0,
+                        duration=round(edited_total_duration, 3),
+                        audio_enabled=True,
+                    )
+                ]
+
+                music_segment_paths: list[str] = []
+                current_music_time = 0.0
+                for index, fragment in enumerate(effective_music_fragments):
+                    fragment_start = max(0.0, float(fragment.timeline_start))
+                    if fragment_start > current_music_time + 1e-3:
+                        gap_duration = fragment_start - current_music_time
+                        gap_path = project_dir / f"{state.project_id}_music_gap_{index}.m4a"
+                        await self._create_silent_audio_for_production(
+                            output_path=str(gap_path),
+                            duration=gap_duration,
+                        )
+                        music_segment_paths.append(str(gap_path))
+                        current_music_time = fragment_start
+
+                    segment_duration = min(
+                        max(0.1, float(fragment.duration)),
+                        max(0.1, edited_total_duration - current_music_time),
+                    )
+                    music_segment_path = project_dir / f"{state.project_id}_{fragment.id}_music.m4a"
+                    try:
+                        await self._extract_clip_audio_for_production(
+                            input_path=music_path,
+                            output_path=str(music_segment_path),
+                            source_start=max(0.0, float(fragment.source_start)),
+                            duration=segment_duration,
+                        )
+                    except RuntimeError:
+                        await self._create_silent_audio_for_production(
+                            output_path=str(music_segment_path),
+                            duration=segment_duration,
+                        )
+                    music_segment_paths.append(str(music_segment_path))
+                    current_music_time = fragment_start + segment_duration
+
+                if current_music_time < edited_total_duration - 1e-3:
+                    tail_silence_path = project_dir / f"{state.project_id}_music_tail.m4a"
+                    await self._create_silent_audio_for_production(
+                        output_path=str(tail_silence_path),
+                        duration=edited_total_duration - current_music_time,
+                    )
+                    music_segment_paths.append(str(tail_silence_path))
+
+                if music_segment_paths:
+                    music_bed_path = project_dir / f"{state.project_id}_music_bed.m4a"
+                    await self._concatenate_audio_segments_for_production(
+                        segment_paths=music_segment_paths,
+                        output_path=str(music_bed_path),
+                    )
+
+                    # Mix the edited clip audio with the arranged music bed.
+                    proc = await asyncio.create_subprocess_exec(
+                        FFMPEG, "-y",
+                        "-i", str(sequence_path),
+                        "-i", str(music_bed_path),
+                        "-filter_complex", "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                        "-map", "0:v:0",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-shortest",
+                        str(final_video_path),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                else:
+                    shutil.copyfile(sequence_path, final_video_path)
+                    proc = None
             else:
                 shutil.copyfile(sequence_path, final_video_path)
                 proc = None

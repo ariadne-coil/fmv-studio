@@ -5,6 +5,9 @@ export interface MediaAsset {
     url: string;
     type: string;
     name: string;
+    label?: string | null;
+    mime_type?: string | null;
+    text_content?: string | null;
 }
 
 export interface VideoClip {
@@ -28,7 +31,8 @@ export interface VideoClip {
 
 export interface ProductionTimelineFragment {
     id: string;
-    source_clip_id: string;
+    track_type?: "video" | "music";
+    source_clip_id?: string | null;
     timeline_start: number;
     source_start: number;
     duration: number;
@@ -54,6 +58,7 @@ export interface DirectorTurn {
     id: string;
     role: "user" | "agent";
     text: string;
+    audio_url?: string | null;
     stage: string;
     created_at: string;
     source?: string | null;
@@ -114,6 +119,7 @@ export interface LiveDirectorRequest {
     selected_clip_id?: string | null;
     selected_fragment_id?: string | null;
     source?: "text" | "voice";
+    speech_mode?: "standard" | "realtime";
 }
 
 export interface LiveDirectorResponse {
@@ -275,7 +281,7 @@ export interface AppPreferences {
 }
 
 export type ImageResolution = "1K" | "2K" | "4K";
-export type VideoResolution = "720p" | "1080p";
+export type VideoResolution = "720p" | "1080p" | "4k";
 
 export interface ResolutionOption<T extends string> {
     value: T;
@@ -291,7 +297,8 @@ export const IMAGE_RESOLUTION_OPTIONS: ResolutionOption<ImageResolution>[] = [
 
 export const VIDEO_RESOLUTION_OPTIONS: ResolutionOption<VideoResolution>[] = [
     { value: "720p", label: "720p", description: "Faster Veo generation with lower output detail." },
-    { value: "1080p", label: "1080p", description: "Higher-quality Veo renders at higher cost." },
+    { value: "1080p", label: "1080p", description: "High-quality Veo renders with a balanced cost/performance tradeoff." },
+    { value: "4k", label: "4K", description: "Maximum Veo output detail at the highest cost." },
 ];
 
 export function normalizeImageResolution(value?: string | null): ImageResolution {
@@ -302,7 +309,7 @@ export function normalizeImageResolution(value?: string | null): ImageResolution
 
 export function normalizeVideoResolution(value?: string | null): VideoResolution {
     const normalized = (value ?? "").trim().toLowerCase();
-    if (normalized === "720p" || normalized === "1080p") return normalized;
+    if (normalized === "720p" || normalized === "1080p" || normalized === "4k") return normalized;
     return "1080p";
 }
 
@@ -443,7 +450,14 @@ export const api = {
         }
     },
 
-    async uploadAsset(projectId: string, file: File): Promise<{ url: string; name: string }> {
+    async uploadAsset(projectId: string, file: File): Promise<{
+        url: string;
+        name: string;
+        label?: string;
+        asset_type?: string;
+        mime_type?: string | null;
+        text_content?: string | null;
+    }> {
         const formData = new FormData();
         formData.append("file", file);
 
@@ -567,10 +581,18 @@ export const api = {
     async liveDirector(id: string, request: LiveDirectorRequest): Promise<LiveDirectorResponse> {
         const key = getStoredApiKey();
         const models = getStoredModels();
+        const preferences = getStoredPreferences();
         const headers: Record<string, string> = {
             "Content-Type": "application/json",
             "X-Orchestrator-Model": models.orchestrator,
+            "X-Critic-Model": models.critic,
             "X-Text-Model": models.orchestrator,
+            "X-Image-Model": models.image,
+            "X-Image-Resolution": preferences.imageResolution,
+            "X-Video-Model": models.video,
+            "X-Video-Resolution": preferences.videoResolution,
+            "X-Music-Model": models.music,
+            "X-Stage-Voice-Briefs-Enabled": String(preferences.stageVoiceBriefsEnabled),
         };
         if (key) headers["X-API-Key"] = key;
 

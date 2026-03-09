@@ -27,6 +27,12 @@ variable "frontend_service_name" {
   default     = "fmv-studio-frontend"
 }
 
+variable "live_director_service_name" {
+  type        = string
+  description = "Cloud Run live director gateway service name."
+  default     = "fmv-studio-live-director"
+}
+
 variable "tasks_queue_name" {
   type        = string
   description = "Cloud Tasks queue name used for asynchronous storyboard/filming jobs."

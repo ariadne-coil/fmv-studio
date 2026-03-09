@@ -10,10 +10,12 @@ flowchart TB
 
     subgraph experience[User Experience]
         frontend[Next.js Studio UI<br/>Cloud Run]
+        director_ui[Live Director Window<br/>chat + realtime voice]
     end
 
     subgraph runtime[Agent Runtime]
         backend[FastAPI Orchestrator<br/>Cloud Run]
+        live_gateway[Live Director Gateway<br/>Cloud Run WebSocket proxy]
         tasks[Cloud Tasks Queue<br/>async storyboard and filming jobs]
         gcs[GCS Bucket<br/>project state, uploads, frames,<br/>clips, music, final renders]
     end
@@ -24,15 +26,21 @@ flowchart TB
         image[Gemini Image<br/>storyboard generation]
         veo[Veo 3.1<br/>filming generation]
         audio[Lyria and TTS<br/>music and stage briefs]
+        live_model[Gemini Live native audio<br/>realtime director speech]
     end
 
     user -->|HTTPS| frontend
+    user -->|chat + mic input| director_ui
+    director_ui -->|same-origin app state| frontend
     frontend -->|REST /api| backend
     frontend <-->|/projects/* media| backend
+    director_ui <-->|WebSocket realtime speech| live_gateway
+    director_ui -->|tool call executes project edits| backend
 
     backend <--> |read and write state + assets| gcs
     backend -->|enqueue long-running runs| tasks
     tasks -->|authenticated execute-run callback| backend
+    live_gateway <-->|Vertex Live session| live_model
 
     backend -->|planning, continuity,<br/>prompt rewriting| orch
     backend -->|frame and clip review| critic
@@ -48,9 +56,9 @@ flowchart TB
     classDef service fill:#e4efe7,stroke:#2f6b4f,stroke-width:1.5px,color:#10251c;
     classDef model fill:#e7eef9,stroke:#3c5f99,stroke-width:1.5px,color:#14243f;
 
-    class user,frontend surface;
-    class backend,tasks,gcs service;
-    class orch,critic,image,veo,audio model;
+    class user,frontend,director_ui surface;
+    class backend,live_gateway,tasks,gcs service;
+    class orch,critic,image,veo,audio,live_model model;
 ```
 
 ## Agent and Production Stage Flow
@@ -75,6 +83,7 @@ flowchart LR
     editor[Production timeline editor<br/>split, reorder, audio edit]
     render[ffmpeg render<br/>final master]
     brief[TTS stage brief<br/>one-time spoken summary]
+    director[Live Director<br/>chat + realtime voice]
 
     input --> music_stage
     music_stage --> orch_music --> lyria --> planning
@@ -88,6 +97,10 @@ flowchart LR
     frame_crit -. failed critique / regenerate .-> storyboard
     clip_crit -. filtered or low-confidence / retry .-> filming
     render -. edit changes or rerender .-> production
+    director -. conversational edits, add/delete/reorder shots, stage navigation .-> planning
+    director -. frame notes, shot timing, structural changes .-> storyboard
+    director -. prompt tweaks, render retries .-> filming
+    director -. split/reorder/audio changes, rerender requests .-> production
 
     planning -. ready summary .-> brief
     storyboard -. ready summary .-> brief
@@ -101,6 +114,7 @@ flowchart LR
     class input,music_stage,planning,storyboard,filming,production,completed stage;
     class orch_music,orch_plan,frame_crit,clip_crit,brief agent;
     class lyria,frame_gen,clip_gen,editor,render output;
+    class director agent;
 ```
 
 ## Runtime Flow
@@ -109,13 +123,15 @@ flowchart LR
 2. The frontend sends project updates and pipeline commands to the FastAPI backend.
 3. The backend persists project state and generated media into Google Cloud Storage.
 4. Long-running storyboard and filming work is queued through Cloud Tasks.
-5. The backend processes those jobs and calls Vertex AI models for orchestration, critique, image generation, video generation, and music / voice synthesis.
-6. Generated assets are written back to GCS and served to the frontend through the backend's `/projects/...` URLs.
+5. The floating Live Director window can send typed commands through the backend or open a realtime voice session through the Live Director gateway.
+6. The backend processes jobs and calls Vertex AI models for orchestration, critique, image generation, video generation, and music / voice synthesis.
+7. Generated assets are written back to GCS and served to the frontend through the backend's `/projects/...` URLs.
 
 ## Notes For Judges
 
 - The same codebase also supports local mode, but the hackathon deployment path is Cloud Run + Vertex AI + GCS + Cloud Tasks.
 - The frontend and backend are deployed separately.
+- Realtime Live Director voice uses a separate Cloud Run WebSocket gateway that proxies to Vertex AI Live.
 - Async runs are durable because project state is persisted outside the Cloud Run instance.
 - Model roles are split:
   - `Gemini Pro` for orchestration and prompt rewriting
@@ -123,3 +139,4 @@ flowchart LR
   - `Veo` for video
   - `Gemini Image` for storyboards
   - `Lyria / TTS` for music and spoken stage briefs
+  - `Gemini Live native audio` for realtime Live Director speech
