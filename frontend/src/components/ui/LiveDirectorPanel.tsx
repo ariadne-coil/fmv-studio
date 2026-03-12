@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, GripVertical, Loader2, Maximize2, Mic, MicOff, Radio, Send, Volume2, VolumeX } from "lucide-react";
 import { DirectorTurn, LiveDirectorResponse, toBackendAssetUrl } from "@/lib/api";
 import {
+  getLiveDirectorRealtimeLocations,
   getLiveDirectorRealtimeLocation,
   getLiveDirectorRealtimeModel,
   getLiveDirectorRealtimeProjectId,
@@ -52,6 +53,10 @@ interface LiveDirectorPanelProps {
   turns: DirectorTurn[];
   isBusy: boolean;
   isProcessing: boolean;
+  mode?: "floating" | "docked";
+  emptyStateText?: string;
+  composerPlaceholder?: string;
+  composerHintText?: string;
   onSubmit: (
     message: string,
     source: "text" | "voice",
@@ -93,7 +98,7 @@ function clampPanelPosition(position: WindowPosition, width: number, height: num
 function buildRealtimeSystemInstruction(): string {
   return [
     "You are FMV Studio's Live Director voice interface.",
-    "For any request that changes, inspects, rewrites, regenerates, or adjusts the user's project, call apply_director_command.",
+    "For any request that changes, inspects, rewrites, regenerates, adjusts, undoes, or rolls back the user's project, call apply_director_command.",
     "Do not claim that edits were applied until the tool confirms them.",
     "After receiving tool output, explain the result briefly and naturally in spoken form.",
     "You may answer very short greetings or capability questions without a tool call, but project work must go through the tool.",
@@ -116,12 +121,31 @@ function buildRealtimeStatusLabel(status: RealtimeStatus, errorText: string | nu
   }
 }
 
+function shouldRetryRealtimeLocation(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("resource exhausted")
+    || normalized.includes("resource_exhausted")
+    || normalized.includes("quota")
+    || normalized.includes("capacity")
+    || normalized.includes("temporarily unavailable")
+    || normalized.includes("unavailable")
+    || normalized.includes("try again")
+    || normalized.includes("429")
+  );
+}
+
 export default function LiveDirectorPanel({
   currentStage,
   focusLabel,
   turns,
   isBusy,
   isProcessing,
+  mode = "floating",
+  emptyStateText,
+  composerPlaceholder,
+  composerHintText,
   onSubmit,
 }: LiveDirectorPanelProps) {
   const [draft, setDraft] = useState("");
@@ -155,6 +179,9 @@ export default function LiveDirectorPanel({
   const canSubmit = !isBusy && !isProcessing && composerValue.length > 0;
   const realtimeEnabled = hasLiveDirectorRealtimeConfig();
   const realtimeStatusLabel = buildRealtimeStatusLabel(realtimeStatus, realtimeError);
+  const isDocked = mode === "docked";
+  const resolvedEmptyStateText = emptyStateText ?? "No live direction yet. Try “make shot 4 wider and moodier” or “mute the middle audio fragment.”";
+  const resolvedComposerPlaceholder = composerPlaceholder ?? "Direct the current stage. Try “make shot 3 tighter.”";
 
   useEffect(() => {
     latestOnSubmitRef.current = onSubmit;
@@ -271,6 +298,9 @@ export default function LiveDirectorPanel({
     }
 
     if (event.type === "error") {
+      realtimeSessionRef.current?.disconnect();
+      realtimeSessionRef.current = null;
+      void stopRealtimeCapture();
       setRealtimeStatus("error");
       setRealtimeError(event.message);
       return;
@@ -300,23 +330,49 @@ export default function LiveDirectorPanel({
         realtimePlayerRef.current = new LiveDirectorAudioPlayer();
       }
 
-      const session = new LiveDirectorRealtimeSession({
-        proxyUrl,
-        model: getLiveDirectorRealtimeModel(),
-        projectId,
-        location: getLiveDirectorRealtimeLocation(),
-        systemInstruction: buildRealtimeSystemInstruction(),
-        voiceName: "Kore",
-        onEvent: (event) => {
-          void handleRealtimeEvent(event);
-        },
-      });
+      const model = getLiveDirectorRealtimeModel();
+      const preferredLocation = getLiveDirectorRealtimeLocation();
+      const candidateLocations = getLiveDirectorRealtimeLocations();
+      let lastError: Error | null = null;
 
-      realtimeSessionRef.current = session;
-      await session.connect();
-      realtimePlayerRef.current.setMuted(!autoSpeakReplies);
-      setRealtimeStatus("connected");
-      return true;
+      for (let index = 0; index < candidateLocations.length; index += 1) {
+        const location = candidateLocations[index];
+        const session = new LiveDirectorRealtimeSession({
+          proxyUrl,
+          model,
+          projectId,
+          location,
+          systemInstruction: buildRealtimeSystemInstruction(),
+          voiceName: "Kore",
+          onEvent: (event) => {
+            void handleRealtimeEvent(event);
+          },
+        });
+
+        try {
+          realtimeSessionRef.current = session;
+          await session.connect();
+          realtimePlayerRef.current.setMuted(!autoSpeakReplies);
+          setRealtimeStatus("connected");
+          if (location !== preferredLocation) {
+            setRealtimeError(`Realtime voice connected via ${location} after capacity issues in ${preferredLocation}.`);
+          }
+          return true;
+        } catch (error) {
+          session.disconnect();
+          realtimeSessionRef.current = null;
+          lastError = error instanceof Error ? error : new Error("Live Director realtime connection failed.");
+          const hasMoreCandidates = index < candidateLocations.length - 1;
+          if (!hasMoreCandidates || !shouldRetryRealtimeLocation(lastError.message)) {
+            break;
+          }
+        }
+      }
+
+      if (lastError) {
+        throw lastError;
+      }
+      throw new Error("Live Director realtime connection failed.");
     } catch (error) {
       setRealtimeStatus("error");
       setRealtimeError(error instanceof Error ? error.message : "Live Director realtime connection failed.");
@@ -373,6 +429,7 @@ export default function LiveDirectorPanel({
   }, [realtimeEnabled]);
 
   useEffect(() => {
+    if (isDocked) return undefined;
     if (typeof window === "undefined") return;
 
     const syncPosition = () => {
@@ -398,9 +455,10 @@ export default function LiveDirectorPanel({
       window.cancelAnimationFrame(frameId);
       window.removeEventListener("resize", syncPosition);
     };
-  }, [isOpen]);
+  }, [isDocked, isOpen]);
 
   useEffect(() => {
+    if (isDocked) return undefined;
     if (!isDragging || typeof window === "undefined") return;
 
     const handlePointerMove = (event: PointerEvent) => {
@@ -433,7 +491,7 @@ export default function LiveDirectorPanel({
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [isDragging]);
+  }, [isDocked, isDragging]);
 
   useEffect(() => {
     realtimePlayerRef.current?.setMuted(!autoSpeakReplies);
@@ -577,29 +635,33 @@ export default function LiveDirectorPanel({
     void handleSubmit();
   };
 
-  const windowStyle = position
-    ? { left: `${position.x}px`, top: `${position.y}px`, visibility: "visible" as const }
-    : { left: "0px", top: "0px", visibility: "hidden" as const };
+  const windowStyle = isDocked
+    ? undefined
+    : position
+      ? { left: `${position.x}px`, top: `${position.y}px`, visibility: "visible" as const }
+      : { left: "0px", top: "0px", visibility: "hidden" as const };
 
   return (
     <div
       ref={panelRef}
-      className={`fixed z-40 overflow-hidden rounded-[1.6rem] border border-cyan-400/20 bg-[#07131c]/95 shadow-[0_26px_90px_rgba(8,145,178,0.22)] backdrop-blur-xl transition-[width,box-shadow] ${isOpen
-        ? "w-[min(24rem,calc(100vw-1.5rem))]"
-        : "w-[min(18rem,calc(100vw-1.5rem))]"
-        } ${isDragging ? "shadow-[0_30px_110px_rgba(34,211,238,0.28)]" : ""}`}
+      className={isDocked
+        ? "h-full w-full overflow-hidden bg-background/40"
+        : `fixed z-40 overflow-hidden rounded-[1.6rem] border border-cyan-400/20 bg-[#07131c]/95 shadow-[0_26px_90px_rgba(8,145,178,0.22)] backdrop-blur-xl transition-[width,box-shadow] ${isOpen
+            ? "w-[min(24rem,calc(100vw-1.5rem))]"
+            : "w-[min(18rem,calc(100vw-1.5rem))]"
+          } ${isDragging ? "shadow-[0_30px_110px_rgba(34,211,238,0.28)]" : ""}`}
       style={windowStyle}
     >
       <audio ref={replyAudioRef} hidden preload="none" />
       <div
-        onPointerDown={handleWindowDragStart}
-        className={`relative flex cursor-grab items-start justify-between gap-3 border-b border-cyan-400/15 bg-gradient-to-r from-cyan-500/14 via-cyan-400/8 to-transparent px-4 py-3 active:cursor-grabbing ${isDragging ? "cursor-grabbing" : ""}`}
+        onPointerDown={isDocked ? undefined : handleWindowDragStart}
+        className={`relative flex items-start justify-between gap-3 border-b border-cyan-400/15 bg-gradient-to-r from-cyan-500/14 via-cyan-400/8 to-transparent px-4 py-3 ${isDocked ? "" : `cursor-grab active:cursor-grabbing ${isDragging ? "cursor-grabbing" : ""}`}`}
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-sm font-semibold text-white/95">
             <Radio className="h-4 w-4 text-cyan-300" />
             Live Director
-            <GripVertical className="h-3.5 w-3.5 text-white/35" />
+            {!isDocked && <GripVertical className="h-3.5 w-3.5 text-white/35" />}
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-cyan-100/65">
             <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-0.5">
@@ -625,20 +687,22 @@ export default function LiveDirectorPanel({
           >
             {autoSpeakReplies ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
           </button>
-          <button
-            type="button"
-            onClick={() => setIsOpen((value) => !value)}
-            className="rounded-full border border-white/10 bg-white/5 p-2 text-white/65 transition-colors hover:bg-white/10 hover:text-white"
-            title={isOpen ? "Minimize window" : "Expand window"}
-            aria-label={isOpen ? "Minimize window" : "Expand window"}
-          >
-            {isOpen ? <ChevronDown className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
-          </button>
+          {!isDocked && (
+            <button
+              type="button"
+              onClick={() => setIsOpen((value) => !value)}
+              className="rounded-full border border-white/10 bg-white/5 p-2 text-white/65 transition-colors hover:bg-white/10 hover:text-white"
+              title={isOpen ? "Minimize window" : "Expand window"}
+              aria-label={isOpen ? "Minimize window" : "Expand window"}
+            >
+              {isOpen ? <ChevronDown className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+            </button>
+          )}
         </div>
       </div>
 
-      {isOpen && (
-        <div className="flex max-h-[min(34rem,calc(100vh-5.5rem))] flex-col">
+      {(isDocked || isOpen) && (
+        <div className={`flex flex-col ${isDocked ? "h-[calc(100%-4.5rem)]" : "max-h-[min(34rem,calc(100vh-5.5rem))]"}`}>
           <div className="space-y-2 border-b border-white/8 px-4 py-2 text-xs leading-relaxed text-surface-border">
             <div className={`rounded-xl border px-3 py-2 ${realtimeStatus === "connected"
               ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-100/85"
@@ -689,7 +753,7 @@ export default function LiveDirectorPanel({
               ))
             ) : (
               <div className="rounded-[1.2rem] border border-dashed border-white/10 bg-white/[0.03] px-4 py-5 text-sm leading-relaxed text-surface-border">
-                No live direction yet. Try “make shot 4 wider and moodier” or “mute the middle audio fragment.”
+                {resolvedEmptyStateText}
               </div>
             )}
 
@@ -733,16 +797,16 @@ export default function LiveDirectorPanel({
                   onChange={(event) => setDraft(event.target.value)}
                   onKeyDown={handleComposerKeyDown}
                   className="max-h-28 min-h-[3.25rem] w-full resize-none bg-transparent text-sm leading-relaxed text-white/90 outline-none placeholder:text-white/28"
-                  placeholder="Direct the current stage. Try “make shot 3 tighter.”"
+                  placeholder={resolvedComposerPlaceholder}
                   disabled={isBusy || isProcessing}
                 />
                 <div className="mt-2 flex items-center justify-between gap-3 text-[11px] text-surface-border">
                   <span>
-                    {realtimeEnabled
+                    {composerHintText ?? (realtimeEnabled
                       ? "Enter to send through realtime voice. Use the mic for direct speech."
                       : legacySpeechSupported
                         ? "Enter to send. Shift+Enter for a new line."
-                        : "Voice capture requires a supported browser or a configured realtime gateway."}
+                        : "Voice capture requires a supported browser or a configured realtime gateway.")}
                   </span>
                   <button
                     type="button"

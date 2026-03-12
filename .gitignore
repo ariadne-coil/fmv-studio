@@ -21,3 +21,9 @@ frontend/node_modules/
 __pycache__/
 *.py[cod]
 *.log
+
+.probe_assets/
+.video_audio_chunks/
+.video_review_frames/
+live_probe_*.py
+state_inspect_*.json

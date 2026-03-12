@@ -85,6 +85,13 @@ class StoredProjectDocument:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class BrowserUploadTarget:
+    upload_url: str
+    method: str = "PUT"
+    headers: dict[str, str] | None = None
+
+
 class BaseStorageBackend:
     name = "base"
 
@@ -120,6 +127,16 @@ class BaseStorageBackend:
         content_type: str | None = None,
     ) -> str:
         raise NotImplementedError
+
+    def create_browser_project_asset_upload(
+        self,
+        relative_path: str,
+        *,
+        content_type: str | None = None,
+        content_length: int | None = None,
+        origin: str | None = None,
+    ) -> BrowserUploadTarget | None:
+        return None
 
     def resolve_project_asset_to_local_path(self, path_or_url: str | Path | None) -> str | None:
         raise NotImplementedError
@@ -387,6 +404,24 @@ class GCSStorageBackend(BaseStorageBackend):
         blob = self._bucket().blob(self._media_blob_name(normalized))
         blob.upload_from_filename(str(cache_path), content_type=_guess_content_type(normalized, content_type))
         return f"/projects/{normalized}"
+
+    def create_browser_project_asset_upload(
+        self,
+        relative_path: str,
+        *,
+        content_type: str | None = None,
+        content_length: int | None = None,
+        origin: str | None = None,
+    ) -> BrowserUploadTarget | None:
+        self.ensure_ready()
+        normalized = _normalize_asset_relative_path(relative_path)
+        blob = self._bucket().blob(self._media_blob_name(normalized))
+        upload_url = blob.create_resumable_upload_session(
+            content_type=_guess_content_type(normalized, content_type),
+            size=content_length,
+            origin=origin,
+        )
+        return BrowserUploadTarget(upload_url=upload_url, method="PUT", headers={})
 
     def resolve_project_asset_to_local_path(self, path_or_url: str | Path | None) -> str | None:
         if not path_or_url:

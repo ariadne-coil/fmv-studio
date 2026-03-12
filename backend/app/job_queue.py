@@ -3,6 +3,7 @@ import json
 import os
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 LOCAL_PIPELINE_TASKS: dict[str, dict[str, Any]] = {}
@@ -99,7 +100,9 @@ def _create_cloud_task(project_id: str, payload: dict[str, Any], base_url: str |
     gcp_project = os.getenv("FMV_GCP_PROJECT", "").strip()
     location = os.getenv("FMV_CLOUD_TASKS_LOCATION", "").strip()
     queue = os.getenv("FMV_CLOUD_TASKS_QUEUE", "").strip()
-    resolved_base_url = (os.getenv("FMV_BASE_URL", "").strip() or (base_url or "").strip())
+    resolved_base_url = _normalize_base_url(
+        os.getenv("FMV_BASE_URL", "").strip() or (base_url or "").strip()
+    )
 
     missing = [
         env_name
@@ -148,3 +151,15 @@ def _create_cloud_task(project_id: str, payload: dict[str, Any], base_url: str |
             },
         }
     )
+
+
+def _normalize_base_url(value: str) -> str:
+    raw = (value or "").strip().rstrip(")]}>,.;")
+    if not raw:
+        return ""
+
+    parsed = urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")

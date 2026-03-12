@@ -34,6 +34,13 @@ resource "google_storage_bucket" "fmv_assets" {
   uniform_bucket_level_access = true
   force_destroy               = false
 
+  cors {
+    origin          = ["*"]
+    method          = ["GET", "HEAD", "POST", "PUT", "OPTIONS"]
+    response_header = ["Content-Type", "Content-Length", "Content-Range", "x-goog-resumable", "x-guploader-uploadid"]
+    max_age_seconds = 3600
+  }
+
   versioning {
     enabled = true
   }
@@ -46,7 +53,7 @@ resource "google_cloud_tasks_queue" "pipeline" {
   location = var.region
 
   rate_limits {
-    max_concurrent_dispatches = 1
+    max_concurrent_dispatches = 4
     max_dispatches_per_second = 1
   }
 

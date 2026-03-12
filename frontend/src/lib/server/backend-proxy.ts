@@ -112,9 +112,11 @@ export async function proxyToBackend(request: Request, targetPath: string): Prom
     redirect: "manual",
   });
 
+  const responseHeaders = copyProxyResponseHeaders(upstream.headers);
+
   return new Response(upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
-    headers: copyProxyResponseHeaders(upstream.headers),
+    headers: responseHeaders,
   });
 }

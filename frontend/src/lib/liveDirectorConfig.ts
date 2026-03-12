@@ -1,7 +1,21 @@
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+const DEFAULT_LIVE_DIRECTOR_MODEL = "gemini-live-2.5-flash-native-audio";
+const GA_NATIVE_AUDIO_REGIONS = [
+  "us-central1",
+  "us-east1",
+  "us-east4",
+  "us-east5",
+  "us-south1",
+  "us-west1",
+  "us-west4",
+];
 
 function normalizeOrigin(value: string): string {
   return value.trim().replace(/\/+$/, "");
+}
+
+function uniqueLocations(locations: string[]): string[] {
+  return Array.from(new Set(locations.map((value) => value.trim()).filter(Boolean)));
 }
 
 export function getLiveDirectorWsUrl(): string | null {
@@ -27,7 +41,23 @@ export function getLiveDirectorRealtimeLocation(): string {
 }
 
 export function getLiveDirectorRealtimeModel(): string {
-  return (process.env.NEXT_PUBLIC_LIVE_DIRECTOR_MODEL || "gemini-live-2.5-flash-native-audio").trim();
+  return (process.env.NEXT_PUBLIC_LIVE_DIRECTOR_MODEL || DEFAULT_LIVE_DIRECTOR_MODEL).trim();
+}
+
+export function getLiveDirectorRealtimeLocations(): string[] {
+  const model = getLiveDirectorRealtimeModel();
+  const primary = getLiveDirectorRealtimeLocation();
+  const configuredFallbacks = uniqueLocations(
+    (process.env.NEXT_PUBLIC_VERTEX_MEDIA_LOCATIONS || "")
+      .split(","),
+  );
+  if (configuredFallbacks.length > 0) {
+    return uniqueLocations([primary, ...configuredFallbacks]);
+  }
+  if (model === DEFAULT_LIVE_DIRECTOR_MODEL) {
+    return uniqueLocations([primary, ...GA_NATIVE_AUDIO_REGIONS]);
+  }
+  return [primary];
 }
 
 export function hasLiveDirectorRealtimeConfig(): boolean {

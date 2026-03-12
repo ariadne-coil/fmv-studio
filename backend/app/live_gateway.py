@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
+import re
 import ssl
 
 import certifi
@@ -21,11 +23,11 @@ app = FastAPI(
 )
 
 
-def _live_director_service_url() -> str:
-    location = get_vertex_media_location()
+def _live_director_service_url(location: str | None = None) -> str:
+    resolved_location = (location or "").strip() or get_vertex_media_location()
     return (
-        f"wss://{location}-aiplatform.googleapis.com"
-        "/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
+        f"wss://{resolved_location}-aiplatform.googleapis.com"
+        "/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
     )
 
 
@@ -59,6 +61,24 @@ def _generate_access_token() -> str:
     )
     credentials.refresh(GoogleAuthRequest())
     return credentials.token
+
+
+def _extract_location_from_setup_message(message: str) -> str:
+    default_location = get_vertex_media_location()
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError:
+        return default_location
+    model = str(payload.get("setup", {}).get("model") or "")
+    match = re.search(r"/locations/([^/]+)/", model)
+    if not match:
+        return default_location
+    return match.group(1).strip() or default_location
+
+
+async def _send_gateway_error(client: WebSocket, message: str) -> None:
+    with contextlib.suppress(Exception):
+        await client.send_text(json.dumps({"error": {"message": message}}))
 
 
 @app.get("/health")
@@ -109,6 +129,15 @@ async def live_director_proxy(websocket: WebSocket) -> None:
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
         return
 
+    try:
+        initial_message = await websocket.receive_text()
+        target_location = _extract_location_from_setup_message(initial_message)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
     ssl_context = ssl.create_default_context(cafile=certifi.where())
     headers = {
         "Authorization": f"Bearer {bearer_token}",
@@ -117,12 +146,13 @@ async def live_director_proxy(websocket: WebSocket) -> None:
 
     try:
         async with websockets.connect(
-            _live_director_service_url(),
+            _live_director_service_url(target_location),
             additional_headers=headers,
             ssl=ssl_context,
             max_size=None,
             open_timeout=30,
         ) as upstream:
+            await upstream.send(initial_message)
             client_to_upstream = asyncio.create_task(_relay_client_to_upstream(websocket, upstream))
             upstream_to_client = asyncio.create_task(_relay_upstream_to_client(upstream, websocket))
 
@@ -136,6 +166,7 @@ async def live_director_proxy(websocket: WebSocket) -> None:
             for task in done:
                 with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect):
                     await task
-    except Exception:
+    except Exception as exc:
+        await _send_gateway_error(websocket, str(exc) or "Live Director realtime connection failed.")
         with contextlib.suppress(Exception):
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)

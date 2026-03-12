@@ -12,15 +12,19 @@ sys.path.insert(0, str(REPO_ROOT / "backend"))
 import app.agent.graph as graph_module
 import app.api.endpoints as endpoints_module
 import app.job_queue as job_queue_module
+import app.media as media_module
 import app.paths as paths_module
 import app.storage as storage_module
 from app.agent.graph import (
     FMVAgentPipeline,
+    _is_resource_exhausted_error,
     _local_media_path,
     _normalize_image_critique,
     _normalize_veo_duration_sequence,
 )
-from app.agent.models import AgentStage, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
+from app.agent.models import AgentStage, DirectorUndoEntry, MediaAsset, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
+from app.agent.models import PipelineRunState, PipelineRunStatus
+from app.video.providers import VideoGenerationReferenceAsset
 
 
 class _FakeVideo:
@@ -52,10 +56,11 @@ class _FakeRawVideoPayload:
 
 
 class _FakeOperation:
-    def __init__(self, response=None):
+    def __init__(self, response=None, error=None):
         self.done = True
         self.name = "operations/fake-veo"
         self.response = response or _FakePayload()
+        self.error = error
 
 
 class _FakeModels:
@@ -65,7 +70,122 @@ class _FakeModels:
 
     def generate_videos(self, **kwargs):
         self.calls.append(kwargs)
-        return _FakeOperation(response=self._response)
+        response = self._response
+        error = None
+        if isinstance(response, list):
+            response = response.pop(0) if response else None
+        elif callable(response):
+            response = response()
+        if isinstance(response, tuple) and len(response) == 2:
+            response, error = response
+        return _FakeOperation(response=response, error=error)
+
+
+def test_previous_review_stage_for_uploaded_track_skips_music_prompt_stage():
+    state = ProjectState(
+        project_id="proj_uploaded_track_prev_stage",
+        name="Uploaded Track Prev Stage",
+        current_stage=AgentStage.PLANNING,
+        music_workflow="uploaded_track",
+        music_url="/projects/song.wav",
+    )
+
+    previous_stage = endpoints_module._previous_review_stage_for_state(state, AgentStage.PLANNING)
+
+    assert previous_stage == AgentStage.INPUT
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [
+        (AgentStage.LYRIA_PROMPTING, AgentStage.INPUT),
+        (AgentStage.PLANNING, AgentStage.LYRIA_PROMPTING),
+        (AgentStage.STORYBOARDING, AgentStage.PLANNING),
+        (AgentStage.FILMING, AgentStage.STORYBOARDING),
+        (AgentStage.PRODUCTION, AgentStage.FILMING),
+        (AgentStage.COMPLETED, AgentStage.PRODUCTION),
+    ],
+)
+def test_previous_review_stage_for_standard_flow(stage, expected):
+    state = ProjectState(
+        project_id="proj_standard_prev_stage",
+        name="Standard Prev Stage",
+        current_stage=stage,
+        music_workflow="lyria3",
+    )
+
+    previous_stage = endpoints_module._previous_review_stage_for_state(state, stage)
+
+    assert previous_stage == expected
+
+
+def test_previous_review_stage_for_halted_filming_state():
+    state = ProjectState(
+        project_id="proj_halted_filming_prev_stage",
+        name="Halted Filming Prev Stage",
+        current_stage=AgentStage.HALTED_FOR_REVIEW,
+        music_workflow="lyria3",
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0,
+                duration=6.0,
+                storyboard_text="Shot 1",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=False,
+            )
+        ],
+    )
+
+    previous_stage = endpoints_module._previous_review_stage_for_state(state, AgentStage.HALTED_FOR_REVIEW)
+
+    assert previous_stage == AgentStage.STORYBOARDING
+
+
+def test_previous_review_stage_for_halted_completed_state():
+    state = ProjectState(
+        project_id="proj_halted_completed_prev_stage",
+        name="Halted Completed Prev Stage",
+        current_stage=AgentStage.HALTED_FOR_REVIEW,
+        music_workflow="uploaded_track",
+        music_url="/projects/song.wav",
+        final_video_url="/projects/final.mp4",
+    )
+
+    previous_stage = endpoints_module._previous_review_stage_for_state(state, AgentStage.HALTED_FOR_REVIEW)
+
+    assert previous_stage == AgentStage.PRODUCTION
+
+
+def test_get_project_run_state_clears_stale_cloud_run(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    state = ProjectState(
+        project_id="proj_stale_storyboard_run",
+        name="Stale Storyboard Run",
+        current_stage=AgentStage.STORYBOARDING,
+        active_run=PipelineRunState(
+            run_id="run-stale",
+            stage=AgentStage.STORYBOARDING,
+            status=PipelineRunStatus.RUNNING,
+            driver="cloud_tasks",
+            started_at="2026-03-12T00:00:00+00:00",
+            updated_at="2026-03-12T00:00:00+00:00",
+        ),
+    )
+    (projects_dir / "proj_stale_storyboard_run.fmv").write_text(state.model_dump_json())
+
+    run_state = endpoints_module._get_project_run_state("proj_stale_storyboard_run")
+    persisted = endpoints_module.get_project("proj_stale_storyboard_run")
+
+    assert run_state is None
+    assert persisted.active_run is None
+    assert persisted.last_error == (
+        "Background storyboarding run timed out while waiting for progress. Please retry the stage."
+    )
 
 
 class _FakeFiles:
@@ -180,9 +300,107 @@ def _patch_storage_roots(monkeypatch, tmp_path):
     return projects_dir
 
 
+async def _read_streaming_response_body(response) -> bytes:
+    body = bytearray()
+    async for chunk in response.body_iterator:
+        body.extend(chunk)
+    return bytes(body)
+
+
 def test_normalize_veo_duration_sequence_matches_allowed_lengths_and_target_total():
     assert _normalize_veo_duration_sequence([5, 5, 5, 5, 6], target_total=26) == [4, 6, 4, 6, 6]
     assert _normalize_veo_duration_sequence([5.2], target_total=None) == [6]
+
+
+def test_build_project_asset_response_streams_full_file_without_ranges(tmp_path):
+    media_path = tmp_path / "sample.mp4"
+    media_path.write_bytes(b"abcdefghij")
+
+    response = media_module.build_project_asset_response(str(media_path), method="GET")
+
+    assert response.status_code == 200
+    assert response.headers["content-length"] == "10"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert asyncio.run(_read_streaming_response_body(response)) == b"abcdefghij"
+
+
+def test_build_project_asset_response_honors_byte_ranges(tmp_path):
+    media_path = tmp_path / "sample.mp4"
+    media_path.write_bytes(b"abcdefghij")
+
+    response = media_module.build_project_asset_response(
+        str(media_path),
+        method="GET",
+        range_header="bytes=2-5",
+    )
+
+    assert response.status_code == 206
+    assert response.headers["content-length"] == "4"
+    assert response.headers["content-range"] == "bytes 2-5/10"
+
+
+def test_is_resource_exhausted_error_matches_common_google_message_shapes():
+    assert _is_resource_exhausted_error(RuntimeError("429 RESOURCE_EXHAUSTED. Try later."))
+    assert _is_resource_exhausted_error(RuntimeError("The resource has been exhausted for this request"))
+    assert not _is_resource_exhausted_error(RuntimeError("Invalid argument"))
+
+
+def test_asset_reference_registry_includes_ai_context():
+    state = ProjectState(
+        project_id="proj",
+        name="Test Project",
+        assets=[
+            MediaAsset(
+                id="asset_1",
+                url="/projects/uploads/proj/mira.png",
+                type="image",
+                name="mira.png",
+                label="Mira",
+                ai_context="A silver-haired lead character with mirrored eyeliner and a chrome jacket.",
+            ),
+            MediaAsset(
+                id="asset_2",
+                url="/projects/uploads/proj/lore.pdf",
+                type="document",
+                name="lore.pdf",
+                label="Lore Bible",
+                text_content="The city floats above a toxic sea.",
+                ai_context="Explains that the floating city runs on stolen tidal energy and bans daylight travel.",
+            ),
+        ],
+    )
+
+    registry = endpoints_module._asset_reference_registry_for_state(state, max_chars=2000)
+    semantic_context = endpoints_module._asset_semantic_context_for_state(state, max_chars=2000)
+
+    assert "AI-understood context" in registry
+    assert "silver-haired lead character" in registry
+    assert "Mira (image):" in semantic_context
+    assert "floating city runs on stolen tidal energy" in semantic_context
+
+
+def test_build_uploaded_asset_response_includes_ai_context(monkeypatch):
+    async def _fake_analyze_uploaded_asset(**kwargs):
+        return "Uptempo synth-pop song with anxious vocals and a dramatic chorus lift."
+
+    monkeypatch.setattr(endpoints_module, "analyze_uploaded_asset", _fake_analyze_uploaded_asset)
+    monkeypatch.setattr(endpoints_module, "build_genai_client", lambda api_key=None: object())
+
+    response_payload = asyncio.run(
+        endpoints_module._build_uploaded_asset_response(
+            filename="song.wav",
+            mime_type="audio/wav",
+            asset_type="audio",
+            url="/projects/uploads/proj/song.wav",
+            content=b"fake",
+            extracted_text=None,
+            api_key="test-key",
+        )
+    )
+
+    assert response_payload["name"] == "song.wav"
+    assert response_payload["asset_type"] == "audio"
+    assert response_payload["ai_context"] == "Uptempo synth-pop song with anxious vocals and a dramatic chorus lift."
 
 
 def test_pipeline_resolves_google_image_and_video_providers_from_model_selection():
@@ -378,7 +596,7 @@ async def test_normalize_storyboard_image_bytes_normalizes_non_16_9_frames(monke
         b"\x00\x00\x00\x00IEND\xaeB`\x82"
     )
 
-    async def fake_normalize_image_canvas(*, input_path, output_path):
+    async def fake_normalize_image_canvas(*, input_path, output_path, target_width, target_height, pad_color):
         Path(output_path).write_bytes(b"normalized-image")
 
     pipeline._normalize_image_canvas = fake_normalize_image_canvas
@@ -390,6 +608,151 @@ async def test_normalize_storyboard_image_bytes_normalizes_non_16_9_frames(monke
 
     assert normalized_bytes == b"normalized-image"
     assert normalized_mime == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_generate_character_reference_asset_uses_portrait_resolution_and_white_background(monkeypatch, tmp_path):
+    _patch_storage_roots(monkeypatch, tmp_path)
+
+    pipeline = FMVAgentPipeline(api_key="dummy", image_size="2K")
+    pipeline.client = SimpleNamespace(models=SimpleNamespace())
+
+    captured = {}
+
+    async def fake_generate_google_image(
+        *,
+        contents,
+        aspect_ratio,
+        image_size,
+        target_width,
+        target_height,
+        pad_color,
+    ):
+        captured["contents"] = contents
+        captured["aspect_ratio"] = aspect_ratio
+        captured["image_size"] = image_size
+        captured["target_width"] = target_width
+        captured["target_height"] = target_height
+        captured["pad_color"] = pad_color
+        return b"portrait-image", "image/png"
+
+    pipeline._generate_google_image = fake_generate_google_image
+    pipeline._sync_local_project_artifact = lambda path, *, relative_path, content_type=None: f"/projects/{relative_path}"
+
+    state = ProjectState(project_id="proj_character_ref", name="Character Ref")
+
+    asset = await pipeline._generate_character_reference_asset(
+        state=state,
+        label="Mira",
+        generation_prompt="An androgynous synth-pop singer with silver hair and mirrored eyeliner.",
+        why="Mira appears across the chorus and bridge.",
+    )
+
+    assert asset.label == "Mira"
+    assert asset.source == "agent"
+    assert asset.purpose == "character_reference"
+    assert asset.url.endswith("proj_character_ref_character_mira.png")
+    assert "canonical portrait reference for Mira" in (asset.ai_context or "")
+    assert captured["aspect_ratio"] == "9:16"
+    assert captured["image_size"] == "2K"
+    assert captured["target_width"] == 1152
+    assert captured["target_height"] == 2048
+    assert captured["pad_color"] == "white"
+    final_prompt = captured["contents"][0]
+    assert "Neutral seamless white studio background" in final_prompt
+    assert "Single centered character portrait reference" in final_prompt
+
+
+@pytest.mark.asyncio
+async def test_ensure_generated_character_assets_skips_user_labeled_assets_and_removes_duplicate_generated_ones(monkeypatch, tmp_path):
+    _patch_storage_roots(monkeypatch, tmp_path)
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(models=SimpleNamespace())
+
+    planned = [
+        {
+            "label": "Mira",
+            "generation_prompt": "Portrait of Mira.",
+            "why": "Lead performer.",
+        },
+        {
+            "label": "Bird",
+            "generation_prompt": "Portrait of the white raven mascot.",
+            "why": "Recurring creature.",
+        },
+    ]
+
+    async def fake_plan_generated_character_assets(state):
+        return planned
+
+    generated_labels = []
+
+    async def fake_generate_character_reference_asset(*, state, label, generation_prompt, why):
+        generated_labels.append(label)
+        return MediaAsset(
+            id=f"asset_auto_{label.lower()}",
+            url=f"/projects/{label.lower()}.png",
+            type="image",
+            name=f"{label}.png",
+            label=label,
+            source="agent",
+            purpose="character_reference",
+        )
+
+    persisted_snapshots = []
+
+    async def fake_persist_state(state):
+        persisted_snapshots.append([asset.label for asset in state.assets])
+
+    pipeline._plan_generated_character_assets = fake_plan_generated_character_assets
+    pipeline._generate_character_reference_asset = fake_generate_character_reference_asset
+    pipeline._persist_state = fake_persist_state
+
+    state = ProjectState(
+        project_id="proj_character_skip",
+        name="Character Skip",
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Mira sings with her white raven companion.",
+            )
+        ],
+        assets=[
+            MediaAsset(
+                id="asset_user_mira",
+                url="/projects/mira_user.png",
+                type="image",
+                name="mira_user.png",
+                label="Mira",
+            ),
+            MediaAsset(
+                id="asset_auto_duplicate",
+                url="/projects/mira_auto.png",
+                type="image",
+                name="mira_auto.png",
+                label="Mira",
+                source="agent",
+                purpose="character_reference",
+            ),
+        ],
+    )
+
+    await pipeline._ensure_generated_character_assets(state)
+
+    assert generated_labels == ["Bird"]
+    assert [asset.label for asset in state.assets] == ["Mira", "Bird"]
+    assert all(
+        not (
+            asset.label == "Mira"
+            and asset.source == "agent"
+            and asset.purpose == "character_reference"
+        )
+        for asset in state.assets
+    )
+    assert persisted_snapshots[-1] == ["Mira", "Bird"]
 
 
 def test_sanitize_video_motion_prompt_text_normalizes_shape_without_rewriting_content():
@@ -466,6 +829,59 @@ async def test_build_video_motion_prompt_uses_orchestrator_rewrite_when_availabl
     assert "Write only the motion" in captured["contents"][0]
 
 
+def test_build_video_reference_assets_uses_storyboard_frame_then_relevant_named_assets(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    frame_path = projects_dir / "proj_clip_0.png"
+    frame_path.write_bytes(b"frame")
+    character_path = projects_dir / "mira.png"
+    character_path.write_bytes(b"mira")
+    background_path = projects_dir / "alley.png"
+    background_path.write_bytes(b"alley")
+
+    pipeline = FMVAgentPipeline(api_key=None)
+    clip = VideoClip(
+        id="clip_0",
+        timeline_start=0.0,
+        duration=6.0,
+        storyboard_text="Mira walks through the neon alley.",
+        image_url="/projects/proj_clip_0.png",
+    )
+
+    asset_lookup = {
+        "asset_mira": MediaAsset(
+            id="asset_mira",
+            url="/projects/mira.png",
+            type="image",
+            name="mira.png",
+            label="Mira",
+        ),
+        "asset_alley": MediaAsset(
+            id="asset_alley",
+            url="/projects/alley.png",
+            type="image",
+            name="alley.png",
+            label="Neon Alley",
+        ),
+    }
+
+    references = pipeline._build_video_reference_assets(
+        clip=clip,
+        relevant_assets=[
+            {"id": "asset_alley", "type": "background"},
+            {"id": "asset_mira", "type": "subject"},
+        ],
+        asset_lookup=asset_lookup,
+    )
+
+    assert [reference.label for reference in references] == [
+        "Storyboard frame",
+        "Mira",
+        "Neon Alley",
+    ]
+    assert [reference.kind for reference in references] == ["subject", "subject", "background"]
+
+
 @pytest.mark.asyncio
 async def test_build_video_retry_prompt_uses_structural_fallback_when_rewriter_is_unavailable():
     pipeline = FMVAgentPipeline(api_key=None)
@@ -531,6 +947,92 @@ def test_cloud_tasks_prefers_explicit_base_url_env_over_request_base_url(monkeyp
     assert request["task"]["http_request"]["url"] == (
         "https://public-backend.example.com/api/internal/projects/proj_async/execute-run"
     )
+
+
+def test_cloud_tasks_normalizes_malformed_base_url_env(monkeypatch):
+    captured = {}
+
+    class _FakeTasksClient:
+        def queue_path(self, project, location, queue):
+            return f"{project}/{location}/{queue}"
+
+        def create_task(self, request):
+            captured["request"] = request
+
+    fake_tasks_module = SimpleNamespace(
+        CloudTasksClient=_FakeTasksClient,
+        HttpMethod=SimpleNamespace(POST="POST"),
+    )
+    monkeypatch.setitem(sys.modules, "google.cloud", SimpleNamespace(tasks_v2=fake_tasks_module))
+    monkeypatch.setitem(sys.modules, "google.cloud.tasks_v2", fake_tasks_module)
+    monkeypatch.setenv("FMV_GCP_PROJECT", "cloud-project")
+    monkeypatch.setenv("FMV_CLOUD_TASKS_LOCATION", "us-central1")
+    monkeypatch.setenv("FMV_CLOUD_TASKS_QUEUE", "fmv-pipeline")
+    monkeypatch.setenv("FMV_BASE_URL", "https://public-backend.example.com)")
+    monkeypatch.delenv("FMV_CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL", raising=False)
+    monkeypatch.delenv("FMV_CLOUD_TASKS_AUDIENCE", raising=False)
+    monkeypatch.delenv("FMV_INTERNAL_TASK_TOKEN", raising=False)
+
+    job_queue_module._create_cloud_task(
+        "proj_async",
+        {"project_id": "proj_async", "run_id": "run_123"},
+        "https://fmv-studio-frontend.example.com/api/projects/proj_async/run-async",
+    )
+
+    request = captured["request"]
+    assert request["task"]["http_request"]["url"] == (
+        "https://public-backend.example.com/api/internal/projects/proj_async/execute-run"
+    )
+
+
+@pytest.mark.asyncio
+async def test_node_planning_generates_character_assets_after_timeline_creation():
+    planning_response = json.dumps(
+        [
+            {
+                "duration": 6,
+                "storyboard_text": "Mira crosses the white soundstage toward camera.",
+            },
+            {
+                "duration": 6,
+                "storyboard_text": "Mira turns and reveals the raven perched on her shoulder.",
+            },
+        ]
+    )
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=planning_response))
+    )
+
+    async def fake_measure_audio_duration_seconds(_music_url):
+        return None
+
+    ensure_calls = []
+
+    async def fake_ensure_generated_character_assets(state):
+        ensure_calls.append(
+            {
+                "stage": state.current_stage,
+                "timeline_count": len(state.timeline),
+            }
+        )
+
+    pipeline._measure_audio_duration_seconds = fake_measure_audio_duration_seconds
+    pipeline._ensure_generated_character_assets = fake_ensure_generated_character_assets
+
+    state = ProjectState(
+        project_id="proj_plan_character_assets",
+        name="Plan Character Assets",
+        screenplay="Mira walks through a stark soundstage while her raven companion watches.",
+        instructions="Clean and futuristic.",
+    )
+
+    result = await pipeline.node_planning(state)
+
+    assert result.current_stage == AgentStage.PLANNING
+    assert len(result.timeline) == 2
+    assert ensure_calls == [{"stage": AgentStage.PLANNING, "timeline_count": 2}]
 
 
 def test_update_project_keeps_production_ready_when_only_deleted_scenes_are_removed(monkeypatch, tmp_path):
@@ -662,6 +1164,430 @@ def test_update_project_rewinds_to_storyboarding_when_remaining_shot_changes(mon
     assert result.stage_summaries == {}
 
 
+def test_update_project_resets_music_track_when_music_start_changes(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    original = ProjectState(
+        project_id="proj_music_start_shift",
+        name="Music Start Shift",
+        current_stage=AgentStage.PRODUCTION,
+        music_url="/projects/proj_music_start_shift_music.wav",
+        music_start_seconds=0.0,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Shot one",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Shot two",
+                image_url="/projects/clip_1.png",
+                image_approved=True,
+                video_url="/projects/clip_1.mp4",
+                video_approved=True,
+            ),
+        ],
+        production_timeline=[
+            ProductionTimelineFragment(
+                id="clip_0_frag_0",
+                source_clip_id="clip_0",
+                timeline_start=0.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="clip_1_frag_0",
+                source_clip_id="clip_1",
+                timeline_start=6.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="music_frag_0",
+                track_type="music",
+                source_clip_id=None,
+                timeline_start=0.0,
+                source_start=0.0,
+                duration=12.0,
+                audio_enabled=True,
+            ),
+        ],
+        final_video_url="/projects/proj_music_start_shift_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+            "production": StageSummary(text="Production", generated_at="2026-03-07T00:03:00+00:00"),
+            "completed": StageSummary(text="Completed", generated_at="2026-03-07T00:04:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_music_start_shift.fmv").write_text(original.model_dump_json())
+
+    updated = original.model_copy(deep=True)
+    updated.music_start_seconds = 4.0
+
+    result = endpoints_module.update_project("proj_music_start_shift", updated)
+
+    assert result.music_start_seconds == 4.0
+    assert [fragment.source_clip_id for fragment in result.production_timeline if (fragment.track_type or "video") != "music"] == [
+        "clip_0",
+        "clip_1",
+    ]
+    music_fragments = [fragment for fragment in result.production_timeline if (fragment.track_type or "video") == "music"]
+    assert len(music_fragments) == 1
+    assert music_fragments[0].timeline_start == 4.0
+    assert music_fragments[0].duration == 8.0
+    assert result.final_video_url is None
+    assert result.stage_summaries == {
+        "planning": original.stage_summaries["planning"],
+        "storyboarding": original.stage_summaries["storyboarding"],
+        "filming": original.stage_summaries["filming"],
+    }
+
+
+def test_update_filming_clip_approval_preserves_other_rerendered_clips(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    original = ProjectState(
+        project_id="proj_preserve_rerenders",
+        name="Preserve Rerenders",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Shot one",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                video_url="/projects/clip_0_rerender.mp4?t=111",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Shot two",
+                image_url="/projects/clip_1.png",
+                image_approved=True,
+                video_url="/projects/clip_1_rerender.mp4?t=222",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_2",
+                timeline_start=12.0,
+                duration=6.0,
+                storyboard_text="Shot three",
+                image_url="/projects/clip_2.png",
+                image_approved=True,
+                video_url="/projects/clip_2_rerender.mp4?t=333",
+                video_approved=False,
+            ),
+        ],
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_preserve_rerenders.fmv").write_text(original.model_dump_json())
+
+    result = endpoints_module.update_filming_clip_approval(
+        "proj_preserve_rerenders",
+        "clip_2",
+        endpoints_module.ClipApprovalRequest(approved=True),
+    )
+
+    assert result.current_stage == AgentStage.FILMING
+    assert [clip.video_approved for clip in result.timeline] == [True, True, True]
+    assert [clip.video_url for clip in result.timeline] == [
+        "/projects/clip_0_rerender.mp4?t=111",
+        "/projects/clip_1_rerender.mp4?t=222",
+        "/projects/clip_2_rerender.mp4?t=333",
+    ]
+    assert result.final_video_url is None
+    assert set(result.stage_summaries.keys()) == {"planning", "storyboarding"}
+
+    persisted = endpoints_module.get_project("proj_preserve_rerenders")
+    assert [clip.video_approved for clip in persisted.timeline] == [True, True, True]
+
+
+def test_update_storyboard_clip_approval_preserves_other_approved_rerenders(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    original = ProjectState(
+        project_id="proj_preserve_storyboard_rerenders",
+        name="Preserve Storyboard Rerenders",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Shot one",
+                image_url="/projects/clip_0_rerender.png?t=111",
+                image_approved=True,
+                image_reference_ready=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Shot two",
+                image_url="/projects/clip_1_rerender.png?t=222",
+                image_approved=True,
+                image_reference_ready=True,
+            ),
+            VideoClip(
+                id="clip_2",
+                timeline_start=12.0,
+                duration=6.0,
+                storyboard_text="Shot three",
+                image_url="/projects/clip_2_rerender.png?t=333",
+                image_approved=False,
+                image_reference_ready=False,
+            ),
+        ],
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_preserve_storyboard_rerenders.fmv").write_text(original.model_dump_json())
+
+    result = endpoints_module.update_storyboard_clip_approval(
+        "proj_preserve_storyboard_rerenders",
+        "clip_2",
+        endpoints_module.ClipApprovalRequest(approved=True),
+    )
+
+    assert result.current_stage == AgentStage.STORYBOARDING
+    assert [clip.image_approved for clip in result.timeline] == [True, True, True]
+    assert [clip.image_url for clip in result.timeline] == [
+        "/projects/clip_0_rerender.png?t=111",
+        "/projects/clip_1_rerender.png?t=222",
+        "/projects/clip_2_rerender.png?t=333",
+    ]
+    assert [clip.image_reference_ready for clip in result.timeline] == [True, True, True]
+    assert set(result.stage_summaries.keys()) == {"planning"}
+
+
+def test_update_project_keeps_rewound_planning_stage_when_outputs_could_otherwise_auto_advance(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    original = ProjectState(
+        project_id="proj_rewound_planning_sticks",
+        name="Rewound Planning Sticks",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+                image_url="/projects/clip_0_manual.png",
+                image_prompt="manual frame",
+                image_critiques=["Manual override"],
+                image_approved=True,
+                image_score=9,
+                image_reference_ready=True,
+                image_manual_override=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            )
+        ],
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+            "production": StageSummary(text="Production", generated_at="2026-03-07T00:03:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_rewound_planning_sticks.fmv").write_text(original.model_dump_json())
+
+    edited = original.model_copy(deep=True)
+    edited.timeline[0].duration = 8.0
+
+    result = endpoints_module.update_project("proj_rewound_planning_sticks", edited)
+
+    assert result.current_stage == AgentStage.PLANNING
+    assert result.timeline[0].image_url == "/projects/clip_0_manual.png"
+    assert result.timeline[0].image_manual_override is True
+    assert result.timeline[0].video_url is None
+    assert result.timeline[0].video_approved is False
+    assert result.stage_summaries == {}
+
+
+@pytest.mark.asyncio
+async def test_endpoint_review_flow_requires_explicit_forward_actions_and_preserves_rerenders(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    class _FakePipeline:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run_pipeline(self, state):
+            next_state = state.model_copy(deep=True)
+
+            if next_state.current_stage == AgentStage.PLANNING:
+                for index, clip in enumerate(next_state.timeline):
+                    clip.image_url = f"/projects/{next_state.project_id}_{clip.id}.png"
+                    clip.image_prompt = f"Storyboard prompt {index}"
+                    clip.image_approved = index == 0
+                    clip.image_reference_ready = index == 0
+                next_state.current_stage = AgentStage.STORYBOARDING
+                return next_state
+
+            if next_state.current_stage == AgentStage.STORYBOARDING:
+                assert all(clip.image_approved and clip.image_url for clip in next_state.timeline)
+                for index, clip in enumerate(next_state.timeline):
+                    clip.video_url = f"/projects/{next_state.project_id}_{clip.id}_v1.mp4"
+                    clip.video_prompt = f"Video prompt {index}"
+                    clip.video_approved = index == 0
+                next_state.current_stage = AgentStage.FILMING
+                return next_state
+
+            if next_state.current_stage == AgentStage.FILMING:
+                if all(clip.video_approved and clip.video_url for clip in next_state.timeline):
+                    next_state.production_timeline = [
+                        ProductionTimelineFragment(
+                            id=f"{clip.id}_frag_0",
+                            source_clip_id=clip.id,
+                            timeline_start=clip.timeline_start,
+                            source_start=0.0,
+                            duration=clip.duration,
+                            audio_enabled=True,
+                        )
+                        for clip in next_state.timeline
+                    ]
+                    next_state.current_stage = AgentStage.PRODUCTION
+                    return next_state
+
+                for clip in next_state.timeline:
+                    if clip.video_approved:
+                        continue
+                    clip.video_url = f"/projects/{next_state.project_id}_{clip.id}_rerender.mp4"
+                    clip.video_prompt = f"Rerendered {clip.id}"
+                next_state.current_stage = AgentStage.FILMING
+                return next_state
+
+            if next_state.current_stage == AgentStage.PRODUCTION:
+                next_state.final_video_url = f"/projects/{next_state.project_id}_final_v2.mp4"
+                next_state.current_stage = AgentStage.COMPLETED
+                return next_state
+
+            return next_state
+
+    monkeypatch.setattr(endpoints_module, "FMVAgentPipeline", _FakePipeline)
+
+    initial_state = ProjectState(
+        project_id="proj_comprehensive_review_flow",
+        name="Comprehensive Review Flow",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+            ),
+        ],
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_comprehensive_review_flow.fmv").write_text(initial_state.model_dump_json())
+
+    storyboard_state = await endpoints_module.run_pipeline_step("proj_comprehensive_review_flow")
+    assert storyboard_state.current_stage == AgentStage.STORYBOARDING
+    assert [clip.image_approved for clip in storyboard_state.timeline] == [True, False]
+
+    storyboard_review_state = endpoints_module.update_storyboard_clip_approval(
+        "proj_comprehensive_review_flow",
+        "clip_1",
+        endpoints_module.ClipApprovalRequest(approved=True),
+    )
+    assert storyboard_review_state.current_stage == AgentStage.STORYBOARDING
+    assert all(clip.image_approved for clip in storyboard_review_state.timeline)
+
+    filming_state = await endpoints_module.run_pipeline_step("proj_comprehensive_review_flow")
+    assert filming_state.current_stage == AgentStage.FILMING
+    assert [clip.video_approved for clip in filming_state.timeline] == [True, False]
+
+    filming_review_state = endpoints_module.update_filming_clip_approval(
+        "proj_comprehensive_review_flow",
+        "clip_1",
+        endpoints_module.ClipApprovalRequest(approved=True),
+    )
+    assert filming_review_state.current_stage == AgentStage.FILMING
+    original_clip_video_urls = [clip.video_url for clip in filming_review_state.timeline]
+
+    production_state = await endpoints_module.run_pipeline_step("proj_comprehensive_review_flow")
+    assert production_state.current_stage == AgentStage.PRODUCTION
+    assert [fragment.source_clip_id for fragment in production_state.production_timeline] == ["clip_0", "clip_1"]
+
+    completed_state = await endpoints_module.run_pipeline_step("proj_comprehensive_review_flow")
+    assert completed_state.current_stage == AgentStage.COMPLETED
+    assert completed_state.final_video_url == "/projects/proj_comprehensive_review_flow_final_v2.mp4"
+
+    rewound_to_production = endpoints_module.revert_pipeline(
+        "proj_comprehensive_review_flow",
+        endpoints_module.RevertRequest(target_stage="production"),
+    )
+    assert rewound_to_production.current_stage == AgentStage.PRODUCTION
+    assert rewound_to_production.final_video_url is None
+
+    rewound_to_filming = endpoints_module.revert_pipeline(
+        "proj_comprehensive_review_flow",
+        endpoints_module.RevertRequest(target_stage="filming"),
+    )
+    assert rewound_to_filming.current_stage == AgentStage.FILMING
+    assert [clip.video_url for clip in rewound_to_filming.timeline] == original_clip_video_urls
+
+    rejected_for_refilm = endpoints_module.update_filming_clip_approval(
+        "proj_comprehensive_review_flow",
+        "clip_0",
+        endpoints_module.ClipApprovalRequest(approved=False),
+    )
+    assert rejected_for_refilm.current_stage == AgentStage.FILMING
+    assert rejected_for_refilm.timeline[0].video_approved is False
+    assert rejected_for_refilm.timeline[1].video_url == original_clip_video_urls[1]
+
+    rerendered_filming_state = await endpoints_module.run_pipeline_step("proj_comprehensive_review_flow")
+    assert rerendered_filming_state.current_stage == AgentStage.FILMING
+    assert rerendered_filming_state.timeline[0].video_url == "/projects/proj_comprehensive_review_flow_clip_0_rerender.mp4"
+    assert rerendered_filming_state.timeline[1].video_url == original_clip_video_urls[1]
+
+    reapproved_filming_state = endpoints_module.update_filming_clip_approval(
+        "proj_comprehensive_review_flow",
+        "clip_0",
+        endpoints_module.ClipApprovalRequest(approved=True),
+    )
+    assert reapproved_filming_state.current_stage == AgentStage.FILMING
+    assert [clip.video_approved for clip in reapproved_filming_state.timeline] == [True, True]
+    assert reapproved_filming_state.timeline[1].video_url == original_clip_video_urls[1]
+
+    back_to_production = await endpoints_module.run_pipeline_step("proj_comprehensive_review_flow")
+    assert back_to_production.current_stage == AgentStage.PRODUCTION
+    assert [fragment.source_clip_id for fragment in back_to_production.production_timeline] == ["clip_0", "clip_1"]
+
+
 @pytest.mark.asyncio
 async def test_live_director_planning_update_clears_only_changed_shot_outputs():
     action = {
@@ -776,6 +1702,8 @@ async def test_live_director_planning_update_clears_only_changed_shot_outputs():
     assert updated_state.director_log[0].source == "voice"
     assert updated_state.director_log[1].role == "agent"
     assert updated_state.director_log[1].applied_changes == action["change_summary"]
+    assert len(updated_state.director_undo_stack) == 1
+    assert updated_state.director_undo_stack[0].snapshot["timeline"][0]["storyboard_text"] == "Original opening shot"
 
 
 @pytest.mark.asyncio
@@ -876,6 +1804,383 @@ async def test_live_director_can_update_multiple_numbered_shots_in_one_turn():
     assert updated_state.final_video_url is None
     assert updated_state.production_timeline == []
     assert set(updated_state.stage_summaries.keys()) == {"planning"}
+    assert updated_state.director_log[-1].applied_changes == action["change_summary"]
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_rename_selected_asset():
+    action = {
+        "reply_text": "I renamed that reference to Mira Solis.",
+        "change_summary": ["Renamed the selected reference asset."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [
+            {
+                "operation_type": "update_label",
+                "target_asset_id": None,
+                "label": "Mira Solis",
+            }
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_asset_rename",
+        name="Live Director Asset Rename",
+        current_stage=AgentStage.INPUT,
+        assets=[
+            MediaAsset(
+                id="asset_hero",
+                url="/projects/mira.png",
+                type="image",
+                name="mira.png",
+                label="Lead Singer",
+                ai_context="Portrait reference for the lead singer.",
+            )
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Rename this asset to Mira Solis.",
+        display_stage=AgentStage.INPUT,
+        selected_asset_id="asset_hero",
+    )
+
+    assert updated_state.assets[0].label == "Mira Solis"
+    assert result["target_asset_id"] == "asset_hero"
+    assert updated_state.current_stage == AgentStage.INPUT
+    assert updated_state.director_log[-1].applied_changes == action["change_summary"]
+    assert len(updated_state.director_undo_stack) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_delete_audio_asset_and_clear_music_outputs():
+    action = {
+        "reply_text": "I removed the uploaded song reference.",
+        "change_summary": ["Deleted the selected audio asset."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [
+            {
+                "operation_type": "delete",
+                "target_asset_id": "asset_song",
+                "label": None,
+            }
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_asset_delete",
+        name="Live Director Asset Delete",
+        current_stage=AgentStage.COMPLETED,
+        music_url="/projects/song.wav",
+        music_workflow="uploaded_track",
+        final_video_url="/projects/final.mp4",
+        assets=[
+            MediaAsset(
+                id="asset_song",
+                url="/projects/song.wav",
+                type="audio",
+                name="song.wav",
+                label="Demo Song",
+            ),
+            MediaAsset(
+                id="asset_ref",
+                url="/projects/mira.png",
+                type="image",
+                name="mira.png",
+                label="Mira",
+            ),
+        ],
+        production_timeline=[
+            ProductionTimelineFragment(
+                id="video_frag_0",
+                track_type="video",
+                source_clip_id="clip_0",
+                timeline_start=0.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="music_frag_0",
+                track_type="music",
+                source_clip_id=None,
+                timeline_start=0.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Delete the uploaded song asset.",
+        display_stage=AgentStage.INPUT,
+        selected_asset_id="asset_song",
+    )
+
+    assert [asset.id for asset in updated_state.assets] == ["asset_ref"]
+    assert updated_state.music_url is None
+    assert updated_state.music_workflow == "lyria3"
+    assert updated_state.final_video_url is None
+    assert all((fragment.track_type or "video") != "music" for fragment in updated_state.production_timeline)
+    assert result["target_asset_id"] is None
+    assert updated_state.director_log[-1].applied_changes == action["change_summary"]
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_regenerate_selected_image_asset_and_clear_affected_shots():
+    action = {
+        "director_operation": "none",
+        "reply_text": "I updated the character reference to reflect the new look.",
+        "change_summary": ["Updated the selected character reference."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [
+            {
+                "operation_type": "regenerate_image",
+                "target_asset_id": None,
+                "label": None,
+                "generation_instruction": "Update Mira to have a short silver bob and a crimson sequined jacket while preserving her identity.",
+            }
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "navigation_action": "stay",
+        "target_stage": None,
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    async def fake_regenerate_asset(state, *, asset_id, generation_instruction):
+        assert asset_id == "asset_hero"
+        assert "silver bob" in generation_instruction
+        asset = next(asset for asset in state.assets if asset.id == asset_id)
+        asset.url = "/projects/mira_refined.png"
+        asset.ai_context = "Updated character reference for Mira with silver hair and crimson wardrobe."
+        return asset
+
+    async def fake_affected_clips(state, *, asset):
+        assert asset.id == "asset_hero"
+        return {"clip_0"}
+
+    pipeline._regenerate_director_image_asset = fake_regenerate_asset
+    pipeline._resolve_director_asset_affected_clip_ids = fake_affected_clips
+
+    state = ProjectState(
+        project_id="proj_live_director_asset_regenerate",
+        name="Live Director Asset Regenerate",
+        current_stage=AgentStage.COMPLETED,
+        assets=[
+            MediaAsset(
+                id="asset_hero",
+                url="/projects/mira.png",
+                type="image",
+                name="mira.png",
+                label="Mira",
+                ai_context="Portrait reference for Mira.",
+                purpose="character_reference",
+            )
+        ],
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Mira sings under neon lights in a rain-slick alley.",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                image_score=9,
+                image_reference_ready=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            )
+        ],
+        final_video_url="/projects/final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+            "completed": StageSummary(text="Completed", generated_at="2026-03-07T00:03:00+00:00"),
+        },
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Change this character so she has a short silver bob and a crimson sequined jacket.",
+        display_stage=AgentStage.STORYBOARDING,
+        selected_asset_id="asset_hero",
+        speech_mode="realtime",
+    )
+
+    assert updated_state.assets[0].url == "/projects/mira_refined.png"
+    assert updated_state.timeline[0].storyboard_text == state.timeline[0].storyboard_text
+    assert updated_state.timeline[0].image_url is None
+    assert updated_state.timeline[0].video_url is None
+    assert updated_state.final_video_url is None
+    assert updated_state.current_stage == AgentStage.STORYBOARDING
+    assert set(updated_state.stage_summaries.keys()) == {"planning"}
+
+
+@pytest.mark.asyncio
+async def test_live_director_asset_regeneration_keeps_planning_stage_when_reviewing_planning():
+    action = {
+        "director_operation": "none",
+        "reply_text": "I updated the character reference and kept the planning stage in focus.",
+        "change_summary": ["Updated the selected character reference."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [
+            {
+                "operation_type": "regenerate_image",
+                "target_asset_id": "asset_hero",
+                "label": None,
+                "generation_instruction": "Update Mira to wear a structured white coat while preserving her identity.",
+            }
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "navigation_action": "stay",
+        "target_stage": None,
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    async def fake_regenerate_asset(state, *, asset_id, generation_instruction):
+        assert asset_id == "asset_hero"
+        assert "white coat" in generation_instruction
+        asset = next(asset for asset in state.assets if asset.id == asset_id)
+        asset.url = "/projects/mira_white_coat.png"
+        asset.ai_context = "Updated character reference for Mira in a structured white coat."
+        return asset
+
+    async def fake_affected_clips(state, *, asset):
+        assert asset.id == "asset_hero"
+        return {"clip_0"}
+
+    pipeline._regenerate_director_image_asset = fake_regenerate_asset
+    pipeline._resolve_director_asset_affected_clip_ids = fake_affected_clips
+
+    state = ProjectState(
+        project_id="proj_live_director_asset_regenerate_planning",
+        name="Live Director Asset Regenerate Planning",
+        current_stage=AgentStage.COMPLETED,
+        assets=[
+            MediaAsset(
+                id="asset_hero",
+                url="/projects/mira.png",
+                type="image",
+                name="mira.png",
+                label="Mira",
+                ai_context="Portrait reference for Mira.",
+                purpose="character_reference",
+            )
+        ],
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Mira walks across a polished white soundstage.",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                image_score=9,
+                image_reference_ready=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            )
+        ],
+        final_video_url="/projects/final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+            "completed": StageSummary(text="Completed", generated_at="2026-03-07T00:03:00+00:00"),
+        },
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Change this character so she wears a structured white coat.",
+        display_stage=AgentStage.PLANNING,
+        selected_asset_id="asset_hero",
+        speech_mode="realtime",
+    )
+
+    assert updated_state.assets[0].url == "/projects/mira_white_coat.png"
+    assert updated_state.timeline[0].image_url is None
+    assert updated_state.timeline[0].video_url is None
+    assert updated_state.final_video_url is None
+    assert updated_state.current_stage == AgentStage.PLANNING
+    assert result["stage"] == AgentStage.PLANNING.value
+    assert set(updated_state.stage_summaries.keys()) == {"planning"}
+    assert result["target_asset_id"] == "asset_hero"
     assert updated_state.director_log[-1].applied_changes == action["change_summary"]
 
 
@@ -1105,6 +2410,214 @@ async def test_live_director_returns_advance_navigation_intent_without_mutating_
     assert result["navigation_action"] == "advance"
     assert result["target_stage"] is None
     assert updated_state.director_log[-1].text == action["reply_text"]
+
+
+@pytest.mark.asyncio
+async def test_live_director_does_not_infer_navigation_when_model_omits_it():
+    action = {
+        "director_operation": "none",
+        "reply_text": "Proceeding to the next stage.",
+        "change_summary": ["Proceeding to the next stage."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_infer_advance",
+        name="Live Director Infer Advance",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            )
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Move to the next stage.",
+        display_stage=AgentStage.PLANNING,
+    )
+
+    assert updated_state.current_stage == AgentStage.PLANNING
+    assert result["navigation_action"] == "stay"
+    assert result["target_stage"] is None
+
+
+@pytest.mark.asyncio
+async def test_live_director_undo_restores_previous_state_from_dissatisfaction_feedback():
+    action = {
+        "director_operation": "undo_last_change",
+        "reply_text": "Reverting to the previous version.",
+        "change_summary": ["Reverting the last Live Director change."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "navigation_action": "stay",
+        "target_stage": None,
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(
+            generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action))
+        )
+    )
+
+    previous_state = ProjectState(
+        project_id="proj_live_director_undo",
+        name="Live Director Undo",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Original opening shot with the singer silhouetted against a neon marquee.",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                image_score=9,
+                image_reference_ready=True,
+            )
+        ],
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+        },
+    )
+
+    state = previous_state.model_copy(deep=True)
+    state.timeline[0].storyboard_text = "A flat close shot that lost the original mood."
+    state.timeline[0].image_url = None
+    state.timeline[0].image_approved = False
+    state.stage_summaries = {
+        "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+    }
+    state.director_undo_stack = [
+        DirectorUndoEntry(
+            id="director_undo_1",
+            message="Make shot 1 flatter.",
+            stage=AgentStage.STORYBOARDING.value,
+            created_at="2026-03-07T00:05:00+00:00",
+            change_summary=["Updated shot 1 and cleared its frame/video outputs."],
+            snapshot=previous_state.model_dump(exclude={"director_log", "director_undo_stack"}),
+        )
+    ]
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Can we go back to the version from before that change? It missed the intent.",
+        display_stage=AgentStage.STORYBOARDING,
+        source="voice",
+        speech_mode="realtime",
+    )
+
+    assert updated_state.current_stage == AgentStage.STORYBOARDING
+    assert updated_state.timeline[0].storyboard_text == previous_state.timeline[0].storyboard_text
+    assert updated_state.timeline[0].image_url == previous_state.timeline[0].image_url
+    assert updated_state.stage_summaries == previous_state.stage_summaries
+    assert updated_state.director_undo_stack == []
+    assert result["navigation_action"] == "stay"
+    assert result["applied_changes"][0] == "Reverted the last Live Director change."
+    assert updated_state.director_log[-2].role == "user"
+    assert updated_state.director_log[-2].text == "Can we go back to the version from before that change? It missed the intent."
+    assert updated_state.director_log[-1].role == "agent"
+    assert "Reverted the last Live Director change" in updated_state.director_log[-1].text
+
+
+@pytest.mark.asyncio
+async def test_live_director_undo_reports_when_nothing_is_available_to_revert():
+    action = {
+        "director_operation": "undo_last_change",
+        "reply_text": "I will revert the last change.",
+        "change_summary": [],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "navigation_action": "stay",
+        "target_stage": None,
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(
+            generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action))
+        )
+    )
+
+    state = ProjectState(
+        project_id="proj_live_director_empty_undo",
+        name="Live Director Empty Undo",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            )
+        ],
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Can you revert the last Live Director change?",
+        display_stage=AgentStage.PLANNING,
+        speech_mode="realtime",
+    )
+
+    assert updated_state.current_stage == AgentStage.PLANNING
+    assert updated_state.timeline[0].storyboard_text == "Opening shot"
+    assert updated_state.director_undo_stack == []
+    assert result["applied_changes"] == []
+    assert updated_state.director_log[-1].text == "There isn't a previous Live Director change to undo."
 
 
 @pytest.mark.asyncio
@@ -1825,6 +3338,7 @@ async def test_node_filming_downloads_generated_video_from_sdk_file_handle(monke
     result = await pipeline.node_filming(state)
 
     assert result.current_stage == AgentStage.FILMING
+    assert result.timeline[0].video_approved is True
     assert result.timeline[0].video_url is not None
     assert "w3schools" not in result.timeline[0].video_url
 
@@ -1838,6 +3352,7 @@ async def test_node_filming_downloads_generated_video_from_sdk_file_handle(monke
     assert request["config"].duration_seconds == 6
     assert request["config"].aspect_ratio == "16:9"
     assert request["config"].resolution == "1080p"
+    assert request["config"].generate_audio is True
     assert request["source"].image is not None
     assert request["source"].prompt.startswith("A lighthouse in fog at dusk.")
     assert "Do not generate music" in request["source"].prompt
@@ -1885,6 +3400,220 @@ async def test_generate_google_video_clip_supports_4k_resolution(monkeypatch, tm
     assert pipeline.video_width == 3840
     assert pipeline.video_height == 2160
     assert request["config"].resolution == "4k"
+    assert request["config"].generate_audio is True
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_uses_ingredients_mode_with_selected_stable_model(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"storyboard-image")
+    character_path = tmp_path / "mira.png"
+    character_path.write_bytes(b"mira-image")
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
+    pipeline.client = _FakeClient(video_bytes=b"untrimmed-video-bytes")
+
+    video_bytes = await pipeline._generate_google_video_clip(
+        prompt="Animate the singer stepping forward as the city lights shimmer.",
+        duration_seconds=8,
+        image_path=str(storyboard_path),
+        reference_assets=[
+            VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
+            VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
+        ],
+    )
+
+    assert video_bytes == b"untrimmed-video-bytes"
+    assert len(pipeline.client.models.calls) == 1
+    request = pipeline.client.models.calls[0]
+    assert request["model"] == "veo-3.1-fast-generate-001"
+    assert request["config"].duration_seconds == 8
+    assert request["config"].generate_audio is True
+    assert len(request["config"].reference_images) == 2
+    assert request["source"].image is None
+    assert len(pipeline.client.files.download_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_falls_back_to_frame_mode_when_ingredients_return_no_videos(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"storyboard-image")
+    character_path = tmp_path / "mira.png"
+    character_path.write_bytes(b"mira-image")
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
+    pipeline.client = _FakeClient(
+        video_bytes=b"frame-video-bytes",
+        response=[_FakeEmptyPayload(), _FakePayload()],
+    )
+
+    video_bytes = await pipeline._generate_google_video_clip(
+        prompt="Animate the singer stepping forward as the city lights shimmer.",
+        duration_seconds=6,
+        image_path=str(storyboard_path),
+        reference_assets=[
+            VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
+            VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
+        ],
+    )
+
+    assert video_bytes == b"frame-video-bytes"
+    assert len(pipeline.client.models.calls) == 2
+    first_request = pipeline.client.models.calls[0]
+    second_request = pipeline.client.models.calls[1]
+    assert first_request["config"].duration_seconds == 8
+    assert len(first_request["config"].reference_images) == 2
+    assert first_request["source"].image is None
+    assert second_request["config"].duration_seconds == 6
+    assert getattr(second_request["config"], "reference_images", None) is None
+    assert second_request["source"].image is not None
+    assert len(pipeline.client.files.download_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_trims_ingredients_result_back_to_requested_duration(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"storyboard-image")
+    character_path = tmp_path / "mira.png"
+    character_path.write_bytes(b"mira-image")
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
+    pipeline.client = _FakeClient(video_bytes=b"untrimmed-video-bytes")
+
+    async def fake_normalize_video_canvas(*, input_path, output_path, include_audio, duration, **kwargs):
+        assert include_audio is True
+        assert duration == 6.0
+        Path(output_path).write_bytes(b"trimmed-video-bytes")
+
+    pipeline._normalize_video_canvas = fake_normalize_video_canvas
+
+    video_bytes = await pipeline._generate_google_video_clip(
+        prompt="Animate the singer stepping forward as the city lights shimmer.",
+        duration_seconds=6,
+        image_path=str(storyboard_path),
+        reference_assets=[
+            VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
+            VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
+        ],
+    )
+
+    assert video_bytes == b"trimmed-video-bytes"
+    request = pipeline.client.models.calls[0]
+    assert request["config"].duration_seconds == 8
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_surfaces_operation_error_message(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"storyboard-image")
+    character_path = tmp_path / "mira.png"
+    character_path.write_bytes(b"mira-image")
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
+    pipeline.client = _FakeClient(
+        video_bytes=b"",
+        response=[(None, {"code": 3, "message": "Unsupported output video duration 6 seconds, supported durations are [8] for feature reference_to_video."})],
+    )
+
+    with pytest.raises(RuntimeError, match="Unsupported output video duration 6 seconds"):
+        await pipeline._generate_google_video_clip(
+            prompt="Animate the singer stepping forward as the city lights shimmer.",
+            duration_seconds=6,
+            image_path=str(storyboard_path),
+            reference_assets=[
+                VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
+                VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
+            ],
+        )
+
+
+def test_reconcile_production_timeline_syncs_whole_clip_fragment_durations_to_latest_storyboard_timing():
+    pipeline = FMVAgentPipeline(api_key=None)
+
+    state = ProjectState(
+        project_id="proj_production_sync",
+        name="Production Sync",
+        current_stage=AgentStage.PRODUCTION,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=8.0,
+                storyboard_text="Opening shot",
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=8.0,
+                duration=4.0,
+                storyboard_text="Follow shot",
+                video_url="/projects/clip_1.mp4",
+                video_approved=True,
+            ),
+        ],
+        production_timeline=[
+            ProductionTimelineFragment(
+                id="clip_1_frag_0",
+                source_clip_id="clip_1",
+                timeline_start=0.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="clip_0_frag_0",
+                source_clip_id="clip_0",
+                timeline_start=6.0,
+                source_start=0.0,
+                duration=4.0,
+                audio_enabled=True,
+            ),
+        ],
+    )
+
+    pipeline._reconcile_production_timeline(state)
+
+    assert [fragment.source_clip_id for fragment in state.production_timeline] == ["clip_1", "clip_0"]
+    assert [fragment.duration for fragment in state.production_timeline] == [4.0, 8.0]
+    assert [fragment.timeline_start for fragment in state.production_timeline] == [0.0, 4.0]
+
+
+def test_initialize_production_timeline_uses_music_start_offset():
+    pipeline = FMVAgentPipeline(api_key=None)
+
+    state = ProjectState(
+        project_id="proj_music_offset",
+        name="Music Offset",
+        current_stage=AgentStage.PRODUCTION,
+        music_url="/projects/proj_music_offset_music.wav",
+        music_start_seconds=4.0,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+            ),
+        ],
+    )
+
+    pipeline._initialize_production_timeline(state)
+
+    music_fragments = [fragment for fragment in state.production_timeline if (fragment.track_type or "video") == "music"]
+    assert len(music_fragments) == 1
+    assert music_fragments[0].timeline_start == 4.0
+    assert music_fragments[0].duration == 8.0
 
 
 @pytest.mark.asyncio
@@ -1900,7 +3629,7 @@ async def test_node_filming_retries_with_adjusted_prompt_after_first_generation_
 
     prompts = []
 
-    async def fake_generate_video_clip(*, prompt, duration_seconds, image_path):
+    async def fake_generate_video_clip(*, prompt, duration_seconds, image_path, reference_assets=None):
         prompts.append(prompt)
         if len(prompts) == 1:
             raise RuntimeError("Google Veo returned no videos")
@@ -2354,6 +4083,34 @@ async def test_update_stage_summary_persists_filming_brief_text(monkeypatch, tmp
     assert summary.audio_url is None
 
 
+def test_build_stage_summary_text_uses_whole_seconds_for_speech():
+    pipeline = FMVAgentPipeline(api_key=None)
+    state = ProjectState(
+        project_id="proj_summary_rounding",
+        name="Summary Rounding Test",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=4.0,
+                storyboard_text="Opening shot",
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=4.0,
+                duration=4.0,
+                storyboard_text="Middle shot",
+            ),
+        ],
+    )
+
+    summary_text = pipeline._build_stage_summary_text(state, AgentStage.PLANNING)
+
+    assert "8 seconds" in summary_text
+    assert "8.0 seconds" not in summary_text
+
+
 @pytest.mark.asyncio
 async def test_update_stage_summary_writes_tts_audio_file(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -2469,6 +4226,93 @@ async def test_run_pipeline_does_not_refresh_existing_stage_summary_when_stage_d
     result = await pipeline.run_pipeline(state)
 
     assert result.current_stage == AgentStage.PRODUCTION
+    assert refreshed["called"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_retries_once_after_resource_exhausted_storyboarding_failure():
+    pipeline = FMVAgentPipeline(api_key=None)
+
+    attempts = {"count": 0}
+    refreshed_stages: list[AgentStage] = []
+
+    async def fake_node_storyboarding(state):
+        attempts["count"] += 1
+        state.current_stage = AgentStage.STORYBOARDING
+        if attempts["count"] == 1:
+            raise RuntimeError("429 RESOURCE_EXHAUSTED. Try later.")
+        return state
+
+    async def fake_update_stage_summary(state, stage):
+        refreshed_stages.append(stage)
+
+    async def fake_sleep(_seconds):
+        return None
+
+    pipeline.node_storyboarding = fake_node_storyboarding
+    pipeline._update_stage_summary = fake_update_stage_summary
+    pipeline._sleep_with_cancellation_checks = fake_sleep
+
+    state = ProjectState(
+        project_id="proj_retry_storyboard",
+        name="Retry Storyboard",
+        current_stage=AgentStage.PLANNING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=4.0,
+                storyboard_text="Retry shot",
+            )
+        ],
+    )
+
+    result = await pipeline.run_pipeline(state)
+
+    assert attempts["count"] == 2
+    assert result.current_stage == AgentStage.STORYBOARDING
+    assert result.last_error is None
+    assert refreshed_stages == [AgentStage.STORYBOARDING]
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_clears_completed_summary_when_production_fails():
+    pipeline = FMVAgentPipeline(api_key=None)
+    refreshed = {"called": False}
+
+    async def fake_update_stage_summary(state, stage):
+        refreshed["called"] = True
+
+    async def fake_node_production(state):
+        state.current_stage = AgentStage.PRODUCTION
+        state.last_error = "ffmpeg failed while building the production sequence"
+        state.final_video_url = None
+        return state
+
+    pipeline._update_stage_summary = fake_update_stage_summary
+    pipeline.node_production = fake_node_production
+
+    state = ProjectState(
+        project_id="proj_failed_render_summary",
+        name="Failed Render Summary",
+        current_stage=AgentStage.PRODUCTION,
+        final_video_url="/projects/previous_final.mp4",
+        stage_summaries={
+            "production": StageSummary(
+                text="Production is ready.",
+                generated_at="2026-03-07T00:00:00+00:00",
+            ),
+            "completed": StageSummary(
+                text="The final render is ready.",
+                generated_at="2026-03-07T00:10:00+00:00",
+            ),
+        },
+    )
+
+    result = await pipeline.run_pipeline(state)
+
+    assert result.current_stage == AgentStage.PRODUCTION
+    assert "completed" not in result.stage_summaries
     assert refreshed["called"] is False
 
 
@@ -2782,6 +4626,7 @@ async def test_node_filming_formats_unavailable_video_review_without_fake_score(
 
     result = await pipeline.node_filming(state)
 
+    assert result.timeline[0].video_approved is True
     assert result.timeline[0].video_score is None
     assert result.timeline[0].video_critiques[-1] == "Automated video review unavailable: upstream timeout"
 
@@ -3093,6 +4938,283 @@ async def test_run_pipeline_step_async_transitions_project_to_storyboarding_imme
     assert final_status.is_running is False
     assert final_state.timeline[0].image_url == "/projects/proj_async_storyboard_clip_0.png"
     assert final_state.active_run is None
+
+
+@pytest.mark.asyncio
+async def test_regenerate_storyboard_clip_endpoint_rerenders_target_clip_immediately(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    class _FakePipeline:
+        def __init__(self, *args, **kwargs):
+            self.persist_state_callback = kwargs.get("persist_state_callback")
+
+        async def _persist_state(self, state):
+            if self.persist_state_callback:
+                result = self.persist_state_callback(state)
+                if asyncio.iscoroutine(result):
+                    await result
+
+        async def _ensure_generated_character_assets(self, state):
+            return None
+
+        def _build_storyboard_asset_context(self, state):
+            return [], {}, {}
+
+        async def _build_storyboard_relevance_map(self, clips, *, image_assets, screenplay=None):
+            return {}
+
+        async def _select_relevant_previous_shots(self, clip, previous_clips):
+            return []
+
+        async def _process_storyboard_clip(self, *, state, clip, relevant_assets, previous_shots, asset_bytes, asset_lookup):
+            clip.image_prompt = "Regenerated storyboard prompt"
+            clip.image_url = f"/projects/{state.project_id}_{clip.id}.png"
+            clip.image_score = 9
+            clip.image_reference_ready = True
+            clip.image_approved = True
+            clip.image_critiques = ["[Attempt 1] Score: 9/10 — Strong regenerated frame."]
+
+    monkeypatch.setattr(endpoints_module, "FMVAgentPipeline", _FakePipeline)
+
+    state = ProjectState(
+        project_id="proj_storyboard_regen",
+        name="Storyboard Regen",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+                image_url="/projects/proj_storyboard_regen_clip_0_old.png",
+                image_prompt="Old prompt",
+                image_approved=True,
+                image_score=7,
+                image_reference_ready=True,
+                video_url="/projects/proj_storyboard_regen_clip_0.mp4",
+                video_prompt="Old video prompt",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+                image_url="/projects/proj_storyboard_regen_clip_1.png",
+                image_prompt="Second prompt",
+                image_approved=True,
+                image_score=8,
+                image_reference_ready=True,
+                video_url="/projects/proj_storyboard_regen_clip_1.mp4",
+                video_prompt="Second video prompt",
+                video_approved=True,
+            ),
+        ],
+        final_video_url="/projects/proj_storyboard_regen_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_storyboard_regen.fmv").write_text(state.model_dump_json())
+
+    response = await endpoints_module.regenerate_storyboard_clip(
+        "proj_storyboard_regen",
+        "clip_0",
+    )
+
+    assert response.current_stage == AgentStage.STORYBOARDING
+    assert response.timeline[0].image_url == "/projects/proj_storyboard_regen_clip_0.png"
+    assert response.timeline[0].image_prompt == "Regenerated storyboard prompt"
+    assert response.timeline[0].image_approved is True
+    assert response.timeline[0].video_url is None
+    assert response.timeline[0].video_prompt is None
+    assert response.timeline[1].image_url == "/projects/proj_storyboard_regen_clip_1.png"
+    assert response.timeline[1].video_url == "/projects/proj_storyboard_regen_clip_1.mp4"
+    assert response.final_video_url is None
+    assert set(response.stage_summaries.keys()) == {"planning"}
+
+    persisted = endpoints_module.get_project("proj_storyboard_regen")
+    assert persisted.timeline[0].image_url == "/projects/proj_storyboard_regen_clip_0.png"
+    assert persisted.timeline[0].video_url is None
+    assert persisted.current_stage == AgentStage.STORYBOARDING
+
+
+def test_upload_storyboard_frame_endpoint_replaces_target_clip_immediately(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    state = ProjectState(
+        project_id="proj_storyboard_upload",
+        name="Storyboard Upload",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+                image_url="/projects/proj_storyboard_upload_clip_0_old.png",
+                image_prompt="Old prompt",
+                image_approved=True,
+                image_score=7,
+                image_reference_ready=True,
+                image_critiques=["Old critique"],
+                video_url="/projects/proj_storyboard_upload_clip_0.mp4",
+                video_prompt="Old video prompt",
+                video_critiques=["Old video critique"],
+                video_score=8,
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+                image_url="/projects/proj_storyboard_upload_clip_1.png",
+                image_prompt="Second prompt",
+                image_approved=True,
+                image_score=8,
+                image_reference_ready=True,
+                video_url="/projects/proj_storyboard_upload_clip_1.mp4",
+                video_prompt="Second video prompt",
+                video_approved=True,
+            ),
+        ],
+        final_video_url="/projects/proj_storyboard_upload_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_storyboard_upload.fmv").write_text(state.model_dump_json())
+
+    response = endpoints_module.upload_storyboard_frame(
+        "proj_storyboard_upload",
+        "clip_0",
+        endpoints_module.StoryboardFrameUploadRequest(
+            url="/projects/uploads/custom_frame.png",
+            name="custom_frame.png",
+        ),
+    )
+
+    assert response.current_stage == AgentStage.STORYBOARDING
+    assert response.timeline[0].image_url == "/projects/uploads/custom_frame.png"
+    assert response.timeline[0].image_prompt is None
+    assert response.timeline[0].image_score is None
+    assert response.timeline[0].image_reference_ready is True
+    assert response.timeline[0].image_approved is True
+    assert response.timeline[0].image_manual_override is True
+    assert response.timeline[0].image_critiques[-1] == "Manual storyboard frame uploaded: custom_frame.png"
+    assert response.timeline[0].video_url is None
+    assert response.timeline[0].video_prompt is None
+    assert response.timeline[0].video_critiques == []
+    assert response.timeline[0].video_score is None
+    assert response.timeline[0].video_approved is None
+    assert response.timeline[1].image_url == "/projects/proj_storyboard_upload_clip_1.png"
+    assert response.timeline[1].video_url == "/projects/proj_storyboard_upload_clip_1.mp4"
+    assert response.final_video_url is None
+    assert set(response.stage_summaries.keys()) == {"planning"}
+
+    persisted = endpoints_module.get_project("proj_storyboard_upload")
+    assert persisted.timeline[0].image_url == "/projects/uploads/custom_frame.png"
+    assert persisted.timeline[0].video_url is None
+    assert persisted.current_stage == AgentStage.STORYBOARDING
+
+
+def test_update_project_preserves_manual_storyboard_frame_on_description_edit(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    previous = ProjectState(
+        project_id="proj_manual_storyboard_preserve",
+        name="Manual Storyboard Preserve",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Original shot description",
+                image_url="/projects/uploads/manual_frame.png",
+                image_prompt=None,
+                image_critiques=["Manual storyboard frame uploaded: manual_frame.png"],
+                image_approved=True,
+                image_score=None,
+                image_reference_ready=True,
+                image_manual_override=True,
+                video_url="/projects/proj_manual_storyboard_preserve_clip_0.mp4",
+                video_prompt="Old video prompt",
+                video_critiques=["Old video critique"],
+                video_score=8,
+                video_approved=True,
+            )
+        ],
+        final_video_url="/projects/proj_manual_storyboard_preserve_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_manual_storyboard_preserve.fmv").write_text(previous.model_dump_json())
+
+    edited = previous.model_copy(deep=True)
+    edited.timeline[0].storyboard_text = "Updated shot description with more detail"
+
+    response = endpoints_module.update_project("proj_manual_storyboard_preserve", edited)
+
+    assert response.timeline[0].image_url == "/projects/uploads/manual_frame.png"
+    assert response.timeline[0].image_approved is True
+    assert response.timeline[0].image_reference_ready is True
+    assert response.timeline[0].image_manual_override is True
+    assert response.timeline[0].video_url is None
+    assert response.timeline[0].video_prompt is None
+    assert response.timeline[0].video_approved is False
+    assert response.final_video_url is None
+
+
+def test_update_asset_label_endpoint_does_not_touch_storyboard_frame(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    state = ProjectState(
+        project_id="proj_asset_label_update",
+        name="Asset Label Update",
+        current_stage=AgentStage.STORYBOARDING,
+        assets=[
+            MediaAsset(
+                id="asset_0",
+                url="/projects/uploads/manual_frame.png",
+                type="image",
+                name="manual_frame.png",
+                label="Old Label",
+            )
+        ],
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Shot",
+                image_url="/projects/uploads/manual_frame.png",
+                image_critiques=["Manual storyboard frame uploaded: manual_frame.png"],
+                image_approved=True,
+                image_reference_ready=True,
+                image_manual_override=True,
+            )
+        ],
+    )
+    (projects_dir / "proj_asset_label_update.fmv").write_text(state.model_dump_json())
+
+    response = endpoints_module.update_asset_label(
+        "proj_asset_label_update",
+        "asset_0",
+        endpoints_module.AssetLabelUpdateRequest(label="New Label"),
+    )
+
+    assert response.assets[0].label == "New Label"
+    assert response.timeline[0].image_url == "/projects/uploads/manual_frame.png"
+    assert response.timeline[0].image_manual_override is True
 
 
 @pytest.mark.asyncio
@@ -3740,6 +5862,49 @@ async def test_critique_image_fails_when_all_three_critics_raise_same_issue(monk
     assert normalized["passes"] is False
     assert len(normalized["hard_fail_reasons"]) == 1
     assert normalized["hard_fail_reasons"][0] in {"extra limbs", "extra arm", "third arm visible"}
+
+
+@pytest.mark.asyncio
+async def test_critique_image_runs_three_critic_lenses_concurrently(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_storage_roots(monkeypatch, tmp_path)
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(models=SimpleNamespace(generate_content=lambda **kwargs: None))
+    monkeypatch.setattr(pipeline, "_build_image_critic_contents", lambda **kwargs: ["frame"])
+
+    started = []
+
+    async def fake_single_pass(**kwargs):
+        started.append(kwargs["reviewer_lens"])
+        await asyncio.sleep(0.05)
+        return {
+            "score": 8,
+            "passes": True,
+            "reasoning": "Looks good.",
+            "suggestions": "None.",
+            "hard_fail_findings": [],
+        }
+
+    monkeypatch.setattr(pipeline, "_single_image_critic_pass", fake_single_pass)
+
+    started_at = asyncio.get_running_loop().time()
+    critique = await pipeline._critique_image(
+        image_bytes=b"fake-image",
+        image_mime_type="image/png",
+        storyboard_text="A single dancer standing in an empty studio.",
+        instructions="Natural proportions and realistic lighting.",
+        image_prompt="A single dancer standing in an empty studio.",
+        primary_reference_shot=None,
+        continuity_reference_shots=[],
+        relevant_assets=[],
+        asset_bytes={},
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert critique["passes"] is True
+    assert len(started) == 3
+    assert elapsed < 0.12
 
 
 def test_critic_config_uses_low_temperature():

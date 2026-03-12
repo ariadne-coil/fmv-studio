@@ -20,6 +20,14 @@ class VideoProviderDefinition:
     default_model: str
 
 
+@dataclass(frozen=True)
+class VideoGenerationReferenceAsset:
+    path: str
+    label: str
+    kind: str = "subject"
+    source_asset_id: str | None = None
+
+
 class BaseVideoProvider:
     definition: VideoProviderDefinition
 
@@ -30,6 +38,7 @@ class BaseVideoProvider:
         prompt: str,
         duration_seconds: int,
         image_path: str | None,
+        reference_assets: list[VideoGenerationReferenceAsset] | None = None,
     ) -> bytes:
         raise NotImplementedError
 
@@ -50,11 +59,13 @@ class GoogleVeoProvider(BaseVideoProvider):
         prompt: str,
         duration_seconds: int,
         image_path: str | None,
+        reference_assets: list[VideoGenerationReferenceAsset] | None = None,
     ) -> bytes:
         return await pipeline._generate_google_video_clip(
             prompt=prompt,
             duration_seconds=duration_seconds,
             image_path=image_path,
+            reference_assets=reference_assets or [],
         )
 
 

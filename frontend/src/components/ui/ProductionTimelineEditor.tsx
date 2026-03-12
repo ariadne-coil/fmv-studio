@@ -6,6 +6,7 @@ import { ProductionTimelineFragment, VideoClip } from "@/lib/api";
 
 const PX_PER_SEC = 84;
 const TRACK_LABEL_WIDTH = 120;
+const TIMELINE_END_GUTTER_PX = 96;
 
 function formatTimecode(seconds: number): string {
     const safeSeconds = Math.max(0, seconds);
@@ -71,7 +72,15 @@ export default function ProductionTimelineEditor({
     const sortedMusicFragments = [...fragments]
         .filter((fragment) => (fragment.track_type ?? "video") === "music")
         .sort((left, right) => left.timeline_start - right.timeline_start);
-    const totalWidth = Math.max(720, totalDuration * PX_PER_SEC);
+    const furthestFragmentEndSeconds = fragments.reduce(
+        (maxEnd, fragment) => Math.max(maxEnd, fragment.timeline_start + fragment.duration),
+        0
+    );
+    const effectiveTimelineDuration = Math.max(totalDuration, furthestFragmentEndSeconds);
+    const totalWidth = Math.max(
+        720,
+        Math.ceil(effectiveTimelineDuration * PX_PER_SEC) + TIMELINE_END_GUTTER_PX,
+    );
 
     const clipLookup = Object.fromEntries(
         clips.map((clip, index) => [
@@ -113,6 +122,23 @@ export default function ProductionTimelineEditor({
         onMoveVideoFragment(draggedFragmentId, beforeFragmentId);
     };
 
+    const handleVideoFragmentDrop = (
+        event: React.DragEvent<HTMLElement>,
+        fragmentId: string,
+        insertAfter: boolean,
+        fallbackNextFragmentId: string | null,
+    ) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!isEditable) return;
+        const draggedFragmentId = event.dataTransfer.getData("text/fragment-id");
+        if (!draggedFragmentId) return;
+
+        const targetBeforeFragmentId = insertAfter ? fallbackNextFragmentId : fragmentId;
+        if (targetBeforeFragmentId === draggedFragmentId) return;
+        onMoveVideoFragment(draggedFragmentId, targetBeforeFragmentId);
+    };
+
     const handleMusicTrackDrop = (event: React.DragEvent<HTMLDivElement>) => {
         event.preventDefault();
         if (!isEditable) return;
@@ -120,6 +146,19 @@ export default function ProductionTimelineEditor({
         if (!draggedFragmentId) return;
 
         const rect = event.currentTarget.getBoundingClientRect();
+        const offsetX = event.clientX - rect.left;
+        onMoveMusicFragment(draggedFragmentId, Math.max(0, offsetX / PX_PER_SEC));
+    };
+
+    const handleMusicFragmentDrop = (event: React.DragEvent<HTMLElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!isEditable) return;
+        const draggedFragmentId = event.dataTransfer.getData("text/fragment-id");
+        if (!draggedFragmentId) return;
+
+        const lane = (event.currentTarget.closest("[data-track-role='music-lane']") as HTMLDivElement | null) ?? null;
+        const rect = lane?.getBoundingClientRect() ?? event.currentTarget.getBoundingClientRect();
         const offsetX = event.clientX - rect.left;
         onMoveMusicFragment(draggedFragmentId, Math.max(0, offsetX / PX_PER_SEC));
     };
@@ -196,11 +235,16 @@ export default function ProductionTimelineEditor({
             </div>
 
             <div className="flex-1 overflow-x-auto overflow-y-hidden bg-background/70">
-                <div className="min-h-full p-3">
+                <div className="min-h-full min-w-full w-max p-3">
                     <div className="flex">
                         <div className="w-[120px] shrink-0" />
-                        <div className="relative h-6" style={{ width: `${totalWidth}px` }}>
-                            {Array.from({ length: Math.max(1, Math.ceil(totalDuration / 2) + 1) }).map((_, index) => {
+                        <div
+                            className="relative h-6 cursor-pointer"
+                            style={{ width: `${totalWidth}px` }}
+                            onClick={handleTrackSeek}
+                            title="Click to seek"
+                        >
+                            {Array.from({ length: Math.max(1, Math.ceil(effectiveTimelineDuration / 2) + 1) }).map((_, index) => {
                                 const second = index * 2;
                                 return (
                                     <div
@@ -239,7 +283,7 @@ export default function ProductionTimelineEditor({
                                 onDragOver={(event) => event.preventDefault()}
                                 onDrop={handleVideoTrackDrop}
                             >
-                                {sortedVideoFragments.map((fragment) => {
+                                {sortedVideoFragments.map((fragment, index) => {
                                     const clipMeta = clipLookup[fragment.source_clip_id ?? ""];
                                     const isSelected = fragment.id === selectedFragmentId && selectedTrack === "video";
                                     return (
@@ -253,6 +297,20 @@ export default function ProductionTimelineEditor({
                                                 }
                                                 event.dataTransfer.effectAllowed = "move";
                                                 event.dataTransfer.setData("text/fragment-id", fragment.id);
+                                            }}
+                                            onDragOver={(event) => {
+                                                event.preventDefault();
+                                                event.stopPropagation();
+                                            }}
+                                            onDrop={(event) => {
+                                                const rect = event.currentTarget.getBoundingClientRect();
+                                                const insertAfter = event.clientX - rect.left >= rect.width / 2;
+                                                handleVideoFragmentDrop(
+                                                    event,
+                                                    fragment.id,
+                                                    insertAfter,
+                                                    sortedVideoFragments[index + 1]?.id ?? null,
+                                                );
                                             }}
                                             onClick={(event) => {
                                                 event.stopPropagation();
@@ -344,6 +402,7 @@ export default function ProductionTimelineEditor({
                                 <div
                                     className="relative h-10 rounded-xl border border-surface-border bg-black/25 overflow-hidden"
                                     style={{ width: `${totalWidth}px` }}
+                                    data-track-role="music-lane"
                                     onClick={handleTrackSeek}
                                     onDragOver={(event) => event.preventDefault()}
                                     onDrop={handleMusicTrackDrop}
@@ -362,6 +421,11 @@ export default function ProductionTimelineEditor({
                                                     event.dataTransfer.effectAllowed = "move";
                                                     event.dataTransfer.setData("text/fragment-id", fragment.id);
                                                 }}
+                                                onDragOver={(event) => {
+                                                    event.preventDefault();
+                                                    event.stopPropagation();
+                                                }}
+                                                onDrop={handleMusicFragmentDrop}
                                                 onClick={(event) => {
                                                     event.stopPropagation();
                                                     onSelectFragment(fragment.id, "music");

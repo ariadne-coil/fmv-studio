@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+from typing import Any, Dict, List, Optional
 from enum import Enum
 
 class AgentStage(str, Enum):
@@ -25,6 +25,9 @@ class MediaAsset(BaseModel):
     label: Optional[str] = None
     mime_type: Optional[str] = None
     text_content: Optional[str] = None
+    ai_context: Optional[str] = None
+    source: str = "user"
+    purpose: Optional[str] = None
 
 class VideoClip(BaseModel):
     id: str
@@ -39,6 +42,7 @@ class VideoClip(BaseModel):
     image_approved: Optional[bool] = None
     image_score: Optional[int] = None
     image_reference_ready: bool = False
+    image_manual_override: bool = False
 
     # Filming Phase (Veo 3.1)
     video_prompt: Optional[str] = None
@@ -84,6 +88,16 @@ class DirectorTurn(BaseModel):
     source: Optional[str] = None
     applied_changes: List[str] = Field(default_factory=list)
 
+
+class DirectorUndoEntry(BaseModel):
+    id: str
+    message: str
+    stage: str
+    created_at: str
+    change_summary: List[str] = Field(default_factory=list)
+    snapshot: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ProjectState(BaseModel):
     project_id: str
     name: str
@@ -102,6 +116,7 @@ class ProjectState(BaseModel):
     style_prompt: str = ""
     music_min_duration_seconds: Optional[float] = None
     music_max_duration_seconds: Optional[float] = None
+    music_start_seconds: float = 0.0
     generated_music_provider: Optional[str] = None
     generated_music_lyrics_prompt: Optional[str] = None
     generated_music_style_prompt: Optional[str] = None
@@ -118,3 +133,4 @@ class ProjectState(BaseModel):
     active_run: Optional[PipelineRunState] = None
     stage_summaries: Dict[str, StageSummary] = Field(default_factory=dict)
     director_log: List[DirectorTurn] = Field(default_factory=list)
+    director_undo_stack: List[DirectorUndoEntry] = Field(default_factory=list)

@@ -7,10 +7,15 @@ from typing import List, Optional
 from fastapi import APIRouter, File, Header, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 
-from app.agent.models import ProjectState, AgentStage, PipelineRunState, PipelineRunStatus
-from app.agent.graph import FMVAgentPipeline
+from app.agent.models import AgentStage, PipelineRunState, PipelineRunStatus, ProductionTimelineFragment, ProjectState
+from app.agent.graph import FMVAgentPipeline, _normalize_relevant_assets
+from app.core.asset_context import (
+    analyze_uploaded_asset,
+    build_asset_reference_registry,
+    build_asset_semantic_context,
+    build_document_context,
+)
 from app.core.document_context import (
-    display_asset_label,
     extract_document_text,
     infer_asset_type,
     suggest_asset_label,
@@ -30,6 +35,10 @@ from google import genai as _genai
 router = APIRouter()
 
 STAGE_ORDER = ["input", "lyria_prompting", "planning", "storyboarding", "filming", "production", "completed"]
+DEFAULT_STALE_RUN_TIMEOUT_SECONDS = {
+    AgentStage.STORYBOARDING: 15 * 60,
+    AgentStage.FILMING: 60 * 60,
+}
 
 
 class ProjectSummary(BaseModel):
@@ -63,6 +72,45 @@ class ExecutePipelineRunRequest(BaseModel):
     stage_voice_briefs_enabled: Optional[bool] = None
 
 
+class AssetUploadPlanRequest(BaseModel):
+    filename: str = Field(min_length=1)
+    content_type: Optional[str] = None
+    size: Optional[int] = Field(default=None, ge=0)
+
+
+class AssetUploadPlanResponse(BaseModel):
+    mode: str
+    upload_url: Optional[str] = None
+    upload_method: Optional[str] = None
+    upload_headers: dict[str, str] = Field(default_factory=dict)
+    url: Optional[str] = None
+    name: Optional[str] = None
+    label: Optional[str] = None
+    asset_type: Optional[str] = None
+    mime_type: Optional[str] = None
+    text_content: Optional[str] = None
+    ai_context: Optional[str] = None
+
+
+class CompleteAssetUploadRequest(BaseModel):
+    url: str = Field(min_length=1)
+    filename: str = Field(min_length=1)
+    content_type: Optional[str] = None
+
+
+class ClipApprovalRequest(BaseModel):
+    approved: bool
+
+
+class StoryboardFrameUploadRequest(BaseModel):
+    url: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+
+class AssetLabelUpdateRequest(BaseModel):
+    label: Optional[str] = None
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -85,6 +133,29 @@ def _coerce_optional_bool_header(value: object) -> Optional[bool]:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _pipeline_run_stale_timeout_seconds(stage: AgentStage) -> int:
+    override = os.getenv("FMV_PIPELINE_STALE_TIMEOUT_SECONDS", "").strip()
+    if override:
+        try:
+            return max(60, int(override))
+        except ValueError:
+            pass
+    return DEFAULT_STALE_RUN_TIMEOUT_SECONDS.get(stage, 15 * 60)
+
+
+def _is_pipeline_run_stale(active_run: PipelineRunState) -> bool:
+    try:
+        updated_at = datetime.fromisoformat(active_run.updated_at)
+    except Exception:
+        return False
+
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+
+    age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    return age_seconds > _pipeline_run_stale_timeout_seconds(active_run.stage)
 
 
 def _resolve_music_provider(override: Optional[str], state: ProjectState) -> Optional[str]:
@@ -164,10 +235,71 @@ def _previous_review_stage(stage: AgentStage | str | None) -> AgentStage | None:
     resolved = _coerce_agent_stage(stage)
     if resolved is None:
         return None
+    if resolved == AgentStage.HALTED_FOR_REVIEW:
+        return None
     index = _stage_index(resolved)
     if index <= 0:
         return None
     return AgentStage(STAGE_ORDER[index - 1])
+
+
+def _infer_review_stage_for_halted_state(state: ProjectState) -> AgentStage:
+    if state.final_video_url:
+        return AgentStage.COMPLETED
+
+    if any((fragment.track_type or "video") != "music" for fragment in state.production_timeline):
+        return AgentStage.PRODUCTION
+
+    if state.timeline:
+        has_video_state = any(
+            clip.video_url or clip.video_prompt or clip.video_critiques
+            for clip in state.timeline
+        )
+        if has_video_state:
+            return AgentStage.FILMING
+
+        has_image_state = any(
+            clip.image_url or clip.image_prompt or clip.image_critiques
+            for clip in state.timeline
+        )
+        if has_image_state:
+            return AgentStage.STORYBOARDING
+
+        return AgentStage.PLANNING
+
+    if state.music_workflow != "uploaded_track" and not state.music_url and (state.lyrics_prompt or state.style_prompt):
+        return AgentStage.LYRIA_PROMPTING
+
+    return AgentStage.INPUT
+
+
+def _previous_review_stage_for_state(
+    state: ProjectState,
+    stage: AgentStage | str | None,
+) -> AgentStage | None:
+    resolved = _coerce_agent_stage(stage)
+    if resolved is None:
+        return None
+    if resolved == AgentStage.HALTED_FOR_REVIEW:
+        resolved = _infer_review_stage_for_halted_state(state)
+
+    if state.music_workflow == "uploaded_track":
+        stage_order = [
+            AgentStage.INPUT,
+            AgentStage.PLANNING,
+            AgentStage.STORYBOARDING,
+            AgentStage.FILMING,
+            AgentStage.PRODUCTION,
+            AgentStage.COMPLETED,
+        ]
+        if resolved not in stage_order:
+            return _previous_review_stage(resolved)
+        index = stage_order.index(resolved)
+        if index <= 0:
+            return None
+        return stage_order[index - 1]
+
+    return _previous_review_stage(resolved)
 
 
 def _planning_signature(state: ProjectState) -> list[tuple[str, float, float, str]]:
@@ -192,52 +324,53 @@ def _trim_stage_summaries_to(state: ProjectState, max_stage: AgentStage) -> None
 
 
 def _document_context_for_state(state: ProjectState, *, max_chars: int = 6000) -> str:
-    snippets: list[str] = []
-    current_length = 0
-    for asset in state.assets:
-        if asset.type != "document" or not asset.text_content:
-            continue
-        snippet = f"{display_asset_label(asset.label, asset.name)}:\n{asset.text_content.strip()}"
-        if current_length + len(snippet) > max_chars:
-            remaining = max_chars - current_length
-            if remaining <= 0:
-                break
-            snippet = snippet[:remaining].rstrip() + "…"
-        snippets.append(snippet)
-        current_length += len(snippet)
-        if current_length >= max_chars:
-            break
-    return "\n\n".join(snippets)
+    return build_document_context(state.assets, max_chars=max_chars)
 
 
 def _asset_reference_registry_for_state(state: ProjectState, *, max_chars: int = 2000) -> str:
-    entries: list[str] = []
-    current_length = 0
-    for asset in state.assets:
-        label = display_asset_label(asset.label, asset.name)
-        if asset.type == "image":
-            entry = (
-                f'- image "{label}" (file: {asset.name}). '
-                f"If this label names a character, creature, hero prop, vehicle, or location from the screenplay, "
-                f"treat this image as the canonical visual reference for that named entity."
-            )
-        elif asset.type == "document":
-            entry = f'- document "{label}" (file: {asset.name}). Supplemental written context for the screenplay, lore, and world details.'
-        elif asset.type == "audio":
-            entry = f'- audio "{label}" (file: {asset.name}). Music or sound reference available to the project.'
-        else:
-            entry = f'- {asset.type} "{label}" (file: {asset.name}).'
+    return build_asset_reference_registry(state.assets, max_chars=max_chars)
 
-        if current_length + len(entry) > max_chars:
-            remaining = max_chars - current_length
-            if remaining <= 0:
-                break
-            entry = entry[:remaining].rstrip() + "…"
-        entries.append(entry)
-        current_length += len(entry)
-        if current_length >= max_chars:
-            break
-    return "\n".join(entries) or "(none)"
+
+def _asset_semantic_context_for_state(state: ProjectState, *, max_chars: int = 3000) -> str:
+    return build_asset_semantic_context(state.assets, max_chars=max_chars) or "(none)"
+
+
+async def _build_uploaded_asset_response(
+    *,
+    filename: str,
+    mime_type: str | None,
+    asset_type: str,
+    url: str,
+    content: bytes | None = None,
+    local_path: str | None = None,
+    extracted_text: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, object | None]:
+    client = build_genai_client(api_key=api_key)
+    ai_context = None
+    try:
+        ai_context = await analyze_uploaded_asset(
+            client=client,
+            filename=filename,
+            label=suggest_asset_label(filename),
+            mime_type=mime_type,
+            asset_type=asset_type,
+            content=content,
+            local_path=local_path,
+            extracted_text=extracted_text,
+        )
+    except Exception:
+        ai_context = None
+
+    return {
+        "url": url,
+        "name": filename,
+        "label": suggest_asset_label(filename),
+        "asset_type": asset_type,
+        "mime_type": mime_type,
+        "text_content": extracted_text,
+        "ai_context": ai_context,
+    }
 
 
 def _clear_clip_storyboard_outputs(clip) -> None:
@@ -247,6 +380,15 @@ def _clear_clip_storyboard_outputs(clip) -> None:
     clip.image_approved = False
     clip.image_score = None
     clip.image_reference_ready = False
+    clip.image_manual_override = False
+    clip.video_prompt = None
+    clip.video_url = None
+    clip.video_critiques = []
+    clip.video_score = None
+    clip.video_approved = False
+
+
+def _clear_clip_video_outputs(clip) -> None:
     clip.video_prompt = None
     clip.video_url = None
     clip.video_critiques = []
@@ -262,6 +404,78 @@ def _preserve_music_production_fragments(state: ProjectState) -> None:
     ]
 
 
+def _normalize_music_start_seconds(value: float | None) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return round(max(0.0, float(value)), 3)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _default_music_fragment_for_state(state: ProjectState) -> list[ProductionTimelineFragment]:
+    if not state.music_url:
+        return []
+
+    program_duration = 0.0
+    if state.timeline:
+        program_duration = max(
+            program_duration,
+            max((float(clip.timeline_start) + float(clip.duration) for clip in state.timeline), default=0.0),
+        )
+
+    if state.production_timeline:
+        video_fragments = [
+            fragment
+            for fragment in state.production_timeline
+            if (fragment.track_type or "video") != "music"
+        ]
+        program_duration = max(
+            program_duration,
+            max(
+                (float(fragment.timeline_start) + float(fragment.duration) for fragment in video_fragments),
+                default=0.0,
+            ),
+        )
+
+    if program_duration <= 0:
+        return []
+
+    music_start = min(
+        _normalize_music_start_seconds(state.music_start_seconds),
+        max(0.0, round(program_duration - 0.1, 3)),
+    )
+    duration = max(0.1, round(program_duration - music_start, 3))
+    return [
+        ProductionTimelineFragment(
+            id="music_frag_0",
+            track_type="music",
+            source_clip_id=None,
+            timeline_start=music_start,
+            source_start=0.0,
+            duration=duration,
+            audio_enabled=True,
+        )
+    ]
+
+
+def _reconcile_after_music_start_edit(previous: ProjectState, state: ProjectState) -> None:
+    state.music_start_seconds = _normalize_music_start_seconds(state.music_start_seconds)
+    video_fragments = [
+        fragment
+        for fragment in state.production_timeline
+        if (fragment.track_type or "video") != "music"
+    ]
+    state.production_timeline = video_fragments + _default_music_fragment_for_state(state)
+    state.final_video_url = None
+    state.last_error = None
+    state.stage_summaries = {
+        stage_name: summary
+        for stage_name, summary in state.stage_summaries.items()
+        if stage_name in STAGE_ORDER and _stage_index(stage_name) < _stage_index(AgentStage.PRODUCTION)
+    }
+
+
 def _reconcile_after_planning_edits(previous: ProjectState, state: ProjectState) -> None:
     previous_clips = {clip.id: clip for clip in previous.timeline}
 
@@ -274,6 +488,16 @@ def _reconcile_after_planning_edits(previous: ProjectState, state: ProjectState)
         storyboard_changed = (previous_clip.storyboard_text or "").strip() != (clip.storyboard_text or "").strip()
         duration_changed = round(float(previous_clip.duration), 3) != round(float(clip.duration), 3)
         if storyboard_changed or duration_changed:
+            if previous_clip.image_manual_override and previous_clip.image_url:
+                clip.image_prompt = previous_clip.image_prompt
+                clip.image_url = previous_clip.image_url
+                clip.image_critiques = list(previous_clip.image_critiques)
+                clip.image_approved = previous_clip.image_approved
+                clip.image_score = previous_clip.image_score
+                clip.image_reference_ready = previous_clip.image_reference_ready
+                clip.image_manual_override = True
+                _clear_clip_video_outputs(clip)
+                continue
             _clear_clip_storyboard_outputs(clip)
 
     _preserve_music_production_fragments(state)
@@ -286,18 +510,28 @@ def _reconcile_after_planning_edits(previous: ProjectState, state: ProjectState)
     }
 
     if not state.timeline:
+        next_stage = AgentStage.PLANNING
+    elif all(clip.video_approved and clip.video_url for clip in state.timeline):
+        next_stage = AgentStage.PRODUCTION
+    elif all(clip.image_approved and clip.image_url for clip in state.timeline):
+        next_stage = AgentStage.FILMING
+    else:
+        next_stage = AgentStage.STORYBOARDING
+
+    current_stage = _coerce_agent_stage(state.current_stage)
+    if current_stage is None or current_stage == AgentStage.HALTED_FOR_REVIEW:
+        state.current_stage = next_stage
+        return
+
+    if _stage_index(current_stage) < _stage_index(AgentStage.PLANNING):
         state.current_stage = AgentStage.PLANNING
         return
 
-    if all(clip.video_approved and clip.video_url for clip in state.timeline):
-        state.current_stage = AgentStage.PRODUCTION
+    if _stage_index(current_stage) < _stage_index(next_stage):
+        state.current_stage = current_stage
         return
 
-    if all(clip.image_approved and clip.image_url for clip in state.timeline):
-        state.current_stage = AgentStage.FILMING
-        return
-
-    state.current_stage = AgentStage.STORYBOARDING
+    state.current_stage = next_stage
 
 
 def _apply_revert_to_state(state: ProjectState, target_stage: AgentStage | str) -> ProjectState:
@@ -339,6 +573,61 @@ def _apply_revert_to_state(state: ProjectState, target_stage: AgentStage | str) 
     return state
 
 
+def _get_clip_or_404(state: ProjectState, clip_id: str):
+    for clip in state.timeline:
+        if clip.id == clip_id:
+            return clip
+    raise HTTPException(status_code=404, detail=f"Clip '{clip_id}' not found")
+
+
+def _get_asset_or_404(state: ProjectState, asset_id: str):
+    for asset in state.assets:
+        if asset.id == asset_id:
+            return asset
+    raise HTTPException(status_code=404, detail=f"Asset '{asset_id}' not found")
+
+
+def _apply_image_approval_change(state: ProjectState, clip_id: str, approved: bool) -> ProjectState:
+    clip = _get_clip_or_404(state, clip_id)
+    current_value = bool(clip.image_approved)
+    if current_value == approved:
+        return state
+    if approved and not clip.image_url:
+        raise HTTPException(status_code=400, detail="Cannot approve a storyboard clip without an image")
+
+    clip.image_approved = approved
+    clip.image_reference_ready = approved and bool(clip.image_url)
+    state.last_error = None
+    state.final_video_url = None
+
+    if not approved:
+        clip.video_prompt = None
+        clip.video_url = None
+        clip.video_critiques = []
+        clip.video_score = None
+        clip.video_approved = False
+
+    _trim_stage_summaries_to(state, AgentStage.PLANNING)
+    state.current_stage = AgentStage.STORYBOARDING
+    return state
+
+
+def _apply_video_approval_change(state: ProjectState, clip_id: str, approved: bool) -> ProjectState:
+    clip = _get_clip_or_404(state, clip_id)
+    current_value = bool(clip.video_approved)
+    if current_value == approved:
+        return state
+    if approved and not clip.video_url:
+        raise HTTPException(status_code=400, detail="Cannot approve a filming clip without a video")
+
+    clip.video_approved = approved
+    state.last_error = None
+    state.final_video_url = None
+    _trim_stage_summaries_to(state, AgentStage.STORYBOARDING)
+    state.current_stage = AgentStage.FILMING
+    return state
+
+
 def _get_project_run_state(project_id: str) -> PipelineRunState | None:
     try:
         state = get_project(project_id)
@@ -347,6 +636,17 @@ def _get_project_run_state(project_id: str) -> PipelineRunState | None:
 
     active_run = state.active_run
     if not active_run:
+        return None
+
+    if _is_pipeline_run_stale(active_run):
+        if active_run.driver == "local":
+            cancel_local_pipeline_task(project_id)
+        state.active_run = None
+        state.last_error = (
+            f"Background {active_run.stage.value} run timed out while waiting for progress. "
+            "Please retry the stage."
+        )
+        _write_project(project_id, state)
         return None
 
     if active_run.driver == "local" and not is_local_pipeline_task_active(project_id, active_run.run_id):
@@ -520,7 +820,34 @@ def update_project(project_id: str, state: ProjectState):
         current = get_project(project_id)
         if _planning_signature(current) != _planning_signature(state):
             _reconcile_after_planning_edits(current, state)
+        elif round(float(current.music_start_seconds or 0.0), 3) != round(float(state.music_start_seconds or 0.0), 3):
+            _reconcile_after_music_start_edit(current, state)
     return _write_project(project_id, state)
+
+
+@router.post("/projects/{project_id}/assets/{asset_id}/label", response_model=ProjectState)
+def update_asset_label(project_id: str, asset_id: str, payload: AssetLabelUpdateRequest):
+    if _get_project_run_state(project_id):
+        raise HTTPException(status_code=409, detail="Asset label edits are unavailable while a background pipeline run is active")
+
+    state = get_project(project_id)
+    asset = _get_asset_or_404(state, asset_id)
+    asset.label = payload.label.strip() if isinstance(payload.label, str) and payload.label.strip() else None
+    return _write_project(project_id, state)
+
+
+@router.post("/projects/{project_id}/clips/{clip_id}/image-approval", response_model=ProjectState)
+def update_storyboard_clip_approval(project_id: str, clip_id: str, payload: ClipApprovalRequest):
+    state = get_project(project_id)
+    updated_state = _apply_image_approval_change(state, clip_id, payload.approved)
+    return _write_project(project_id, updated_state)
+
+
+@router.post("/projects/{project_id}/clips/{clip_id}/video-approval", response_model=ProjectState)
+def update_filming_clip_approval(project_id: str, clip_id: str, payload: ClipApprovalRequest):
+    state = get_project(project_id)
+    updated_state = _apply_video_approval_change(state, clip_id, payload.approved)
+    return _write_project(project_id, updated_state)
 
 
 @router.get("/projects/{project_id}/run-status", response_model=ProjectRunStatus)
@@ -538,7 +865,11 @@ def get_project_run_status(project_id: str):
     )
 
 @router.post("/projects/{project_id}/upload")
-async def upload_asset(project_id: str, file: UploadFile = File(...)):
+async def upload_asset(
+    project_id: str,
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
     """
     Saves an uploaded file (image or audio) to disk under projects/uploads/{project_id}/.
     Returns {"url": <server-local path>, "name": <original filename>}.
@@ -565,14 +896,77 @@ async def upload_asset(project_id: str, file: UploadFile = File(...)):
         content,
         content_type=file.content_type,
     )
-    return {
-        "url": url,
-        "name": file.filename or unique_name,
-        "label": suggest_asset_label(file.filename or unique_name),
-        "asset_type": asset_type,
-        "mime_type": file.content_type,
-        "text_content": text_content,
-    }
+    return await _build_uploaded_asset_response(
+        filename=file.filename or unique_name,
+        mime_type=file.content_type,
+        asset_type=asset_type,
+        url=url,
+        content=content,
+        extracted_text=text_content,
+        api_key=_coerce_optional_header(x_api_key),
+    )
+
+
+@router.post("/projects/{project_id}/upload-plan", response_model=AssetUploadPlanResponse)
+async def create_asset_upload_plan(
+    project_id: str,
+    payload: AssetUploadPlanRequest,
+    request: Request,
+):
+    storage = get_storage_backend()
+    asset_type = infer_asset_type(payload.filename, payload.content_type)
+    if asset_type == "document":
+        return AssetUploadPlanResponse(mode="proxy")
+
+    ext = os.path.splitext(payload.filename or "file")[1] or ""
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    relative_path = f"uploads/{project_id}/{unique_name}"
+    upload_target = storage.create_browser_project_asset_upload(
+        relative_path,
+        content_type=payload.content_type,
+        content_length=payload.size,
+        origin=request.headers.get("origin"),
+    )
+    if not upload_target:
+        return AssetUploadPlanResponse(mode="proxy")
+
+    normalized_relative_path = relative_path.replace("\\", "/").lstrip("/")
+    return AssetUploadPlanResponse(
+        mode="direct",
+        upload_url=upload_target.upload_url,
+        upload_method=upload_target.method,
+        upload_headers=upload_target.headers or {},
+        url=f"/projects/{normalized_relative_path}",
+        name=payload.filename or unique_name,
+        label=suggest_asset_label(payload.filename or unique_name),
+        asset_type=asset_type,
+        mime_type=payload.content_type,
+        text_content=None,
+        ai_context=None,
+    )
+
+
+@router.post("/projects/{project_id}/upload-complete", response_model=AssetUploadPlanResponse)
+async def complete_asset_upload(
+    project_id: str,
+    payload: CompleteAssetUploadRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
+    storage = get_storage_backend()
+    asset_type = infer_asset_type(payload.filename, payload.content_type)
+    local_path = storage.resolve_project_asset_to_local_path(payload.url)
+    if not local_path or not os.path.exists(local_path):
+        raise HTTPException(status_code=404, detail="Uploaded asset could not be found for analysis")
+
+    response_payload = await _build_uploaded_asset_response(
+        filename=payload.filename,
+        mime_type=payload.content_type,
+        asset_type=asset_type,
+        url=payload.url,
+        local_path=local_path,
+        api_key=_coerce_optional_header(x_api_key),
+    )
+    return AssetUploadPlanResponse(mode="direct", **response_payload)
 
 
 @router.post("/projects/{project_id}/regenerate-music", response_model=ProjectState)
@@ -827,6 +1221,7 @@ class LiveDirectorRequest(BaseModel):
     display_stage: Optional[AgentStage] = None
     selected_clip_id: Optional[str] = None
     selected_fragment_id: Optional[str] = None
+    selected_asset_id: Optional[str] = None
     source: str = "text"
     speech_mode: str = "standard"
 
@@ -837,6 +1232,7 @@ class LiveDirectorResponse(BaseModel):
     applied_changes: List[str] = Field(default_factory=list)
     target_clip_id: Optional[str] = None
     target_fragment_id: Optional[str] = None
+    target_asset_id: Optional[str] = None
     stage: AgentStage
 
 
@@ -877,6 +1273,7 @@ Project context:
 - Style instructions: {state.instructions[:300]}
 - Additional lore: {state.additional_lore[:400]}
 - Uploaded asset registry: {_asset_reference_registry_for_state(state, max_chars=1600)}
+- Uploaded asset understanding: {_asset_semantic_context_for_state(state, max_chars=2000)}
 - Uploaded document context: {_document_context_for_state(state, max_chars=2000) or "(none)"}
 
 Nearby shots for context:
@@ -900,6 +1297,117 @@ Return ONLY the storyboard description text, no bullet points, no JSON, no extra
         ),
     )
     return {"storyboard_text": response.text.strip()}
+
+
+@router.post("/projects/{project_id}/storyboard-clips/{clip_id}/regenerate", response_model=ProjectState)
+async def regenerate_storyboard_clip(
+    project_id: str,
+    clip_id: str,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_orchestrator_model: Optional[str] = Header(default=None, alias="X-Orchestrator-Model"),
+    x_critic_model: Optional[str] = Header(default=None, alias="X-Critic-Model"),
+    x_text_model: Optional[str] = Header(default=None, alias="X-Text-Model"),
+    x_image_model: Optional[str] = Header(default=None, alias="X-Image-Model"),
+    x_image_resolution: Optional[str] = Header(default=None, alias="X-Image-Resolution"),
+):
+    if _get_project_run_state(project_id):
+        raise HTTPException(status_code=409, detail="Storyboard regeneration is unavailable while a background pipeline run is active")
+
+    state = get_project(project_id)
+    clip_index = next((index for index, clip in enumerate(state.timeline) if clip.id == clip_id), None)
+    if clip_index is None:
+        raise HTTPException(status_code=404, detail=f"Clip '{clip_id}' was not found")
+
+    target_clip = state.timeline[clip_index]
+    _clear_clip_storyboard_outputs(target_clip)
+    _preserve_music_production_fragments(state)
+    state.final_video_url = None
+    state.last_error = None
+    state.current_stage = AgentStage.STORYBOARDING
+    _trim_stage_summaries_to(state, AgentStage.PLANNING)
+
+    pipeline = FMVAgentPipeline(
+        api_key=_coerce_optional_header(x_api_key),
+        orchestrator_model=_resolve_orchestrator_model(
+            _coerce_optional_header(x_orchestrator_model),
+            _coerce_optional_header(x_text_model),
+        ),
+        critic_model=_resolve_critic_model(_coerce_optional_header(x_critic_model)),
+        image_model=_coerce_optional_header(x_image_model),
+        image_size=_coerce_optional_header(x_image_resolution),
+        persist_state_callback=lambda updated_state: _write_project(project_id, updated_state),
+    )
+
+    await pipeline._persist_state(state)
+    await pipeline._ensure_generated_character_assets(state)
+
+    image_assets, asset_bytes, asset_lookup = pipeline._build_storyboard_asset_context(state)
+    relevance_map = await pipeline._build_storyboard_relevance_map(
+        [target_clip],
+        image_assets=image_assets,
+        screenplay=state.screenplay,
+    )
+    relevant_assets = _normalize_relevant_assets(relevance_map.get(target_clip.id, []))
+    previous_reference_ready = [
+        clip
+        for clip in state.timeline[:clip_index]
+        if clip.image_url is not None and clip.image_reference_ready
+    ]
+    relevant_prev_shots = await pipeline._select_relevant_previous_shots(
+        target_clip,
+        previous_reference_ready,
+    )
+
+    try:
+        await pipeline._process_storyboard_clip(
+            state=state,
+            clip=target_clip,
+            relevant_assets=relevant_assets,
+            previous_shots=relevant_prev_shots,
+            asset_bytes=asset_bytes,
+            asset_lookup=asset_lookup,
+        )
+        await pipeline._persist_state(state)
+    except Exception as exc:
+        state.last_error = f"Storyboard regeneration failed for {clip_id}: {exc}"
+        _write_project(project_id, state)
+        raise HTTPException(status_code=500, detail=state.last_error) from exc
+
+    return state
+
+
+@router.post("/projects/{project_id}/storyboard-clips/{clip_id}/upload-frame", response_model=ProjectState)
+def upload_storyboard_frame(
+    project_id: str,
+    clip_id: str,
+    payload: StoryboardFrameUploadRequest,
+):
+    if _get_project_run_state(project_id):
+        raise HTTPException(status_code=409, detail="Storyboard frame upload is unavailable while a background pipeline run is active")
+
+    state = get_project(project_id)
+    clip = _get_clip_or_404(state, clip_id)
+
+    clip.image_url = payload.url
+    clip.image_prompt = None
+    clip.image_score = None
+    clip.image_reference_ready = True
+    clip.image_approved = True
+    clip.image_manual_override = True
+    clip.image_critiques = [
+        *clip.image_critiques,
+        f"Manual storyboard frame uploaded: {payload.name}",
+    ]
+    _clear_clip_video_outputs(clip)
+    clip.video_approved = None
+
+    _preserve_music_production_fragments(state)
+    state.final_video_url = None
+    state.last_error = None
+    state.current_stage = AgentStage.STORYBOARDING
+    _trim_stage_summaries_to(state, AgentStage.PLANNING)
+
+    return _write_project(project_id, state)
 
 
 @router.post("/projects/{project_id}/live-director", response_model=LiveDirectorResponse)
@@ -947,6 +1455,7 @@ async def live_director_mode(
             display_stage=body.display_stage,
             selected_clip_id=body.selected_clip_id,
             selected_fragment_id=body.selected_fragment_id,
+            selected_asset_id=body.selected_asset_id,
             source=body.source,
             speech_mode=body.speech_mode,
         )
@@ -962,7 +1471,7 @@ async def live_director_mode(
         navigation_action = "rewind"
 
     if navigation_action == "rewind":
-        rewind_target = requested_target_stage or _previous_review_stage(display_stage)
+        rewind_target = requested_target_stage or _previous_review_stage_for_state(updated_state, display_stage)
         if rewind_target is not None:
             response_state = _apply_revert_to_state(updated_state, rewind_target)
         _write_project(project_id, response_state)

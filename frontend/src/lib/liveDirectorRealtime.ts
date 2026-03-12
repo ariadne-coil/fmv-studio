@@ -24,9 +24,14 @@ function parseRealtimeMessage(message: unknown): LiveDirectorRealtimeEvent | nul
   const parts = data?.serverContent?.modelTurn?.parts;
   const inputTranscription = data?.inputTranscription || data?.serverContent?.inputTranscription;
   const outputTranscription = data?.outputTranscription || data?.serverContent?.outputTranscription;
+  const topLevelError = data?.error;
 
   if (data?.setupComplete) {
     return { type: "setup-complete" };
+  }
+  if (topLevelError) {
+    const detail = topLevelError.message || topLevelError.status || "Live Director realtime request failed.";
+    return { type: "error", message: detail };
   }
   if (data?.serverContent?.turnComplete) {
     return { type: "turn-complete" };
@@ -92,6 +97,20 @@ export class LiveDirectorRealtimeSession {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(this.proxyUrl);
       this.socket = socket;
+      let settled = false;
+      let setupComplete = false;
+
+      const settleReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      const settleResolve = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
 
       socket.onopen = () => {
         this.send({
@@ -112,12 +131,18 @@ export class LiveDirectorRealtimeSession {
             system_instruction: {
               parts: [{ text: this.systemInstruction }],
             },
+            context_window_compression: {
+              trigger_tokens: 10000,
+              sliding_window: {
+                target_tokens: 4000,
+              },
+            },
             tools: {
               function_declarations: [
                 {
                   name: "apply_director_command",
                   description:
-                    "Apply any FMV Studio project direction request. Use this for edits, rewrites, shot changes, prompt changes, audio edits, or regeneration requests.",
+                    "Apply any FMV Studio project direction request. Use this for edits, rewrites, shot changes, prompt changes, audio edits, undo or rollback requests, or regeneration requests.",
                   parameters: {
                     type: "OBJECT",
                     properties: {
@@ -131,8 +156,6 @@ export class LiveDirectorRealtimeSession {
                 },
               ],
             },
-            input_audio_transcription: {},
-            output_audio_transcription: {},
             realtime_input_config: {
               automatic_activity_detection: {
                 disabled: false,
@@ -142,26 +165,37 @@ export class LiveDirectorRealtimeSession {
             },
           },
         });
-        resolve();
       };
 
       socket.onerror = () => {
-        this.onEvent({ type: "error", message: "Live Director realtime connection failed." });
-        reject(new Error("Live Director realtime connection failed."));
+        const message = "Live Director realtime connection failed.";
+        this.onEvent({ type: "error", message });
+        settleReject(new Error(message));
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
         this.socket = null;
+        if (setupComplete) return;
+        const reason = event.reason?.trim() || "Live Director realtime connection closed before setup completed.";
+        settleReject(new Error(reason));
       };
 
       socket.onmessage = (event) => {
         try {
           const parsed = parseRealtimeMessage(JSON.parse(event.data));
           if (parsed) {
+            if (parsed.type === "setup-complete") {
+              setupComplete = true;
+              settleResolve();
+            } else if (parsed.type === "error" && !setupComplete) {
+              settleReject(new Error(parsed.message));
+            }
             this.onEvent(parsed);
           }
         } catch {
-          this.onEvent({ type: "error", message: "Live Director realtime message parsing failed." });
+          const message = "Live Director realtime message parsing failed.";
+          this.onEvent({ type: "error", message });
+          settleReject(new Error(message));
         }
       };
     });

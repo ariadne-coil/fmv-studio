@@ -8,6 +8,9 @@ export interface MediaAsset {
     label?: string | null;
     mime_type?: string | null;
     text_content?: string | null;
+    ai_context?: string | null;
+    source?: string;
+    purpose?: string | null;
 }
 
 export interface VideoClip {
@@ -21,6 +24,7 @@ export interface VideoClip {
     image_approved: boolean | null;
     image_score?: number | null;
     image_reference_ready?: boolean;
+    image_manual_override?: boolean;
     video_prompt?: string;
     video_url?: string;
     video_quality?: 'fast' | 'quality';
@@ -81,6 +85,7 @@ export interface ProjectState {
     style_prompt?: string;
     music_min_duration_seconds?: number | null;
     music_max_duration_seconds?: number | null;
+    music_start_seconds?: number | null;
     generated_music_provider?: string | null;
     generated_music_lyrics_prompt?: string | null;
     generated_music_style_prompt?: string | null;
@@ -118,6 +123,7 @@ export interface LiveDirectorRequest {
     display_stage?: AgentStage;
     selected_clip_id?: string | null;
     selected_fragment_id?: string | null;
+    selected_asset_id?: string | null;
     source?: "text" | "voice";
     speech_mode?: "standard" | "realtime";
 }
@@ -128,11 +134,29 @@ export interface LiveDirectorResponse {
     applied_changes: string[];
     target_clip_id?: string | null;
     target_fragment_id?: string | null;
+    target_asset_id?: string | null;
     stage: AgentStage;
+    navigation_action?: "stay" | "advance" | "rewind";
+    target_stage?: AgentStage | null;
 }
 
 const API_URL = "/api";
 const LOCAL_APP_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+const DIRECT_UPLOAD_MIN_BYTES = 8 * 1024 * 1024;
+
+interface AssetUploadPlan {
+    mode: "proxy" | "direct";
+    upload_url?: string;
+    upload_method?: string;
+    upload_headers?: Record<string, string>;
+    url?: string;
+    name?: string;
+    label?: string | null;
+    asset_type?: string;
+    mime_type?: string | null;
+    text_content?: string | null;
+    ai_context?: string | null;
+}
 
 export function shouldShowApiKeySettings(): boolean {
     if (typeof window === "undefined") return false;
@@ -450,6 +474,26 @@ export const api = {
         }
     },
 
+    async updateAssetLabel(id: string, assetId: string, label: string | null): Promise<ProjectState> {
+        const key = getStoredApiKey();
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/assets/${assetId}/label`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(key ? { "X-API-Key": key } : {}),
+                },
+                body: JSON.stringify({ label }),
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Failed to save asset label"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Failed to save asset label", error);
+        }
+    },
+
     async uploadAsset(projectId: string, file: File): Promise<{
         url: string;
         name: string;
@@ -457,16 +501,87 @@ export const api = {
         asset_type?: string;
         mime_type?: string | null;
         text_content?: string | null;
+        ai_context?: string | null;
     }> {
-        const formData = new FormData();
-        formData.append("file", file);
-
+        const key = getStoredApiKey();
         try {
+            if (file.size >= DIRECT_UPLOAD_MIN_BYTES) {
+                const planResponse = await fetch(`${API_URL}/projects/${projectId}/upload-plan`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        ...(key ? { "X-API-Key": key } : {}),
+                    },
+                    body: JSON.stringify({
+                        filename: file.name,
+                        content_type: file.type || null,
+                        size: file.size,
+                    }),
+                });
+                if (!planResponse.ok) {
+                    throw new Error(await getApiErrorMessage(planResponse, "Failed to prepare asset upload"));
+                }
+
+                const plan = await planResponse.json() as AssetUploadPlan;
+                if (plan.mode === "direct" && plan.upload_url && plan.url) {
+                    const uploadHeaders = new Headers(plan.upload_headers ?? {});
+                    if (!uploadHeaders.has("Content-Type") && file.type) {
+                        uploadHeaders.set("Content-Type", file.type);
+                    }
+                    const directUploadResponse = await fetch(plan.upload_url, {
+                        method: plan.upload_method || "PUT",
+                        headers: uploadHeaders,
+                        body: file,
+                    });
+                    if (!directUploadResponse.ok) {
+                        const failureMessage = directUploadResponse.status === 413
+                            ? "This file is too large for direct upload."
+                            : "Failed to upload asset bytes.";
+                        throw new Error(await getApiErrorMessage(directUploadResponse, failureMessage));
+                    }
+
+                    const finalizeResponse = await fetch(`${API_URL}/projects/${projectId}/upload-complete`, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            ...(key ? { "X-API-Key": key } : {}),
+                        },
+                        body: JSON.stringify({
+                            url: plan.url,
+                            filename: plan.name || file.name,
+                            content_type: (plan.mime_type ?? file.type) || null,
+                        }),
+                    });
+                    if (!finalizeResponse.ok) {
+                        throw new Error(await getApiErrorMessage(finalizeResponse, "Failed to analyze uploaded asset"));
+                    }
+                    const finalized = await finalizeResponse.json() as AssetUploadPlan;
+
+                    return {
+                        url: finalized.url || plan.url,
+                        name: finalized.name || plan.name || file.name,
+                        label: finalized.label ?? plan.label ?? undefined,
+                        asset_type: finalized.asset_type || plan.asset_type,
+                        mime_type: finalized.mime_type ?? plan.mime_type ?? file.type,
+                        text_content: finalized.text_content ?? undefined,
+                        ai_context: finalized.ai_context ?? undefined,
+                    };
+                }
+            }
+
+            const formData = new FormData();
+            formData.append("file", file);
             const res = await fetch(`${API_URL}/projects/${projectId}/upload`, {
                 method: "POST",
+                headers: key ? { "X-API-Key": key } : undefined,
                 body: formData,
             });
-            if (!res.ok) throw new Error("Upload failed");
+            if (!res.ok) {
+                const fallbackMessage = res.status === 413
+                    ? "This file is too large for the standard upload path. Try again and the app will use direct cloud upload for large audio/video/image files."
+                    : "Upload failed";
+                throw new Error(await getApiErrorMessage(res, fallbackMessage));
+            }
             return res.json();
         } catch (error) {
             throw toApiError("Upload failed", error);
@@ -608,6 +723,97 @@ export const api = {
             return res.json();
         } catch (error) {
             throw toApiError("Live Director Mode failed", error);
+        }
+    },
+
+    async updateStoryboardClipApproval(id: string, clipId: string, approved: boolean): Promise<ProjectState> {
+        const key = getStoredApiKey();
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/clips/${clipId}/image-approval`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(key ? { "X-API-Key": key } : {}),
+                },
+                body: JSON.stringify({ approved }),
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Failed to update storyboard approval"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Failed to update storyboard approval", error);
+        }
+    },
+
+    async updateFilmingClipApproval(id: string, clipId: string, approved: boolean): Promise<ProjectState> {
+        const key = getStoredApiKey();
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/clips/${clipId}/video-approval`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(key ? { "X-API-Key": key } : {}),
+                },
+                body: JSON.stringify({ approved }),
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Failed to update video approval"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Failed to update video approval", error);
+        }
+    },
+
+    async regenerateStoryboardClip(id: string, clipId: string): Promise<ProjectState> {
+        const key = getStoredApiKey();
+        const models = getStoredModels();
+        const preferences = getStoredPreferences();
+        const headers: Record<string, string> = {
+            "X-Orchestrator-Model": models.orchestrator,
+            "X-Critic-Model": models.critic,
+            "X-Text-Model": models.orchestrator,
+            "X-Image-Model": models.image,
+            "X-Image-Resolution": preferences.imageResolution,
+        };
+        if (key) headers["X-API-Key"] = key;
+
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/storyboard-clips/${clipId}/regenerate`, {
+                method: "POST",
+                headers,
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Failed to regenerate storyboard frame"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Failed to regenerate storyboard frame", error);
+        }
+    },
+
+    async uploadStoryboardFrame(
+        id: string,
+        clipId: string,
+        payload: { url: string; name: string }
+    ): Promise<ProjectState> {
+        const key = getStoredApiKey();
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/storyboard-clips/${clipId}/upload-frame`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(key ? { "X-API-Key": key } : {}),
+                },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Failed to replace storyboard frame"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Failed to replace storyboard frame", error);
         }
     }
 }

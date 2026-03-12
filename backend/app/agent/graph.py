@@ -12,11 +12,19 @@ import uuid
 import wave
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Dict, Any, List
 from urllib.parse import urlsplit
 from google import genai
-from .models import AgentStage, DirectorTurn, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
-from app.core.document_context import display_asset_label, normalize_document_text
+from .models import AgentStage, DirectorTurn, DirectorUndoEntry, MediaAsset, ProductionTimelineFragment, ProjectState, StageSummary, VideoClip
+from app.core.asset_context import (
+    analyze_uploaded_asset,
+    build_asset_reference_registry,
+    build_asset_semantic_context,
+    build_document_context,
+    normalize_asset_context_text,
+)
+from app.core.document_context import display_asset_label
 from app.image.providers import (
     DEFAULT_IMAGE_PROVIDER,
     get_image_provider,
@@ -31,6 +39,7 @@ from app.video.providers import (
     DEFAULT_VIDEO_PROVIDER,
     get_video_provider,
     resolve_video_provider_selection,
+    VideoGenerationReferenceAsset,
 )
 from app.genai_runtime import (
     build_genai_client,
@@ -85,6 +94,7 @@ FFMPEG = _find_ffmpeg()
 FFPROBE = _find_ffprobe(FFMPEG)
 VALID_VEO_DURATIONS = (4, 6, 8)
 TARGET_IMAGE_ASPECT_RATIO = "16:9"
+TARGET_REFERENCE_IMAGE_ASPECT_RATIO = "9:16"
 TARGET_VIDEO_ASPECT_RATIO = "16:9"
 DEFAULT_TARGET_IMAGE_SIZE = "4K"
 DEFAULT_TARGET_VIDEO_RESOLUTION = "1080p"
@@ -93,14 +103,30 @@ IMAGE_SIZE_DIMENSIONS = {
     "2K": (2048, 1152),
     "4K": (3840, 2160),
 }
+REFERENCE_IMAGE_SIZE_DIMENSIONS = {
+    "1K": (576, 1024),
+    "2K": (1152, 2048),
+    "4K": (2160, 3840),
+}
 VIDEO_RESOLUTION_DIMENSIONS = {
     "720p": (1280, 720),
     "1080p": (1920, 1080),
     "4k": (3840, 2160),
 }
+AUTO_GENERATED_ASSET_SOURCE = "agent"
+CHARACTER_REFERENCE_ASSET_PURPOSE = "character_reference"
+MAX_AUTO_CHARACTER_ASSETS = 4
+MAX_VEO_REFERENCE_IMAGES = 3
 STORYBOARD_PASS_SCORE = 8
 STORYBOARD_MAX_ATTEMPTS = 5
 STORYBOARD_MAX_REFERENCE_SHOTS = 6
+RESOURCE_EXHAUSTED_RETRY_ATTEMPTS = 1
+RESOURCE_EXHAUSTED_RETRY_DELAY_SECONDS = 15
+GENAI_TEXT_REQUEST_TIMEOUT_SECONDS = 120
+GENAI_IMAGE_REQUEST_TIMEOUT_SECONDS = 180
+DEFAULT_VERTEX_STORYBOARD_INTER_CLIP_DELAY_SECONDS = 0.5
+DEFAULT_VERTEX_FILMING_INTER_CLIP_DELAY_SECONDS = 0.5
+DEFAULT_DEVELOPER_INTER_CLIP_DELAY_SECONDS = 3.0
 LYRIA_PCM_SAMPLE_RATE = 48000
 LYRIA_PCM_CHANNELS = 2
 LYRIA_PCM_SAMPLE_WIDTH = 2
@@ -134,6 +160,26 @@ LIVE_DIRECTOR_CREATIVE_FIELDS = {
 def _normalize_director_similarity_text(text: str) -> str:
     lowered = re.sub(r"[^a-z0-9\s]+", " ", text.lower())
     return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _is_resource_exhausted_error(error: object) -> bool:
+    if error is None:
+        return False
+
+    class_name = error.__class__.__name__.lower()
+    if class_name == "resourceexhausted":
+        return True
+
+    raw_message = str(error or "").strip().lower()
+    if not raw_message:
+        return False
+
+    normalized_message = re.sub(r"[\s\-]+", " ", raw_message)
+    return (
+        "resource_exhausted" in raw_message
+        or "resource exhausted" in normalized_message
+        or "resource has been exhausted" in normalized_message
+    )
 
 
 def _looks_like_literal_director_text(requested_message: str, candidate_text: str) -> bool:
@@ -192,6 +238,12 @@ def _normalize_video_resolution_name(video_resolution: str | None) -> str:
     return DEFAULT_TARGET_VIDEO_RESOLUTION
 
 
+def _format_seconds_for_speech(value: float | int | None) -> str:
+    rounded_seconds = max(0, int(round(float(value or 0.0))))
+    unit = "second" if rounded_seconds == 1 else "seconds"
+    return f"{rounded_seconds} {unit}"
+
+
 def _local_media_path(path_or_url: str | None) -> str | None:
     """Convert a persisted media URL into a local filesystem path when possible."""
     if not path_or_url:
@@ -236,6 +288,15 @@ def _normalize_relevant_assets(raw_assets: Any) -> list[dict[str, str]]:
         normalized.append({"id": asset_id, "type": asset_type})
 
     return normalized
+
+
+def _asset_label_key(value: str | None) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _slugify_asset_label(value: str | None) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", _asset_label_key(value))
+    return normalized.strip("_") or uuid.uuid4().hex[:12]
 
 
 _SPECULATIVE_CRITIQUE_SNIPPETS = (
@@ -294,6 +355,7 @@ _SUBJECT_COUNT_HARD_FAIL_SNIPPETS = (
 )
 _MIN_CONFIDENT_VISUAL_HARD_FAIL = 0.85
 CRITIC_PANEL_SIZE = 3
+DIRECTOR_UNDO_STACK_LIMIT = 12
 IMAGE_CRITIC_LENSES = (
     "Independent reviewer A. Prioritize literal prompt faithfulness and visible continuity. Reject speculative defect claims.",
     "Independent reviewer B. Prioritize anatomy, subject count, and object integrity, but only when defects are directly visible.",
@@ -303,6 +365,33 @@ VIDEO_CRITIC_LENSES = (
     "Independent reviewer A. Prioritize scene faithfulness and visible continuity over time.",
     "Independent reviewer B. Prioritize temporal stability, artifact detection, and whether alleged defects are directly visible in the sampled frames.",
     "Independent reviewer C. Prioritize cinematic quality, motion readability, and skepticism toward speculative failure claims.",
+)
+_DIRECTOR_UNDO_PATTERNS = (
+    r"\bundo\b",
+    r"\brevert\b",
+    r"\brollback\b",
+    r"\broll back\b",
+    r"\bchange (?:it|that|this) back\b",
+    r"\bput (?:it|that|this) back\b",
+    r"\brestore (?:it|that|this|the last change|the previous version)\b",
+    r"\btake (?:it|that|this) back\b",
+)
+_DIRECTOR_UNDO_DISSATISFACTION_SNIPPETS = (
+    "not what i wanted",
+    "not what i meant",
+    "not what i had in mind",
+    "not what i was going for",
+    "that wasn't right",
+    "that wasnt right",
+    "that's not right",
+    "thats not right",
+    "that is not right",
+    "that was wrong",
+    "that's wrong",
+    "thats wrong",
+    "that is wrong",
+    "i don't like that",
+    "i dont like that",
 )
 
 
@@ -798,6 +887,78 @@ class FMVAgentPipeline:
             await result
         self._check_cancelled()
 
+    async def _sleep_with_cancellation_checks(self, delay_seconds: float) -> None:
+        remaining = max(0.0, float(delay_seconds))
+        while remaining > 0:
+            self._check_cancelled()
+            interval = min(1.0, remaining)
+            await asyncio.sleep(interval)
+            remaining -= interval
+        self._check_cancelled()
+
+    async def _run_with_resource_exhausted_retry(
+        self,
+        operation: Callable[[], Any],
+        *,
+        on_retry: Callable[[int, Exception], Any] | None = None,
+    ) -> Any:
+        retry_attempt = 0
+        while True:
+            try:
+                result = operation()
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+            except Exception as exc:
+                if retry_attempt >= RESOURCE_EXHAUSTED_RETRY_ATTEMPTS or not _is_resource_exhausted_error(exc):
+                    raise
+                retry_attempt += 1
+                if on_retry:
+                    on_retry(retry_attempt, exc)
+                await self._sleep_with_cancellation_checks(RESOURCE_EXHAUSTED_RETRY_DELAY_SECONDS)
+
+    async def _generate_content_with_timeout(
+        self,
+        *,
+        model: str,
+        contents: list[Any],
+        config: Any,
+        timeout_seconds: float = GENAI_TEXT_REQUEST_TIMEOUT_SECONDS,
+    ) -> Any:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=model,
+                    contents=contents,
+                    config=config,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Google model request timed out after {int(timeout_seconds)} seconds"
+            ) from exc
+
+    def _inter_clip_delay_seconds(self, phase: str) -> float:
+        env_var = {
+            "storyboarding": "FMV_STORYBOARD_INTER_CLIP_DELAY_SECONDS",
+            "filming": "FMV_FILMING_INTER_CLIP_DELAY_SECONDS",
+        }.get(phase)
+        override = os.getenv(env_var or "", "").strip() if env_var else ""
+        if override:
+            try:
+                return max(0.0, float(override))
+            except ValueError:
+                pass
+
+        if self.uses_vertex_ai:
+            if phase == "filming":
+                return DEFAULT_VERTEX_FILMING_INTER_CLIP_DELAY_SECONDS
+            return DEFAULT_VERTEX_STORYBOARD_INTER_CLIP_DELAY_SECONDS
+
+        return DEFAULT_DEVELOPER_INTER_CLIP_DELAY_SECONDS
+
     def _stage_summary_generated_at(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
@@ -878,62 +1039,23 @@ class FMVAgentPipeline:
         return f"shot {shot_number}" if shot_number is not None else clip.id
 
     def _document_context_text(self, state: ProjectState, *, max_chars: int = 6000) -> str:
-        snippets: list[str] = []
-        current_length = 0
-        for asset in state.assets:
-            if asset.type != "document" or not asset.text_content:
-                continue
-            snippet = (
-                f"{display_asset_label(asset.label, asset.name)}:\n"
-                f"{normalize_document_text(asset.text_content, max_chars=max_chars)}"
-            )
-            if current_length + len(snippet) > max_chars:
-                remaining = max_chars - current_length
-                if remaining <= 0:
-                    break
-                snippet = snippet[:remaining].rstrip() + "…"
-            snippets.append(snippet)
-            current_length += len(snippet)
-            if current_length >= max_chars:
-                break
-        return "\n\n".join(snippets)
+        return build_document_context(state.assets, max_chars=max_chars)
 
     def _asset_reference_registry_text(self, state: ProjectState, *, max_chars: int = 2000) -> str:
-        entries: list[str] = []
-        current_length = 0
-        for asset in state.assets:
-            label = display_asset_label(asset.label, asset.name)
-            if asset.type == "image":
-                entry = (
-                    f'- image "{label}" (file: {asset.name}). '
-                    f"If this label names a character, creature, hero prop, vehicle, or location from the screenplay, "
-                    f"treat this image as the canonical visual reference for that named entity anywhere it appears."
-                )
-            elif asset.type == "document":
-                entry = f'- document "{label}" (file: {asset.name}). Supplemental written context for the screenplay, lore, and world details.'
-            elif asset.type == "audio":
-                entry = f'- audio "{label}" (file: {asset.name}). Music or sound reference available to the project.'
-            else:
-                entry = f'- {asset.type} "{label}" (file: {asset.name}).'
+        return build_asset_reference_registry(state.assets, max_chars=max_chars)
 
-            if current_length + len(entry) > max_chars:
-                remaining = max_chars - current_length
-                if remaining <= 0:
-                    break
-                entry = entry[:remaining].rstrip() + "…"
-            entries.append(entry)
-            current_length += len(entry)
-            if current_length >= max_chars:
-                break
-        return "\n".join(entries) or "(none)"
+    def _asset_semantic_context_text(self, state: ProjectState, *, max_chars: int = 4000) -> str:
+        return build_asset_semantic_context(state.assets, max_chars=max_chars) or "(none)"
 
     def _project_context_block(self, state: ProjectState, *, max_document_chars: int = 6000) -> str:
         document_context = self._document_context_text(state, max_chars=max_document_chars) or "(none)"
         asset_registry = self._asset_reference_registry_text(state, max_chars=2000)
+        asset_context = self._asset_semantic_context_text(state, max_chars=3000)
         lore_text = state.additional_lore.strip() or "(none)"
         return (
             f"Additional Lore:\n{lore_text}\n\n"
             f"Uploaded Asset Registry:\n{asset_registry}\n\n"
+            f"Uploaded Asset Understanding:\n{asset_context}\n\n"
             f"Uploaded Document Context:\n{document_context}"
         )
 
@@ -942,6 +1064,39 @@ class FMVAgentPipeline:
             fragment
             for fragment in state.production_timeline
             if (fragment.track_type or "video") == "music"
+        ]
+
+    def _normalized_music_start_seconds(self, state: ProjectState, *, program_duration: float) -> float:
+        try:
+            raw_value = float(state.music_start_seconds or 0.0)
+        except (TypeError, ValueError):
+            raw_value = 0.0
+        clamped_value = max(0.0, raw_value)
+        if program_duration > 0:
+            clamped_value = min(clamped_value, max(0.0, round(program_duration - 0.1, 3)))
+        return round(clamped_value, 3)
+
+    def _default_music_production_fragments(
+        self,
+        state: ProjectState,
+        *,
+        program_duration: float,
+    ) -> list[ProductionTimelineFragment]:
+        if not state.music_url or program_duration <= 0:
+            return []
+
+        music_start = self._normalized_music_start_seconds(state, program_duration=program_duration)
+        duration = max(0.1, round(program_duration - music_start, 3))
+        return [
+            ProductionTimelineFragment(
+                id="music_frag_0",
+                track_type="music",
+                source_clip_id=None,
+                timeline_start=music_start,
+                source_start=0.0,
+                duration=duration,
+                audio_enabled=True,
+            )
         ]
 
     def _preserve_music_production_fragments(self, state: ProjectState) -> None:
@@ -972,6 +1127,7 @@ class FMVAgentPipeline:
             f"Project instructions: {state.instructions}",
             f"Additional lore: {state.additional_lore}",
             f"Uploaded asset registry: {self._asset_reference_registry_text(state, max_chars=1200)}",
+            f"Uploaded asset understanding: {self._asset_semantic_context_text(state, max_chars=1800)}",
             f"Uploaded document context: {self._document_context_text(state, max_chars=2000) or '(none)'}",
             f"Lyrics prompt: {state.lyrics_prompt}",
             f"Style prompt: {state.style_prompt}",
@@ -1130,6 +1286,83 @@ User instruction:
             return matching_fragments[0].id
         return None
 
+    def _infer_stage_reference_from_text(self, message: str) -> AgentStage | None:
+        normalized = message.strip().lower()
+        if not normalized:
+            return None
+
+        stage_patterns: list[tuple[AgentStage, tuple[str, ...]]] = [
+            (AgentStage.INPUT, (r"\binput(?: stage)?\b",)),
+            (AgentStage.LYRIA_PROMPTING, (r"\bmusic(?: stage| step)?\b", r"\blyria\b")),
+            (AgentStage.PLANNING, (r"\bplanning(?: stage| step)?\b", r"\bplan(?:ning)? step\b")),
+            (AgentStage.STORYBOARDING, (r"\bstoryboard(?:ing)?(?: stage| step)?\b",)),
+            (AgentStage.FILMING, (r"\bfilming(?: stage| step)?\b", r"\bvideo generation\b")),
+            (AgentStage.PRODUCTION, (r"\bproduction(?: stage| step)?\b", r"\bediting(?: stage| step)?\b")),
+            (AgentStage.COMPLETED, (r"\bcompleted(?: stage)?\b", r"\bfinal stage\b")),
+        ]
+        for stage, patterns in stage_patterns:
+            if any(re.search(pattern, normalized) for pattern in patterns):
+                return stage
+        return None
+
+    def _infer_navigation_from_message(
+        self,
+        message: str,
+        *,
+        review_stage: AgentStage,
+    ) -> tuple[str, AgentStage | None]:
+        normalized = message.strip().lower()
+        if not normalized:
+            return "stay", None
+
+        target_stage = self._infer_stage_reference_from_text(normalized)
+        move_command = bool(
+            re.search(
+                r"\b(?:go|move|take|jump|return|rewind|advance|proceed|continue)\b",
+                normalized,
+            )
+        )
+        explicit_rewind = bool(
+            re.search(
+                r"\b(?:go back|move back|back to|take me back|previous stage|prior stage|rewind|return to)\b",
+                normalized,
+            )
+        )
+        explicit_advance = bool(
+            re.search(
+                r"\b(?:next stage|move on|go ahead|go to the next stage|move to the next stage|proceed to the next stage|advance to the next stage|continue to the next stage)\b",
+                normalized,
+            )
+        )
+
+        if target_stage and move_command:
+            if target_stage == review_stage:
+                return "stay", target_stage
+            if target_stage.value == AgentStage.COMPLETED.value or target_stage.value == AgentStage.PRODUCTION.value:
+                if self._stage_to_order(review_stage) < self._stage_to_order(target_stage):
+                    return "advance", target_stage
+            if self._stage_to_order(target_stage) < self._stage_to_order(review_stage):
+                return "rewind", target_stage
+            return "advance", target_stage
+
+        if explicit_rewind:
+            return "rewind", target_stage
+        if explicit_advance:
+            return "advance", target_stage
+        return "stay", target_stage
+
+    def _stage_to_order(self, stage: AgentStage) -> int:
+        stage_order = [
+            AgentStage.INPUT,
+            AgentStage.LYRIA_PROMPTING,
+            AgentStage.PLANNING,
+            AgentStage.STORYBOARDING,
+            AgentStage.FILMING,
+            AgentStage.PRODUCTION,
+            AgentStage.COMPLETED,
+        ]
+        return stage_order.index(stage)
+
     def _latest_review_note(self, critiques: list[str]) -> str:
         if not critiques:
             return ""
@@ -1176,6 +1409,61 @@ User instruction:
         )
         state.director_log = state.director_log[-24:]
 
+    def _director_state_snapshot(self, state: ProjectState) -> dict[str, Any]:
+        return state.model_dump(exclude={"director_log", "director_undo_stack"})
+
+    def _push_director_undo_snapshot(
+        self,
+        state: ProjectState,
+        *,
+        snapshot_state: ProjectState,
+        message: str,
+        review_stage: AgentStage,
+        change_summary: list[str] | None = None,
+    ) -> None:
+        snapshot = self._director_state_snapshot(snapshot_state)
+        state.director_undo_stack.append(
+            DirectorUndoEntry(
+                id=f"director_undo_{uuid.uuid4().hex}",
+                message=message.strip(),
+                stage=review_stage.value,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                change_summary=change_summary or [],
+                snapshot=snapshot,
+            )
+        )
+        state.director_undo_stack = state.director_undo_stack[-DIRECTOR_UNDO_STACK_LIMIT:]
+
+    def _restore_latest_director_undo_snapshot(
+        self,
+        state: ProjectState,
+    ) -> tuple[ProjectState | None, DirectorUndoEntry | None]:
+        if not state.director_undo_stack:
+            return None, None
+
+        undo_entry = state.director_undo_stack[-1]
+        remaining_stack = [entry.model_copy(deep=True) for entry in state.director_undo_stack[:-1]]
+        restored_state = ProjectState.model_validate(undo_entry.snapshot)
+        restored_state.director_log = [turn.model_copy(deep=True) for turn in state.director_log]
+        restored_state.director_undo_stack = remaining_stack
+        return restored_state, undo_entry
+
+    def _is_live_director_undo_request(self, message: str) -> bool:
+        normalized = re.sub(r"\s+", " ", message.lower()).strip()
+        if not normalized:
+            return False
+
+        if any(re.search(pattern, normalized) for pattern in _DIRECTOR_UNDO_PATTERNS):
+            return True
+
+        if any(stage.value.replace("_", " ") in normalized for stage in AgentStage if stage != AgentStage.HALTED_FOR_REVIEW):
+            return False
+
+        if any(snippet in normalized for snippet in _DIRECTOR_UNDO_DISSATISFACTION_SNIPPETS):
+            return any(token in normalized for token in ("that", "this", "it", "last"))
+
+        return False
+
     def _trim_stage_summaries_to_stage(self, state: ProjectState, max_stage: AgentStage | str) -> None:
         stage_value = max_stage.value if isinstance(max_stage, AgentStage) else str(max_stage)
         stage_order = [stage.value for stage in AgentStage if stage != AgentStage.HALTED_FOR_REVIEW]
@@ -1195,6 +1483,7 @@ User instruction:
         clip.image_approved = False
         clip.image_score = None
         clip.image_reference_ready = False
+        clip.image_manual_override = False
         clip.video_prompt = None
         clip.video_url = None
         clip.video_critiques = []
@@ -1296,10 +1585,37 @@ User instruction:
         state.timeline.insert(insert_index, moved_clip)
         return moved_clip
 
+    def _delete_director_asset(self, state: ProjectState, *, asset_id: str) -> MediaAsset | None:
+        for index, asset in enumerate(state.assets):
+            if asset.id != asset_id:
+                continue
+
+            deleted_asset = state.assets.pop(index)
+            if deleted_asset.type == "audio":
+                if state.music_url == deleted_asset.url:
+                    state.music_url = None
+                state.production_timeline = [
+                    fragment
+                    for fragment in state.production_timeline
+                    if (fragment.track_type or "video") != "music"
+                ]
+                state.final_video_url = None
+                state.last_error = None
+                if state.music_workflow == "uploaded_track":
+                    state.music_workflow = "lyria3"
+                state.generated_music_provider = None
+                state.generated_music_lyrics_prompt = None
+                state.generated_music_style_prompt = None
+                state.generated_music_min_duration_seconds = None
+                state.generated_music_max_duration_seconds = None
+            return deleted_asset
+        return None
+
     def _normalize_music_production_fragments(
         self,
         fragments: list[ProductionTimelineFragment],
         *,
+        state: ProjectState,
         program_duration: float,
     ) -> list[ProductionTimelineFragment]:
         if program_duration <= 0:
@@ -1307,17 +1623,7 @@ User instruction:
         normalized_fragments: list[ProductionTimelineFragment] = []
         working_fragments = [fragment for fragment in fragments if fragment.duration > 0]
         if not working_fragments:
-            return [
-                ProductionTimelineFragment(
-                    id="music_frag_0",
-                    track_type="music",
-                    source_clip_id=None,
-                    timeline_start=0.0,
-                    source_start=0.0,
-                    duration=round(program_duration, 3),
-                    audio_enabled=True,
-                )
-            ]
+            return self._default_music_production_fragments(state, program_duration=program_duration)
 
         current_end = 0.0
         for index, fragment in enumerate(
@@ -1360,6 +1666,16 @@ User instruction:
             storyboard_changed = (previous_clip.storyboard_text or "").strip() != (clip.storyboard_text or "").strip()
             duration_changed = round(float(previous_clip.duration), 3) != round(float(clip.duration), 3)
             if storyboard_changed or duration_changed:
+                if previous_clip.image_manual_override and previous_clip.image_url:
+                    clip.image_prompt = previous_clip.image_prompt
+                    clip.image_url = previous_clip.image_url
+                    clip.image_critiques = list(previous_clip.image_critiques)
+                    clip.image_approved = previous_clip.image_approved
+                    clip.image_score = previous_clip.image_score
+                    clip.image_reference_ready = previous_clip.image_reference_ready
+                    clip.image_manual_override = True
+                    self._clear_clip_video_outputs(clip, preserve_prompt=False)
+                    continue
                 self._clear_clip_storyboard_outputs(clip)
 
         self._preserve_music_production_fragments(state)
@@ -1434,6 +1750,7 @@ User instruction:
         display_stage: AgentStage | str | None = None,
         selected_clip_id: str | None = None,
         selected_fragment_id: str | None = None,
+        selected_asset_id: str | None = None,
         source: str = "text",
         speech_mode: str = "standard",
     ) -> tuple[ProjectState, dict[str, Any]]:
@@ -1453,8 +1770,17 @@ User instruction:
         updated_state = state.model_copy(deep=True)
         previous_state = state.model_copy(deep=True)
 
+        self._append_director_turn(
+            updated_state,
+            role="user",
+            text=requested_message,
+            stage=review_stage,
+            source=source,
+        )
+
         selected_clip = next((clip for clip in updated_state.timeline if clip.id == selected_clip_id), None)
         selected_fragment = next((fragment for fragment in updated_state.production_timeline if fragment.id == selected_fragment_id), None)
+        selected_asset = next((asset for asset in updated_state.assets if asset.id == selected_asset_id), None)
         shot_lookup = self._shot_lookup(updated_state)
         explicit_shot_references = self._resolve_director_shot_references(updated_state, requested_message)
         explicit_shot_number = explicit_shot_references[0][0] if explicit_shot_references else None
@@ -1489,6 +1815,18 @@ User instruction:
             }
             for fragment in updated_state.production_timeline
         ]
+        asset_context = [
+            {
+                "asset_id": asset.id,
+                "label": display_asset_label(asset.label, asset.name),
+                "name": asset.name,
+                "type": asset.type,
+                "source": asset.source,
+                "purpose": asset.purpose,
+                "ai_context": normalize_asset_context_text((asset.ai_context or asset.text_content or "")[:400]),
+            }
+            for asset in updated_state.assets
+        ]
 
         prompt = f"""
 You are FMV Studio's Live Director agent.
@@ -1500,6 +1838,7 @@ Current reviewed stage: {review_stage.value}
 Actual saved pipeline stage: {updated_state.current_stage.value}
 Selected clip id: {selected_clip.id if selected_clip else ""}
 Selected fragment id: {selected_fragment.id if selected_fragment else ""}
+Selected asset id: {selected_asset.id if selected_asset else ""}
 Explicitly referenced shot number: {explicit_shot_number if explicit_shot_number is not None else ""}
 Explicitly referenced shot numbers: {json.dumps([shot_number for shot_number, _ in explicit_shot_references], ensure_ascii=True)}
 Resolved explicit clip id: {explicit_target_clip_id or ""}
@@ -1521,15 +1860,30 @@ Timeline clips:
 Production fragments:
 {json.dumps(fragment_context, ensure_ascii=True)}
 
+Project assets:
+{json.dumps(asset_context, ensure_ascii=True)}
+
 Supported operations:
+- director_operation: no-op or undo the last Live Director change
 - global_updates: screenplay, instructions, additional_lore, lyrics_prompt, style_prompt, music_min_duration_seconds, music_max_duration_seconds
 - one or more clip operations: each clip operation may update, insert, delete, or move a shot
+- one or more asset operations: each asset operation may rename, delete, or regenerate an image asset
 - one production audio toggle: target_fragment_id + fragment_updates.audio_enabled
 - optional stage navigation when the user asks to move forward or backward in the pipeline
 
 Rules:
+- You always have the full toolset available. Decide from semantic user intent, not trigger words or canned refusals.
 - If the user explicitly names a shot number, that exact shot is the primary target. Do not switch to a different shot.
 - If the user explicitly names multiple shot numbers, you may update multiple shots in one reply. Return one clip_operations entry per affected shot.
+- If the user refers to "this asset", "this reference", "this document", "this image", or "this track", prefer the selected_asset_id.
+- If the user wants to reverse the previous Live Director change, set director_operation to "undo_last_change". Do not say you lack access to edit history.
+- Use asset operation types:
+  - "update_label": rename an existing asset label
+  - "delete": remove an existing asset
+  - "regenerate_image": edit an existing image asset itself while keeping it as a reusable reference
+- Asset labels should be concise semantic names like characters, props, locations, or music references. Do not rewrite them into long descriptions.
+- If a labeled image asset exists for a character, prop, creature, vehicle, or location and the user wants that entity to look different, prefer regenerating that reference image asset instead of rewriting shots.
+- Do not delete a reference image asset just because the user wants that character or object changed. Regenerate the asset unless the user truly wants it removed.
 - If the user asks to proceed, continue, move on, or go to the next stage, set navigation_action to "advance".
 - If the user asks to go back, return, rewind, or revisit an earlier stage, set navigation_action to "rewind".
 - If the user explicitly names a stage like planning, storyboarding, filming, production, or music, set target_stage to that stage value.
@@ -1553,6 +1907,7 @@ Rules:
 
 Return STRICTLY as JSON matching this schema:
 {{
+  "director_operation": "none" | "undo_last_change",
   "reply_text": string,
   "change_summary": [string],
   "global_updates": {{
@@ -1574,6 +1929,14 @@ Return STRICTLY as JSON matching this schema:
       "video_prompt": string | null,
       "clear_target_image": boolean,
       "clear_target_video": boolean
+    }}
+  ],
+  "asset_operations": [
+    {{
+      "operation_type": "update_label" | "delete" | "regenerate_image",
+      "target_asset_id": string | null,
+      "label": string | null,
+      "generation_instruction": string | null
     }}
   ],
   "target_fragment_id": string | null,
@@ -1599,6 +1962,7 @@ User instruction:
             ),
         )
         action = json.loads(response.text)
+        director_operation = str(action.get("director_operation") or "none").strip().lower() or "none"
 
         reply_text = str(action.get("reply_text") or "I reviewed the request, but I did not apply any concrete changes.").strip()
         change_summary = [
@@ -1607,13 +1971,48 @@ User instruction:
             if str(item).strip()
         ]
 
-        self._append_director_turn(
-            updated_state,
-            role="user",
-            text=requested_message,
-            stage=review_stage,
-            source=source,
-        )
+        if director_operation == "undo_last_change":
+            restored_state, undo_entry = self._restore_latest_director_undo_snapshot(updated_state)
+            if restored_state is None or undo_entry is None:
+                reply_text = "There isn't a previous Live Director change to undo."
+                change_summary = []
+                response_state = updated_state
+            else:
+                reply_text = "Reverted the last Live Director change and restored the previous version."
+                change_summary = ["Reverted the last Live Director change."]
+                if undo_entry.change_summary:
+                    change_summary.append(f"Undid: {undo_entry.change_summary[0]}")
+                response_state = restored_state
+
+            agent_turn_id = f"director_{uuid.uuid4().hex}"
+            agent_audio_url = None
+            if speech_mode != "realtime":
+                agent_audio_url = await self._synthesize_director_reply_audio(
+                    response_state,
+                    turn_id=agent_turn_id,
+                    reply_text=reply_text,
+                )
+            self._append_director_turn(
+                response_state,
+                turn_id=agent_turn_id,
+                role="agent",
+                text=reply_text,
+                audio_url=agent_audio_url,
+                stage=response_state.current_stage,
+                source="agent",
+                applied_changes=change_summary,
+            )
+
+            return response_state, {
+                "reply_text": reply_text,
+                "applied_changes": change_summary,
+                "target_clip_id": None,
+                "target_fragment_id": None,
+                "target_asset_id": None,
+                "stage": response_state.current_stage.value,
+                "navigation_action": "stay",
+                "target_stage": None,
+            }
 
         target_clip = None
 
@@ -1685,11 +2084,19 @@ User instruction:
         storyboarding_changed_clip_ids: set[str] = set()
         filming_changed_clip_ids: set[str] = set()
         structural_change_summary: list[str] = []
+        targeted_asset_id: str | None = None
+        asset_changed = False
+        asset_image_changed_clip_ids: set[str] = set()
 
         def resolve_clip_by_id(clip_id: str | None) -> VideoClip | None:
             if not clip_id:
                 return None
             return next((clip for clip in updated_state.timeline if clip.id == clip_id), None)
+
+        def resolve_asset_by_id(asset_id: str | None) -> MediaAsset | None:
+            if not asset_id:
+                return None
+            return next((asset for asset in updated_state.assets if asset.id == asset_id), None)
 
         for operation_index, clip_operation in enumerate(clip_operations):
             operation_type = str(clip_operation.get("operation_type") or "update").strip().lower() or "update"
@@ -1826,6 +2233,76 @@ User instruction:
                 self._clear_clip_video_outputs(operation_target_clip, preserve_prompt=True)
                 filming_changed_clip_ids.add(operation_target_clip.id)
 
+        raw_asset_operations = action.get("asset_operations")
+        asset_operations: list[dict[str, Any]] = []
+        if isinstance(raw_asset_operations, list):
+            asset_operations = [item for item in raw_asset_operations if isinstance(item, dict)]
+
+        for asset_operation in asset_operations:
+            asset_operation_type = str(asset_operation.get("operation_type") or "").strip().lower()
+            target_asset_id = str(
+                asset_operation.get("target_asset_id")
+                or (selected_asset_id if len(asset_operations) == 1 else "")
+                or ""
+            ).strip() or None
+            if not target_asset_id:
+                continue
+
+            target_asset = resolve_asset_by_id(target_asset_id)
+            if target_asset is None:
+                continue
+
+            targeted_asset_id = target_asset.id
+
+            if asset_operation_type == "update_label":
+                next_label = str(asset_operation.get("label") or "").strip()
+                if not next_label:
+                    continue
+                target_asset.label = next_label
+                asset_changed = True
+                if not change_summary:
+                    change_summary.append(
+                        f"Renamed asset {display_asset_label(None, target_asset.name)} to {next_label}."
+                    )
+                continue
+
+            if asset_operation_type == "delete":
+                deleted_asset = self._delete_director_asset(updated_state, asset_id=target_asset.id)
+                if deleted_asset is None:
+                    continue
+                asset_changed = True
+                if not change_summary:
+                    change_summary.append(
+                        f"Deleted asset {display_asset_label(deleted_asset.label, deleted_asset.name)}."
+                    )
+                if targeted_asset_id == deleted_asset.id:
+                    targeted_asset_id = None
+                continue
+
+            if asset_operation_type == "regenerate_image":
+                generation_instruction = str(
+                    asset_operation.get("generation_instruction")
+                    or requested_message
+                    or ""
+                ).strip()
+                regenerated_asset = await self._regenerate_director_image_asset(
+                    updated_state,
+                    asset_id=target_asset.id,
+                    generation_instruction=generation_instruction,
+                )
+                if regenerated_asset is None:
+                    continue
+                targeted_asset_id = regenerated_asset.id
+                asset_changed = True
+                asset_image_changed_clip_ids |= await self._resolve_director_asset_affected_clip_ids(
+                    updated_state,
+                    asset=regenerated_asset,
+                )
+                if not change_summary:
+                    change_summary.append(
+                        f"Updated the reference image for {display_asset_label(regenerated_asset.label, regenerated_asset.name)}."
+                    )
+
         target_fragment_id = str(
             explicit_target_fragment_id
             or action.get("target_fragment_id")
@@ -1905,10 +2382,50 @@ User instruction:
                 if not change_summary:
                     change_summary.append("Updated the selected production fragment.")
 
+        if asset_image_changed_clip_ids:
+            for clip in updated_state.timeline:
+                if clip.id not in asset_image_changed_clip_ids:
+                    continue
+                self._clear_clip_storyboard_outputs(clip)
+
+            self._preserve_music_production_fragments(updated_state)
+            updated_state.final_video_url = None
+            updated_state.last_error = None
+            if updated_state.timeline:
+                if review_stage in {AgentStage.PLANNING, AgentStage.STORYBOARDING} and not rewind_to_stage:
+                    updated_state.current_stage = review_stage
+                else:
+                    updated_state.current_stage = AgentStage.STORYBOARDING
+                self._trim_stage_summaries_to_stage(updated_state, AgentStage.PLANNING)
+            if not change_summary:
+                if len(asset_image_changed_clip_ids) == 1:
+                    affected_clip = next(
+                        (clip for clip in updated_state.timeline if clip.id in asset_image_changed_clip_ids),
+                        None,
+                    )
+                    if affected_clip is not None:
+                        change_summary.append(
+                            f"Updated the image reference and cleared downstream outputs for {self._shot_label(affected_clip, self._shot_lookup(updated_state))}."
+                        )
+                if not change_summary:
+                    change_summary.append(
+                        f"Updated the image reference and cleared downstream outputs for {len(asset_image_changed_clip_ids)} affected shots."
+                    )
+
         if rewind_to_stage:
             self._rewind_state_to_stage(updated_state, rewind_to_stage)
             if not change_summary:
                 change_summary.append(f"Rewound the project to {rewind_to_stage.value}.")
+
+        project_changed = self._director_state_snapshot(updated_state) != self._director_state_snapshot(previous_state)
+        if project_changed or navigation_action != "stay":
+            self._push_director_undo_snapshot(
+                updated_state,
+                snapshot_state=previous_state,
+                message=requested_message,
+                review_stage=review_stage,
+                change_summary=change_summary,
+            )
 
         agent_turn_id = f"director_{uuid.uuid4().hex}"
         agent_audio_url = None
@@ -1934,6 +2451,7 @@ User instruction:
             "applied_changes": change_summary,
             "target_clip_id": target_clip.id if target_clip else None,
             "target_fragment_id": target_fragment.id if target_fragment else None,
+            "target_asset_id": targeted_asset_id,
             "stage": updated_state.current_stage.value,
             "navigation_action": navigation_action,
             "target_stage": target_stage.value if target_stage else None,
@@ -1950,9 +2468,9 @@ User instruction:
             total_duration = sum(clip.duration for clip in ordered_clips)
             longest_clip = max(ordered_clips, key=lambda clip: clip.duration)
             return (
-                f"Planning is ready. I mapped {len(ordered_clips)} shots across roughly {total_duration:.1f} seconds, "
+                f"Planning is ready. I mapped {len(ordered_clips)} shots across roughly {_format_seconds_for_speech(total_duration)}, "
                 "and the overall structure now has a clear visual arc. "
-                f"Please give {self._shot_label(longest_clip, shot_lookup)} extra attention because at {longest_clip.duration:.1f} seconds, "
+                f"Please give {self._shot_label(longest_clip, shot_lookup)} extra attention because at {_format_seconds_for_speech(longest_clip.duration)}, "
                 "it will have the biggest impact on pacing."
             )
 
@@ -2049,7 +2567,7 @@ User instruction:
             )
 
             positive = (
-                f"Production is ready. The cut is assembled into {len(fragments)} fragments across roughly {total_duration:.1f} seconds."
+                f"Production is ready. The cut is assembled into {len(fragments)} fragments across roughly {_format_seconds_for_speech(total_duration)}."
                 if fragments
                 else "Production is ready, but the edit timeline is still empty."
             )
@@ -2080,7 +2598,7 @@ User instruction:
             muted_fragments = [fragment for fragment in fragments if not fragment.audio_enabled]
 
             positive = (
-                f"The final render is ready at roughly {total_duration:.1f} seconds."
+                f"The final render is ready at roughly {_format_seconds_for_speech(total_duration)}."
                 if state.final_video_url
                 else "The final render step finished, but no export is currently attached."
             )
@@ -2295,6 +2813,9 @@ User instruction:
         *,
         input_path: str,
         output_path: str,
+        target_width: int,
+        target_height: int,
+        pad_color: str = "black",
     ) -> None:
         proc = await asyncio.create_subprocess_exec(
             FFMPEG,
@@ -2302,8 +2823,8 @@ User instruction:
             "-i", input_path,
             "-vf",
             (
-                f"scale={self.image_width}:{self.image_height}:force_original_aspect_ratio=decrease,"
-                f"pad={self.image_width}:{self.image_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color={pad_color},"
                 "setsar=1"
             ),
             "-frames:v", "1",
@@ -2321,11 +2842,14 @@ User instruction:
                 f"ffmpeg reported success but produced an empty normalized image for '{input_path}'"
             )
 
-    async def _normalize_storyboard_image_bytes(
+    async def _normalize_generated_image_bytes(
         self,
         *,
         image_bytes: bytes,
         image_mime_type: str,
+        target_width: int,
+        target_height: int,
+        pad_color: str,
     ) -> tuple[bytes, str]:
         is_png = image_mime_type == "image/png" and image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
         is_jpeg = image_mime_type in {"image/jpeg", "image/jpg"} and image_bytes.startswith(b"\xff\xd8")
@@ -2337,14 +2861,14 @@ User instruction:
         if is_png and len(image_bytes) >= 24:
             width = int.from_bytes(image_bytes[16:20], "big")
             height = int.from_bytes(image_bytes[20:24], "big")
-            if (width, height) == (self.image_width, self.image_height):
+            if (width, height) == (target_width, target_height):
                 return image_bytes, image_mime_type
 
         guessed_extension = mimetypes.guess_extension(image_mime_type) or ".png"
         if guessed_extension == ".jpe":
             guessed_extension = ".jpg"
 
-        with tempfile.TemporaryDirectory(prefix="fmv-storyboard-") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="fmv-generated-image-") as temp_dir:
             input_path = os.path.join(temp_dir, f"input{guessed_extension}")
             output_path = os.path.join(temp_dir, "output.png")
             with open(input_path, "wb") as file_handle:
@@ -2353,15 +2877,32 @@ User instruction:
             width, height = await self._probe_image_dimensions(input_path)
             if width is None or height is None:
                 return image_bytes, image_mime_type
-            if (width, height) != (self.image_width, self.image_height):
+            if (width, height) != (target_width, target_height):
                 await self._normalize_image_canvas(
                     input_path=input_path,
                     output_path=output_path,
+                    target_width=target_width,
+                    target_height=target_height,
+                    pad_color=pad_color,
                 )
                 with open(output_path, "rb") as file_handle:
                     return file_handle.read(), "image/png"
 
         return image_bytes, image_mime_type
+
+    async def _normalize_storyboard_image_bytes(
+        self,
+        *,
+        image_bytes: bytes,
+        image_mime_type: str,
+    ) -> tuple[bytes, str]:
+        return await self._normalize_generated_image_bytes(
+            image_bytes=image_bytes,
+            image_mime_type=image_mime_type,
+            target_width=self.image_width,
+            target_height=self.image_height,
+            pad_color="black",
+        )
 
     async def _normalize_video_canvas(
         self,
@@ -2424,18 +2965,27 @@ User instruction:
     async def _generate_storyboard_frame(self, *, contents: list[Any]) -> tuple[bytes, str]:
         return await self.image_provider.generate_frame(self, contents=contents)
 
-    async def _generate_google_storyboard_image(self, *, contents: list[Any]) -> tuple[bytes, str]:
-        result = await asyncio.to_thread(
-            self.client.models.generate_content,
+    async def _generate_google_image(
+        self,
+        *,
+        contents: list[Any],
+        aspect_ratio: str,
+        image_size: str,
+        target_width: int,
+        target_height: int,
+        pad_color: str = "black",
+    ) -> tuple[bytes, str]:
+        result = await self._generate_content_with_timeout(
             model=self.image_model,
             contents=contents,
             config=genai.types.GenerateContentConfig(
                 response_modalities=["IMAGE", "TEXT"],
                 image_config=genai.types.ImageConfig(
-                    aspect_ratio=self.image_aspect_ratio,
-                    image_size=self.image_size,
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
                 ),
-            )
+            ),
+            timeout_seconds=GENAI_IMAGE_REQUEST_TIMEOUT_SECONDS,
         )
 
         image_bytes_out = None
@@ -2449,10 +2999,29 @@ User instruction:
         if not image_bytes_out:
             raise RuntimeError(f"{self.image_provider.definition.label} returned no image data")
 
-        return await self._normalize_storyboard_image_bytes(
+        return await self._normalize_generated_image_bytes(
             image_bytes=image_bytes_out,
             image_mime_type=image_mime_type,
+            target_width=target_width,
+            target_height=target_height,
+            pad_color=pad_color,
         )
+
+    async def _generate_google_storyboard_image(self, *, contents: list[Any]) -> tuple[bytes, str]:
+        return await self._generate_google_image(
+            contents=contents,
+            aspect_ratio=self.image_aspect_ratio,
+            image_size=self.image_size,
+            target_width=self.image_width,
+            target_height=self.image_height,
+            pad_color="black",
+        )
+
+    def _resolve_google_ingredients_video_model(self, model_name: str) -> str:
+        normalized = (model_name or "").strip()
+        if normalized:
+            return normalized
+        return self.video_model
 
     def _sanitize_video_motion_prompt_text(self, text: str) -> str:
         cleaned = str(text or "").strip()
@@ -2504,14 +3073,34 @@ User instruction:
             f"{cleaned_prompt} "
             "Preserve the existing subject, scene, and style from the source frame. "
             "Single continuous shot. "
-            "Do not generate music, vocals, singing, soundtrack, beat, or score. "
-            "Diegetic ambient sound effects are acceptable, but there must be no musical content."
+            "Generate no musical audio whatsoever. "
+            "Do not generate music, vocals, singing, soundtrack, beat, melody, rhythm bed, or score. "
+            "If any audio is present, it must be limited to non-musical diegetic ambient sound effects only."
         )
 
-    async def _build_video_motion_prompt(self, clip: VideoClip, state: ProjectState) -> str:
+    async def _build_video_motion_prompt(
+        self,
+        clip: VideoClip,
+        state: ProjectState,
+        *,
+        relevant_assets: list[dict[str, str]] | None = None,
+        asset_lookup: dict[str, Any] | None = None,
+    ) -> str:
         storyboard_text = self._sanitize_video_motion_prompt_text(clip.storyboard_text or "")
         if not storyboard_text:
             return "Natural continuous motion within the scene."
+
+        relevant_assets = relevant_assets or []
+        asset_lookup = asset_lookup or {}
+        asset_labels = [
+            display_asset_label(
+                getattr(asset_lookup.get(asset.get("id")), "label", None),
+                getattr(asset_lookup.get(asset.get("id")), "name", asset.get("id")),
+            )
+            for asset in relevant_assets
+            if asset.get("id")
+        ]
+        asset_label_text = ", ".join(dict.fromkeys([label for label in asset_labels if label]))
 
         model_generate_content = getattr(getattr(self.client, "models", None), "generate_content", None)
         if not callable(model_generate_content):
@@ -2534,9 +3123,13 @@ Rules:
 - Avoid piling on loaded, overly literal, or redundant phrasing.
 - Do not mention audio, music, duration, aspect ratio, resolution, or editing.
 - Keep it as one continuous shot.
+- If ingredient reference images are provided for named characters or props, preserve their canonical identity and design.
 
 Storyboard description:
 {storyboard_text}
+
+Relevant ingredient labels:
+{asset_label_text or "(none)"}
 
 Return only the final motion prompt.
 """.strip()
@@ -2627,12 +3220,14 @@ Return only the rewritten motion prompt.
         prompt: str,
         duration_seconds: int,
         image_path: str | None,
+        reference_assets: list[VideoGenerationReferenceAsset] | None = None,
     ) -> bytes:
         return await self.video_provider.generate_clip(
             self,
             prompt=prompt,
             duration_seconds=duration_seconds,
             image_path=image_path,
+            reference_assets=reference_assets or [],
         )
 
     async def _generate_google_video_clip(
@@ -2641,6 +3236,8 @@ Return only the rewritten motion prompt.
         prompt: str,
         duration_seconds: int,
         image_path: str | None,
+        reference_assets: list[VideoGenerationReferenceAsset] | None = None,
+        _allow_ingredients_fallback: bool = True,
     ) -> bytes:
         client = self.media_client if self.uses_vertex_ai else self.client
         if client is None:
@@ -2648,8 +3245,18 @@ Return only the rewritten motion prompt.
         if not client:
             raise RuntimeError("Google video generation is not configured.")
 
+        reference_assets = reference_assets or []
+        uses_ingredients_mode = bool(reference_assets)
+        effective_model = self.video_model
+        requested_duration_seconds = duration_seconds
+        generation_duration_seconds = duration_seconds
+        if uses_ingredients_mode:
+            effective_model = self._resolve_google_ingredients_video_model(self.video_model)
+            # Veo reference-to-video currently requires 8-second generations on Vertex.
+            generation_duration_seconds = 8
+
         source_kwargs: dict[str, Any] = {"prompt": prompt}
-        if image_path and os.path.exists(image_path):
+        if not uses_ingredients_mode and image_path and os.path.exists(image_path):
             with open(image_path, "rb") as f:
                 img_bytes = f.read()
             mime = mimetypes.guess_type(image_path)[0] or "image/png"
@@ -2657,10 +3264,44 @@ Return only the rewritten motion prompt.
 
         config_kwargs: dict[str, Any] = {
             "number_of_videos": 1,
-            "duration_seconds": duration_seconds,
+            "duration_seconds": generation_duration_seconds,
             "aspect_ratio": self.video_aspect_ratio,
             "resolution": self.video_resolution,
+            "generate_audio": True,
         }
+        if uses_ingredients_mode:
+            reference_images = []
+            for reference_asset in reference_assets[:MAX_VEO_REFERENCE_IMAGES]:
+                if not os.path.exists(reference_asset.path):
+                    continue
+                with open(reference_asset.path, "rb") as file_handle:
+                    reference_images.append(
+                        genai.types.VideoGenerationReferenceImage(
+                            image=genai.types.Image(
+                                image_bytes=file_handle.read(),
+                                mime_type=mimetypes.guess_type(reference_asset.path)[0] or "image/png",
+                            ),
+                            reference_type=genai.types.VideoGenerationReferenceType.ASSET,
+                        )
+                    )
+            if not reference_images and image_path and os.path.exists(image_path):
+                with open(image_path, "rb") as file_handle:
+                    reference_images.append(
+                        genai.types.VideoGenerationReferenceImage(
+                            image=genai.types.Image(
+                                image_bytes=file_handle.read(),
+                                mime_type=mimetypes.guess_type(image_path)[0] or "image/png",
+                            ),
+                            reference_type=genai.types.VideoGenerationReferenceType.ASSET,
+                        )
+                    )
+            if not reference_images:
+                uses_ingredients_mode = False
+                effective_model = self.video_model
+                generation_duration_seconds = duration_seconds
+                config_kwargs["duration_seconds"] = generation_duration_seconds
+            else:
+                config_kwargs["reference_images"] = reference_images
         output_gcs_uri: str | None = None
         if self.uses_vertex_ai:
             output_gcs_uri = self._vertex_output_gcs_uri(
@@ -2668,8 +3309,14 @@ Return only the rewritten motion prompt.
             )
             config_kwargs["output_gcs_uri"] = output_gcs_uri
 
+        if not uses_ingredients_mode and "image" not in source_kwargs and image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+            mime = mimetypes.guess_type(image_path)[0] or "image/png"
+            source_kwargs["image"] = genai.types.Image(image_bytes=img_bytes, mime_type=mime)
+
         generate_kwargs: dict[str, Any] = dict(
-            model=self.video_model,
+            model=effective_model,
             source=genai.types.GenerateVideosSource(**source_kwargs),
             config=genai.types.GenerateVideosConfig(**config_kwargs),
         )
@@ -2692,6 +3339,21 @@ Return only the rewritten motion prompt.
             elapsed += poll_interval
             operation = await asyncio.to_thread(client.operations.get, operation)
 
+        operation_error = getattr(operation, "error", None)
+        if operation_error:
+            if isinstance(operation_error, dict):
+                error_message = str(
+                    operation_error.get("message")
+                    or operation_error.get("details")
+                    or operation_error
+                ).strip()
+            else:
+                error_message = str(getattr(operation_error, "message", None) or operation_error).strip()
+            if error_message:
+                raise RuntimeError(
+                    f"{self.video_provider.definition.label} generation failed: {error_message}"
+                )
+
         operation_payload = getattr(operation, "response", None) or getattr(operation, "result", None)
         generated_videos = self._extract_generated_videos(operation_payload)
         if not generated_videos and output_gcs_uri:
@@ -2703,13 +3365,47 @@ Return only the rewritten motion prompt.
                 return video_bytes
 
         if not generated_videos:
+            fallback_error: Exception | None = None
+            if (
+                uses_ingredients_mode
+                and _allow_ingredients_fallback
+                and image_path
+                and os.path.exists(image_path)
+            ):
+                try:
+                    return await self._generate_google_video_clip(
+                        prompt=prompt,
+                        duration_seconds=duration_seconds,
+                        image_path=image_path,
+                        reference_assets=[],
+                        _allow_ingredients_fallback=False,
+                    )
+                except Exception as exc:  # pragma: no cover - exercised via raised message
+                    fallback_error = exc
+
+            generation_context = (
+                f"model={effective_model}, "
+                f"mode={'ingredients' if uses_ingredients_mode else 'frame'}, "
+                f"refs={len(reference_assets)}, "
+                f"duration={requested_duration_seconds}s, "
+                f"resolution={self.video_resolution}"
+            )
             filter_reasons = self._extract_video_filter_reasons(operation_payload)
+            fallback_suffix = ""
+            if fallback_error is not None:
+                fallback_suffix = (
+                    f" Fell back to frame-only generation, but that also failed: {fallback_error}"
+                )
             if filter_reasons:
                 raise RuntimeError(
                     f"{self.video_provider.definition.label} returned no videos. "
-                    f"Possible filter reasons: {', '.join(filter_reasons)}"
+                    f"Possible filter reasons: {', '.join(filter_reasons)} "
+                    f"({generation_context}).{fallback_suffix}"
                 )
-            raise RuntimeError(f"{self.video_provider.definition.label} returned no videos")
+            raise RuntimeError(
+                f"{self.video_provider.definition.label} returned no videos "
+                f"({generation_context}).{fallback_suffix}"
+            )
 
         generated_video = generated_videos[0]
         video_bytes = getattr(generated_video, "video_bytes", None)
@@ -2729,6 +3425,21 @@ Return only the rewritten motion prompt.
             )
         if not video_bytes:
             raise RuntimeError(f"{self.video_provider.definition.label} returned no downloadable video bytes")
+
+        if uses_ingredients_mode and generation_duration_seconds != requested_duration_seconds:
+            with tempfile.TemporaryDirectory(prefix="fmv-veo-trim-") as temp_dir:
+                input_path = os.path.join(temp_dir, "input.mp4")
+                output_path = os.path.join(temp_dir, "output.mp4")
+                with open(input_path, "wb") as file_handle:
+                    file_handle.write(video_bytes)
+                await self._normalize_video_canvas(
+                    input_path=input_path,
+                    output_path=output_path,
+                    include_audio=True,
+                    duration=float(duration_seconds),
+                )
+                with open(output_path, "rb") as file_handle:
+                    return file_handle.read()
 
         return video_bytes
 
@@ -3003,6 +3714,154 @@ Return only the rewritten motion prompt.
 
         return None
 
+    async def _regenerate_director_image_asset(
+        self,
+        state: ProjectState,
+        *,
+        asset_id: str,
+        generation_instruction: str,
+    ) -> MediaAsset | None:
+        target_asset = next((asset for asset in state.assets if asset.id == asset_id), None)
+        if target_asset is None or target_asset.type != "image":
+            return None
+
+        asset_path = _local_media_path(target_asset.url)
+        if not asset_path or not os.path.exists(asset_path):
+            return None
+
+        current_bytes = Path(asset_path).read_bytes()
+        current_mime_type = (
+            target_asset.mime_type
+            or mimetypes.guess_type(asset_path)[0]
+            or "image/png"
+        )
+        probed_width, probed_height = await self._probe_image_dimensions(asset_path)
+        is_portrait_reference = (
+            getattr(target_asset, "purpose", None) == CHARACTER_REFERENCE_ASSET_PURPOSE
+            or (
+                isinstance(probed_width, int)
+                and isinstance(probed_height, int)
+                and probed_height > probed_width
+            )
+        )
+
+        if is_portrait_reference:
+            target_width, target_height = REFERENCE_IMAGE_SIZE_DIMENSIONS[self.image_size]
+            aspect_ratio = TARGET_REFERENCE_IMAGE_ASPECT_RATIO
+        else:
+            target_width, target_height = IMAGE_SIZE_DIMENSIONS[self.image_size]
+            aspect_ratio = TARGET_IMAGE_ASPECT_RATIO
+
+        pad_color = (
+            "white"
+            if getattr(target_asset, "purpose", None) == CHARACTER_REFERENCE_ASSET_PURPOSE
+            else "black"
+        )
+        asset_label = display_asset_label(target_asset.label, target_asset.name)
+        existing_context = normalize_asset_context_text(
+            target_asset.ai_context or target_asset.text_content or "",
+            max_chars=900,
+        )
+        instruction_text = str(generation_instruction or "").strip()
+        if not instruction_text:
+            return None
+
+        prompt_lines = [
+            "You are updating a labeled visual reference asset for FMV Studio.",
+            f"Asset label: {asset_label}",
+            f"Asset purpose: {getattr(target_asset, 'purpose', None) or 'reference_image'}",
+        ]
+        if existing_context:
+            prompt_lines.append(f"Existing AI-understood context: {existing_context}")
+        prompt_lines.extend(
+            [
+                f"Director request: {instruction_text}",
+                "Edit the provided image itself. Do not reinterpret this as a shot rewrite.",
+                "Preserve the same canonical subject identity unless the director explicitly requests a different identity or design.",
+                "Keep the result as a clean reusable reference image for downstream storyboard and video generation.",
+            ]
+        )
+        if getattr(target_asset, "purpose", None) == CHARACTER_REFERENCE_ASSET_PURPOSE:
+            prompt_lines.extend(
+                [
+                    "Keep a single centered character portrait.",
+                    "Use a seamless neutral white background with even clean studio lighting.",
+                    "No environment, no text, no extra people, no collage.",
+                ]
+            )
+
+        image_bytes, image_mime_type = await self._run_with_resource_exhausted_retry(
+            lambda: self._generate_google_image(
+                contents=[
+                    "\n".join(prompt_lines),
+                    genai.types.Part.from_bytes(
+                        data=current_bytes,
+                        mime_type=current_mime_type,
+                    ),
+                ],
+                aspect_ratio=aspect_ratio,
+                image_size=self.image_size,
+                target_width=target_width,
+                target_height=target_height,
+                pad_color=pad_color,
+            )
+        )
+
+        relative_path = Path(urlsplit(target_asset.url).path).name or f"{state.project_id}_{target_asset.id}.png"
+        target_asset.url = self._write_project_asset_bytes(
+            relative_path,
+            image_bytes,
+            content_type=image_mime_type,
+        )
+        target_asset.mime_type = image_mime_type
+        target_asset.ai_context = await analyze_uploaded_asset(
+            client=self.client,
+            filename=target_asset.name,
+            label=target_asset.label,
+            mime_type=image_mime_type,
+            asset_type="image",
+            content=image_bytes,
+        )
+        return target_asset
+
+    async def _resolve_director_asset_affected_clip_ids(
+        self,
+        state: ProjectState,
+        *,
+        asset: MediaAsset,
+    ) -> set[str]:
+        if asset.type != "image" or not state.timeline or not self.client:
+            return set()
+
+        asset_path = _local_media_path(asset.url)
+        if not asset_path or not os.path.exists(asset_path):
+            return set()
+
+        try:
+            relevance_map = await self._build_storyboard_relevance_map(
+                state.timeline,
+                image_assets=[(asset, asset_path)],
+                screenplay=state.screenplay,
+            )
+        except Exception:
+            relevance_map = {}
+
+        affected_clip_ids = {
+            clip.id
+            for clip in state.timeline
+            if any(
+                item.get("id") == asset.id
+                for item in _normalize_relevant_assets(relevance_map.get(clip.id, []))
+            )
+        }
+        if affected_clip_ids:
+            return affected_clip_ids
+
+        if getattr(asset, "purpose", None) == CHARACTER_REFERENCE_ASSET_PURPOSE:
+            return {clip.id for clip in state.timeline}
+
+        return set()
+
     async def _generate_music_track(
         self,
         state: ProjectState,
@@ -3253,9 +4112,30 @@ Existing style prompt:
             current_time += duration
         music_fragments = self._normalize_music_production_fragments(
             self._music_production_fragments(state) if state.music_url else [],
+            state=state,
             program_duration=current_time,
         ) if state.music_url else []
         state.production_timeline = fragments + music_fragments
+
+    def _can_sync_whole_clip_fragment_durations(
+        self,
+        ordered_clips: list[VideoClip],
+        video_fragments: list[ProductionTimelineFragment],
+    ) -> bool:
+        if not ordered_clips or len(video_fragments) != len(ordered_clips):
+            return False
+
+        clip_ids = {clip.id for clip in ordered_clips}
+        seen_clip_ids: set[str] = set()
+        for fragment in video_fragments:
+            source_clip_id = fragment.source_clip_id or ""
+            if not source_clip_id or source_clip_id not in clip_ids or source_clip_id in seen_clip_ids:
+                return False
+            if abs(float(fragment.source_start)) > 1e-3:
+                return False
+            seen_clip_ids.add(source_clip_id)
+
+        return len(seen_clip_ids) == len(ordered_clips)
 
     def _reconcile_production_timeline(self, state: ProjectState) -> None:
         if not state.timeline:
@@ -3286,6 +4166,10 @@ Existing style prompt:
             self._initialize_production_timeline(state)
             return
 
+        sync_whole_clip_durations = self._can_sync_whole_clip_fragment_durations(
+            ordered_clips,
+            video_fragments,
+        )
         normalized_fragments: list[ProductionTimelineFragment] = []
         current_time = 0.0
         for fragment in sorted(
@@ -3298,14 +4182,14 @@ Existing style prompt:
                 return
 
             clip_duration = max(0.1, float(clip.duration))
-            source_start = max(0.0, float(fragment.source_start))
+            source_start = 0.0 if sync_whole_clip_durations else max(0.0, float(fragment.source_start))
             if source_start >= clip_duration:
                 self._initialize_production_timeline(state)
                 return
 
             remaining_duration = max(0.1, clip_duration - source_start)
-            duration = max(0.1, float(fragment.duration))
-            if duration > remaining_duration + 1e-3:
+            duration = clip_duration if sync_whole_clip_durations else max(0.1, float(fragment.duration))
+            if not sync_whole_clip_durations and duration > remaining_duration + 1e-3:
                 self._initialize_production_timeline(state)
                 return
 
@@ -3324,6 +4208,7 @@ Existing style prompt:
 
         music_fragments = self._normalize_music_production_fragments(
             self._music_production_fragments(state) if state.music_url else [],
+            state=state,
             program_duration=current_time,
         ) if state.music_url else []
         state.production_timeline = normalized_fragments + music_fragments
@@ -3351,11 +4236,15 @@ Existing style prompt:
         try:
             if state.current_stage == AgentStage.INPUT:
                 if state.music_workflow == "uploaded_track" and state.music_url:
-                    state = await self.node_planning(state)
+                    state = await self._run_with_resource_exhausted_retry(
+                        lambda: self.node_planning(state),
+                    )
                 else:
                     # Generated or manually imported song workflows should always revisit
                     # the Music stage from Input, even if a prior render still exists.
-                    state = await self.node_music_prompting(state)
+                    state = await self._run_with_resource_exhausted_retry(
+                        lambda: self.node_music_prompting(state),
+                    )
             
             elif state.current_stage == AgentStage.LYRIA_PROMPTING:
                 blocking_message = self._music_prompting_blocking_message(state)
@@ -3364,31 +4253,50 @@ Existing style prompt:
                     state.current_stage = AgentStage.LYRIA_PROMPTING
                     return state
                 state.last_error = None
-                state = await self.node_planning(state)
+                state = await self._run_with_resource_exhausted_retry(
+                    lambda: self.node_planning(state),
+                )
             
             elif state.current_stage == AgentStage.PLANNING:
                 # Assuming HITL approved the planning phase
-                state = await self.node_storyboarding(state)
+                state = await self._run_with_resource_exhausted_retry(
+                    lambda: self.node_storyboarding(state),
+                )
             
             elif state.current_stage == AgentStage.STORYBOARDING:
                 if all(clip.image_approved for clip in state.timeline):
-                    state = await self.node_filming(state)
+                    state = await self._run_with_resource_exhausted_retry(
+                        lambda: self.node_filming(state),
+                    )
                 else:
-                    state = await self.node_storyboarding(state)
+                    state = await self._run_with_resource_exhausted_retry(
+                        lambda: self.node_storyboarding(state),
+                    )
             
             elif state.current_stage == AgentStage.FILMING:
                 if all(clip.video_approved and clip.video_url for clip in state.timeline):
                     state = self.node_prepare_production(state)
                 else:
-                    state = await self.node_filming(state)
+                    state = await self._run_with_resource_exhausted_retry(
+                        lambda: self.node_filming(state),
+                    )
 
             elif state.current_stage == AgentStage.PRODUCTION:
-                state = await self.node_production(state)
+                state = await self._run_with_resource_exhausted_retry(
+                    lambda: self.node_production(state),
+                )
 
             elif state.current_stage == AgentStage.HALTED_FOR_REVIEW:
                 state.current_stage = self._infer_resume_stage(state)
                 state.last_error = None
                 return await self.run_pipeline(state)
+
+            if state.current_stage == AgentStage.PRODUCTION and (state.last_error or not state.final_video_url):
+                self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
+
+            if state.current_stage == AgentStage.COMPLETED and (state.last_error or not state.final_video_url):
+                state.current_stage = AgentStage.PRODUCTION
+                self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
 
             stage_summary_key = state.current_stage.value
             if (
@@ -3443,7 +4351,7 @@ Existing style prompt:
             {{ "lyrics_prompt": string, "style_prompt": string }}
             """
             
-            response = self.client.models.generate_content(
+            response = await self._generate_content_with_timeout(
                 model=self.orchestrator_model,
                 contents=[prompt],
                 config=self._orchestrator_config(
@@ -3487,13 +4395,20 @@ Existing style prompt:
             audio_duration_seconds = await self._measure_audio_duration_seconds(state.music_url)
             audio_duration_hint = ""
             if audio_duration_seconds is not None:
+                music_start_seconds = self._normalized_music_start_seconds(
+                    state,
+                    program_duration=audio_duration_seconds + max(0.0, float(state.music_start_seconds or 0.0)) + 0.1,
+                )
+                target_total_seconds = audio_duration_seconds + music_start_seconds
                 audio_duration_hint = (
                     f"\n            DURATION CONSTRAINT (HARD RULE):\n"
                     f"            The audio track is exactly {audio_duration_seconds:.1f} seconds long.\n"
-                    f"            Your clips MUST sum to approximately {audio_duration_seconds:.1f} seconds total.\n"
+                    f"            The music begins at {music_start_seconds:.1f} seconds into the visual plan.\n"
+                    f"            Your clips MUST sum to approximately {target_total_seconds:.1f} seconds total so there is room for the full song after that lead-in.\n"
+                    f"            Shots before {music_start_seconds:.1f}s are pre-music intro shots.\n"
                     f"            Generate the minimum number of clips needed to fill this duration naturally.\n"
                     f"            Every clip duration MUST be exactly one of: 4, 6, or 8 seconds.\n"
-                    f"            Aim for {max(1, int(audio_duration_seconds // 6))}–{max(2, int(audio_duration_seconds // 4))} clips."
+                    f"            Aim for {max(1, int(target_total_seconds // 6))}–{max(2, int(target_total_seconds // 4))} clips."
                 )
 
             # ── Upload audio for multimodal beat alignment ───────────────────
@@ -3528,7 +4443,7 @@ Existing style prompt:
             [{{ "duration": float, "storyboard_text": string }}]
             """
             
-            response = self.client.models.generate_content(
+            response = await self._generate_content_with_timeout(
                 model=self.orchestrator_model,
                 contents=media_files + [prompt],
                 config=self._orchestrator_config(
@@ -3546,9 +4461,14 @@ Existing style prompt:
                     proposed_storyboard_texts.append(clip.get("storyboard_text", ""))
                     proposed_durations.append(float(clip.get("duration", 6.0)))
 
+                target_total_seconds = (
+                    audio_duration_seconds + max(0.0, float(state.music_start_seconds or 0.0))
+                    if audio_duration_seconds is not None
+                    else None
+                )
                 normalized_durations = _normalize_veo_duration_sequence(
                     proposed_durations,
-                    target_total=audio_duration_seconds,
+                    target_total=target_total_seconds,
                 )
                 current_time = 0.0
                 for idx, (storyboard_text, duration) in enumerate(zip(proposed_storyboard_texts, normalized_durations)):
@@ -3562,8 +4482,11 @@ Existing style prompt:
             except Exception as e:
                 raise RuntimeError(f"Failed to parse Gemini output: {e}\nResponse: {response.text}")
 
-        # Breakpoint for HITL review
         state.current_stage = AgentStage.PLANNING
+        self._remove_generated_character_assets(state)
+        if self.client:
+            await self._ensure_generated_character_assets(state)
+        # Breakpoint for HITL review
         return state
 
     async def _build_asset_relevance_map(
@@ -3596,7 +4519,11 @@ Existing style prompt:
 
         for asset in image_assets:
             asset_label = display_asset_label(getattr(asset, "label", None), asset.name)
-            parts.append(f"[ASSET_ID: {asset.id}  |  Label: {asset_label}  |  File: {asset.name}]")
+            asset_context = getattr(asset, "ai_context", None)
+            descriptor = f"[ASSET_ID: {asset.id}  |  Label: {asset_label}  |  File: {asset.name}]"
+            if asset_context:
+                descriptor += f"\nAI context: {asset_context}"
+            parts.append(descriptor)
             asset_path = _local_media_path(asset.url)
             if not asset_path or not os.path.exists(asset_path):
                 continue
@@ -3624,7 +4551,7 @@ Existing style prompt:
         )
 
         try:
-            response = self.client.models.generate_content(
+            response = await self._generate_content_with_timeout(
                 model=self.orchestrator_model,
                 contents=parts,
                 config=self._orchestrator_config(
@@ -3684,7 +4611,7 @@ Return your answer STRICTLY as a JSON object:
 {{"relevant_indices": [<int>, ...]}}
 """
         try:
-            response = self.client.models.generate_content(
+            response = await self._generate_content_with_timeout(
                 model=self.orchestrator_model,
                 contents=[prompt],
                 config=self._orchestrator_config(
@@ -3711,6 +4638,475 @@ Return your answer STRICTLY as a JSON object:
             print(f"[select_previous_shots] Failed: {e}")
             return []
 
+    def _build_storyboard_asset_context(
+        self,
+        state: ProjectState,
+    ) -> tuple[list[tuple[Any, str]], dict[str, tuple[bytes, str]], dict[str, Any]]:
+        image_assets: list[tuple[Any, str]] = []
+        for asset in state.assets:
+            if asset.type != "image":
+                continue
+            asset_path = _local_media_path(asset.url)
+            if asset_path and os.path.exists(asset_path):
+                image_assets.append((asset, asset_path))
+
+        asset_bytes: dict[str, tuple[bytes, str]] = {}
+        asset_lookup = {asset.id: asset for asset, _ in image_assets}
+        for asset, asset_path in image_assets:
+            with open(asset_path, "rb") as f:
+                img_bytes = f.read()
+            mime = mimetypes.guess_type(asset_path)[0] or "image/jpeg"
+            asset_bytes[asset.id] = (img_bytes, mime)
+
+        return image_assets, asset_bytes, asset_lookup
+
+    def _remove_generated_character_assets(self, state: ProjectState) -> None:
+        state.assets = [
+            asset
+            for asset in state.assets
+            if not (
+                asset.type == "image"
+                and getattr(asset, "source", "user") == AUTO_GENERATED_ASSET_SOURCE
+                and getattr(asset, "purpose", None) == CHARACTER_REFERENCE_ASSET_PURPOSE
+            )
+        ]
+
+    async def _plan_generated_character_assets(self, state: ProjectState) -> list[dict[str, str]]:
+        if not self.client or not state.timeline or len(state.timeline) < 2:
+            return []
+
+        existing_labels = {
+            _asset_label_key(display_asset_label(asset.label, asset.name))
+            for asset in state.assets
+            if asset.type == "image"
+        }
+
+        prompt = f"""
+You are preparing canonical character reference assets for an AI music video pipeline.
+
+Given the screenplay, project context, and the planned shot list, identify up to {MAX_AUTO_CHARACTER_ASSETS} recurring characters or creatures that need appearance consistency across multiple shots.
+
+Rules:
+- Only include subjects that clearly need identity continuity across more than one shot.
+- Exclude any subject that already has a labeled image asset.
+- Prefer exact names already used in the screenplay or shot descriptions.
+- Return concise stable labels that can be reused across storyboard and video generation.
+- Each generation_prompt must describe a single subject only.
+- Each generation_prompt must explicitly call for a centered portrait on a seamless neutral white background with clean studio lighting.
+- Do not include scene backgrounds, extra people, text, graphic design, or multiple poses.
+- Keep props minimal unless they are essential to the character identity.
+
+Existing labeled image assets:
+{self._asset_reference_registry_text(state, max_chars=1800)}
+
+Planned shots:
+{json.dumps([{"id": clip.id, "storyboard_text": clip.storyboard_text} for clip in state.timeline], ensure_ascii=False)}
+
+Project context:
+{self._project_context_block(state, max_document_chars=2500)}
+
+Return STRICTLY as a JSON list:
+[{{"label": string, "generation_prompt": string, "why": string}}]
+""".strip()
+
+        try:
+            response = await self._generate_content_with_timeout(
+                model=self.orchestrator_model,
+                contents=[prompt],
+                config=self._orchestrator_config(
+                    response_mime_type="application/json",
+                    thinking_budget=2048,
+                    temperature=0.2,
+                ),
+            )
+            parsed = json.loads(response.text)
+        except Exception:
+            return []
+
+        if not isinstance(parsed, list):
+            return []
+
+        planned_assets: list[dict[str, str]] = []
+        seen_labels: set[str] = set()
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            generation_prompt = str(item.get("generation_prompt") or "").strip()
+            why = str(item.get("why") or "").strip()
+            label_key = _asset_label_key(label)
+            if not label or not generation_prompt or not label_key:
+                continue
+            if label_key in existing_labels or label_key in seen_labels:
+                continue
+            planned_assets.append(
+                {
+                    "label": label,
+                    "generation_prompt": generation_prompt,
+                    "why": why,
+                }
+            )
+            seen_labels.add(label_key)
+            if len(planned_assets) >= MAX_AUTO_CHARACTER_ASSETS:
+                break
+
+        return planned_assets
+
+    async def _generate_character_reference_asset(
+        self,
+        *,
+        state: ProjectState,
+        label: str,
+        generation_prompt: str,
+        why: str,
+    ) -> MediaAsset:
+        portrait_width, portrait_height = REFERENCE_IMAGE_SIZE_DIMENSIONS[self.image_size]
+        final_prompt = (
+            f"{generation_prompt.strip().rstrip('.')} "
+            "Single centered character portrait reference. "
+            "Portrait aspect ratio. Neutral seamless white studio background. "
+            "Even clean studio lighting. No environment, no text, no extra people, no collage."
+        )
+        image_bytes, image_mime_type = await self._generate_google_image(
+            contents=[final_prompt],
+            aspect_ratio=TARGET_REFERENCE_IMAGE_ASPECT_RATIO,
+            image_size=self.image_size,
+            target_width=portrait_width,
+            target_height=portrait_height,
+            pad_color="white",
+        )
+
+        slug = _slugify_asset_label(label)
+        asset_path = PROJECTS_DIR / f"{state.project_id}_character_{slug}.png"
+        os.makedirs(PROJECTS_DIR, exist_ok=True)
+        with open(asset_path, "wb") as file_handle:
+            file_handle.write(image_bytes)
+
+        return MediaAsset(
+            id=f"asset_auto_character_{slug}",
+            url=self._sync_local_project_artifact(
+                asset_path,
+                relative_path=asset_path.name,
+                content_type=image_mime_type,
+            ),
+            type="image",
+            name=f"{label} character reference.png",
+            label=label,
+            mime_type=image_mime_type,
+            ai_context=normalize_asset_context_text(
+                f"Auto-generated canonical portrait reference for {label}. {why}".strip()
+            ),
+            source=AUTO_GENERATED_ASSET_SOURCE,
+            purpose=CHARACTER_REFERENCE_ASSET_PURPOSE,
+        )
+
+    async def _ensure_generated_character_assets(self, state: ProjectState) -> None:
+        if not self.client or not state.timeline:
+            return
+
+        user_image_labels = {
+            _asset_label_key(display_asset_label(asset.label, asset.name))
+            for asset in state.assets
+            if asset.type == "image" and getattr(asset, "source", "user") != AUTO_GENERATED_ASSET_SOURCE
+        }
+        state.assets = [
+            asset
+            for asset in state.assets
+            if not (
+                asset.type == "image"
+                and getattr(asset, "source", "user") == AUTO_GENERATED_ASSET_SOURCE
+                and getattr(asset, "purpose", None) == CHARACTER_REFERENCE_ASSET_PURPOSE
+                and _asset_label_key(display_asset_label(asset.label, asset.name)) in user_image_labels
+            )
+        ]
+
+        planned_assets = await self._plan_generated_character_assets(state)
+        if not planned_assets:
+            return
+
+        existing_labels = {
+            _asset_label_key(display_asset_label(asset.label, asset.name))
+            for asset in state.assets
+            if asset.type == "image"
+        }
+
+        for planned_asset in planned_assets:
+            label = planned_asset["label"]
+            label_key = _asset_label_key(label)
+            if label_key in existing_labels:
+                continue
+            try:
+                generated_asset = await self._run_with_resource_exhausted_retry(
+                    lambda: self._generate_character_reference_asset(
+                        state=state,
+                        label=label,
+                        generation_prompt=planned_asset["generation_prompt"],
+                        why=planned_asset.get("why", ""),
+                    )
+                )
+            except Exception as exc:
+                print(f"[character_asset] Failed to generate reference for '{label}': {exc}")
+                continue
+
+            state.assets.append(generated_asset)
+            existing_labels.add(label_key)
+            await self._persist_state(state)
+
+    async def _build_storyboard_relevance_map(
+        self,
+        clips: list[VideoClip],
+        *,
+        image_assets: list[tuple[Any, str]],
+        screenplay: str | None = None,
+    ) -> dict[str, Any]:
+        if not image_assets or not clips:
+            return {}
+
+        raw_relevance_map = await self._build_asset_relevance_map(
+            [asset for asset, _ in image_assets],
+            clips,
+            screenplay=screenplay or "",
+        )
+        if isinstance(raw_relevance_map, dict):
+            return raw_relevance_map
+
+        print(
+            f"[asset_relevance_map] Ignoring unexpected relevance map type: "
+            f"{type(raw_relevance_map).__name__}"
+        )
+        return {}
+
+    def _build_video_reference_assets(
+        self,
+        *,
+        clip: VideoClip,
+        relevant_assets: list[dict[str, str]],
+        asset_lookup: dict[str, Any],
+    ) -> list[VideoGenerationReferenceAsset]:
+        extra_reference_assets: list[VideoGenerationReferenceAsset] = []
+        seen_paths: set[str] = set()
+
+        sorted_assets = sorted(
+            relevant_assets,
+            key=lambda asset: (0 if asset.get("type") == "subject" else 1, asset.get("id", "")),
+        )
+        for asset in sorted_assets:
+            if len(extra_reference_assets) >= max(0, MAX_VEO_REFERENCE_IMAGES - 1):
+                break
+            asset_id = asset.get("id")
+            if not asset_id or asset_id not in asset_lookup:
+                continue
+            stored_asset = asset_lookup[asset_id]
+            asset_path = _local_media_path(stored_asset.url)
+            if not asset_path or not os.path.exists(asset_path) or asset_path in seen_paths:
+                continue
+            seen_paths.add(asset_path)
+            extra_reference_assets.append(
+                VideoGenerationReferenceAsset(
+                    path=asset_path,
+                    label=display_asset_label(stored_asset.label, stored_asset.name),
+                    kind=asset.get("type", "subject"),
+                    source_asset_id=asset_id,
+                )
+            )
+
+        if not extra_reference_assets:
+            return []
+
+        reference_assets: list[VideoGenerationReferenceAsset] = []
+        frame_path = _local_media_path(clip.image_url)
+        if frame_path and os.path.exists(frame_path):
+            reference_assets.append(
+                VideoGenerationReferenceAsset(
+                    path=frame_path,
+                    label="Storyboard frame",
+                    kind="subject",
+                    source_asset_id=clip.id,
+                )
+            )
+        reference_assets.extend(extra_reference_assets[:MAX_VEO_REFERENCE_IMAGES])
+        return reference_assets
+
+    async def _process_storyboard_clip(
+        self,
+        *,
+        state: ProjectState,
+        clip: VideoClip,
+        relevant_assets: list[dict[str, str]],
+        previous_shots: list[VideoClip],
+        asset_bytes: dict[str, tuple[bytes, str]],
+        asset_lookup: dict[str, Any],
+    ) -> None:
+        if not self.client:
+            clip.image_prompt = (
+                f"{clip.storyboard_text}. {state.instructions}. "
+                f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
+            )
+            clip.image_url = f"https://picsum.photos/seed/{clip.id}/800/450"
+            clip.image_score = None
+            clip.image_reference_ready = False
+            clip.image_approved = False
+            clip.image_critiques = []
+            return
+
+        base_prompt = (
+            f"{clip.storyboard_text}. {state.instructions}. "
+            f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
+        )
+        working_prompt = base_prompt
+        clip.image_prompt = base_prompt
+        clip.image_url = None
+        clip.image_score = None
+        clip.image_reference_ready = False
+        clip.image_approved = False
+        clip.image_critiques = []
+
+        clip_ref_parts: list[Any] = []
+        primary_previous_shot = previous_shots[0] if previous_shots else None
+
+        primary_shot_path = _local_media_path(primary_previous_shot.image_url) if primary_previous_shot else None
+        if primary_previous_shot and primary_shot_path and os.path.exists(primary_shot_path):
+            clip_ref_parts.append(
+                "PRIMARY CONTINUITY REFERENCE (CRITICAL): Match the same character identity, environment, and visual continuity unless the shot description explicitly calls for a change."
+            )
+            with open(primary_shot_path, "rb") as f:
+                clip_ref_parts.append(
+                    genai.types.Part.from_bytes(data=f.read(), mime_type="image/png")
+                )
+
+        for asset in relevant_assets:
+            asset_id = asset.get("id")
+            asset_type = asset.get("type")
+            if asset_id not in asset_bytes:
+                continue
+
+            img_bytes, mime = asset_bytes[asset_id]
+            asset_label = display_asset_label(
+                getattr(asset_lookup.get(asset_id), "label", None),
+                getattr(asset_lookup.get(asset_id), "name", asset_id),
+            )
+            asset_context = getattr(asset_lookup.get(asset_id), "ai_context", None)
+            if asset_type == "subject":
+                clip_ref_parts.append(
+                    f"REFERENCE: Subject '{asset_label}' [{asset_id}]. "
+                    f"Treat this image as the canonical appearance reference for that named subject. "
+                    f"Use this image ONLY for the subject's likeness/appearance. DO NOT copy or use the background from this image. "
+                    f"Ensure the subject is placed entirely in the environment described in the main prompt or continuity references."
+                )
+            else:
+                clip_ref_parts.append(
+                    f"REFERENCE: Background/Location '{asset_label}' [{asset_id}]. "
+                    f"Use this image as the canonical environmental reference for that named setting."
+                )
+            if asset_context:
+                clip_ref_parts.append(f"AI-understood context for '{asset_label}': {asset_context}")
+            clip_ref_parts.append(
+                genai.types.Part.from_bytes(data=img_bytes, mime_type=mime)
+            )
+
+        best_attempt: dict[str, Any] | None = None
+        def note_resource_exhausted_retry(retry_attempt: int, exc: Exception) -> None:
+            clip.image_critiques.append(
+                f"[Attempt {attempt}] {self.image_provider.definition.label} reported resource exhaustion "
+                f"({exc}). Retrying automatically in {RESOURCE_EXHAUSTED_RETRY_DELAY_SECONDS}s."
+            )
+
+        for attempt in range(1, STORYBOARD_MAX_ATTEMPTS + 1):
+            self._check_cancelled()
+            try:
+                contents = clip_ref_parts + [working_prompt]
+                image_bytes_out, image_mime_type = await self._run_with_resource_exhausted_retry(
+                    lambda: self._generate_storyboard_frame(contents=contents),
+                    on_retry=note_resource_exhausted_retry,
+                )
+
+                critique = _normalize_image_critique(
+                    await self._run_with_resource_exhausted_retry(
+                        lambda: self._critique_image(
+                            image_bytes=image_bytes_out,
+                            image_mime_type=image_mime_type,
+                            storyboard_text=clip.storyboard_text,
+                            instructions=state.instructions,
+                            image_prompt=working_prompt,
+                            primary_reference_shot=primary_previous_shot,
+                            continuity_reference_shots=previous_shots,
+                            relevant_assets=relevant_assets,
+                            asset_bytes=asset_bytes,
+                            asset_lookup=asset_lookup,
+                        ),
+                        on_retry=note_resource_exhausted_retry,
+                    )
+                )
+
+                critique_line = (
+                    f"[Attempt {attempt}] Score: {critique['score']}/10 — {critique['reasoning']}"
+                )
+                if critique["hard_fail_reasons"]:
+                    critique_line += f" | Hard fails: {', '.join(critique['hard_fail_reasons'])}"
+                if relevant_assets:
+                    critique_line += f" | Refs used: {[a.get('id') for a in relevant_assets]}"
+                if primary_previous_shot:
+                    critique_line += f" | Primary continuity: {primary_previous_shot.id}"
+                if len(previous_shots) > 1:
+                    critique_line += (
+                        " | Additional continuity: "
+                        + str([shot.id for shot in previous_shots[1:STORYBOARD_MAX_REFERENCE_SHOTS]])
+                    )
+                clip.image_critiques.append(critique_line)
+
+                candidate = {
+                    "bytes": image_bytes_out,
+                    "mime_type": image_mime_type,
+                    "critique": critique,
+                    "prompt": working_prompt,
+                }
+                candidate_rank = (
+                    1 if critique["passes"] else 0,
+                    critique["score"],
+                    -len(critique["hard_fail_reasons"]),
+                )
+                if best_attempt is None:
+                    best_attempt = candidate
+                else:
+                    best_rank = (
+                        1 if best_attempt["critique"]["passes"] else 0,
+                        best_attempt["critique"]["score"],
+                        -len(best_attempt["critique"]["hard_fail_reasons"]),
+                    )
+                    if candidate_rank > best_rank:
+                        best_attempt = candidate
+
+                if critique["passes"]:
+                    break
+
+                if attempt < STORYBOARD_MAX_ATTEMPTS:
+                    working_prompt = (
+                        f"{clip.storyboard_text}. {state.instructions}. "
+                        f"Mandatory corrections before regeneration: {critique['suggestions']}. "
+                        f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail. "
+                        "Do not introduce extra limbs, extra people, missing heads, fused bodies, broken animals, or inconsistent character design."
+                    )
+            except Exception as e:
+                clip.image_critiques.append(
+                    f"[Attempt {attempt}] {self.image_provider.definition.label} generation failed: {str(e)}"
+                )
+                break
+
+        if best_attempt:
+            image_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}.png"
+            os.makedirs(PROJECTS_DIR, exist_ok=True)
+            with open(image_path, "wb") as f:
+                f.write(best_attempt["bytes"])
+            clip.image_url = self._sync_local_project_artifact(
+                image_path,
+                relative_path=image_path.name,
+                content_type=best_attempt.get("mime_type"),
+            )
+            clip.image_prompt = best_attempt["prompt"]
+            clip.image_score = best_attempt["critique"]["score"]
+            clip.image_reference_ready = best_attempt["critique"]["passes"]
+            clip.image_approved = best_attempt["critique"]["passes"]
+
     async def node_storyboarding(self, state: ProjectState) -> ProjectState:
         """
         Node 2: Storyboard Image Provider + Auto-Critique
@@ -3730,198 +5126,22 @@ Return your answer STRICTLY as a JSON object:
                     await self._persist_state(state)
             return state
 
+        await self._ensure_generated_character_assets(state)
         await self._persist_state(state)
-
-        # ── Phase 1: Smart asset routing ─────────────────────────────────────
-        import mimetypes
-        image_assets = []
-        for asset in state.assets:
-            if asset.type != "image":
-                continue
-            asset_path = _local_media_path(asset.url)
-            if asset_path and os.path.exists(asset_path):
-                image_assets.append((asset, asset_path))
-
-        # Build a reusable bytes cache keyed by asset id
-        asset_bytes: dict[str, tuple[bytes, str]] = {}
-        asset_lookup = {asset.id: asset for asset, _ in image_assets}
-        for asset, asset_path in image_assets:
-            with open(asset_path, "rb") as f:
-                img_bytes = f.read()
-            mime = mimetypes.guess_type(asset_path)[0] or "image/jpeg"
-            asset_bytes[asset.id] = (img_bytes, mime)
+        image_assets, asset_bytes, asset_lookup = self._build_storyboard_asset_context(state)
 
         unapproved_clips = [c for c in state.timeline if not c.image_approved]
-
-        relevance_map: dict[str, Any] = {}
-        if image_assets:
-            raw_relevance_map = await self._build_asset_relevance_map(
-                [asset for asset, _ in image_assets],
-                unapproved_clips,
-                screenplay=state.screenplay,
-            )
-            if isinstance(raw_relevance_map, dict):
-                relevance_map = raw_relevance_map
-            else:
-                print(
-                    f"[asset_relevance_map] Ignoring unexpected relevance map type: "
-                    f"{type(raw_relevance_map).__name__}"
-                )
-
-        # ── Phase 2: Generate each shot with iterative auto-critique ──────────
-        async def _process_clip(
-            clip: VideoClip,
-            relevant_assets: list[dict],
-            previous_shots: list[VideoClip],
-        ) -> None:
-            base_prompt = (
-                f"{clip.storyboard_text}. {state.instructions}. "
-                f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
-            )
-            working_prompt = base_prompt
-            clip.image_prompt = base_prompt
-            clip.image_url = None
-            clip.image_score = None
-            clip.image_reference_ready = False
-            clip.image_approved = False
-            clip.image_critiques = []
-
-            clip_ref_parts: list = []
-            primary_previous_shot = previous_shots[0] if previous_shots else None
-
-            primary_shot_path = _local_media_path(primary_previous_shot.image_url) if primary_previous_shot else None
-            if primary_previous_shot and primary_shot_path and os.path.exists(primary_shot_path):
-                clip_ref_parts.append(
-                    "PRIMARY CONTINUITY REFERENCE (CRITICAL): Match the same character identity, environment, and visual continuity unless the shot description explicitly calls for a change."
-                )
-                with open(primary_shot_path, "rb") as f:
-                    clip_ref_parts.append(
-                        genai.types.Part.from_bytes(data=f.read(), mime_type="image/png")
-                    )
-
-            if relevant_assets:
-                for asset in relevant_assets:
-                    asset_id = asset.get("id")
-                    asset_type = asset.get("type")
-                    if asset_id in asset_bytes:
-                        img_bytes, mime = asset_bytes[asset_id]
-                        asset_label = display_asset_label(
-                            getattr(asset_lookup.get(asset_id), "label", None),
-                            getattr(asset_lookup.get(asset_id), "name", asset_id),
-                        )
-                        if asset_type == "subject":
-                            clip_ref_parts.append(
-                                f"REFERENCE: Subject '{asset_label}' [{asset_id}]. "
-                                f"Treat this image as the canonical appearance reference for that named subject. "
-                                f"Use this image ONLY for the subject's likeness/appearance. DO NOT copy or use the background from this image. "
-                                f"Ensure the subject is placed entirely in the environment described in the main prompt or continuity references."
-                            )
-                        else:
-                            clip_ref_parts.append(
-                                f"REFERENCE: Background/Location '{asset_label}' [{asset_id}]. "
-                                f"Use this image as the canonical environmental reference for that named setting."
-                            )
-                        clip_ref_parts.append(
-                            genai.types.Part.from_bytes(data=img_bytes, mime_type=mime)
-                        )
-
-            best_attempt: dict[str, Any] | None = None
-
-            for attempt in range(1, STORYBOARD_MAX_ATTEMPTS + 1):
-                try:
-                    contents = clip_ref_parts + [working_prompt]
-                    image_bytes_out, image_mime_type = await self._generate_storyboard_frame(
-                        contents=contents,
-                    )
-
-                    critique = _normalize_image_critique(
-                        await self._critique_image(
-                            image_bytes=image_bytes_out,
-                            image_mime_type=image_mime_type,
-                            storyboard_text=clip.storyboard_text,
-                            instructions=state.instructions,
-                            image_prompt=working_prompt,
-                            primary_reference_shot=primary_previous_shot,
-                            continuity_reference_shots=previous_shots,
-                            relevant_assets=relevant_assets,
-                            asset_bytes=asset_bytes,
-                            asset_lookup=asset_lookup,
-                        )
-                    )
-
-                    critique_line = (
-                        f"[Attempt {attempt}] Score: {critique['score']}/10 — {critique['reasoning']}"
-                    )
-                    if critique["hard_fail_reasons"]:
-                        critique_line += f" | Hard fails: {', '.join(critique['hard_fail_reasons'])}"
-                    if relevant_assets:
-                        critique_line += f" | Refs used: {[a.get('id') for a in relevant_assets]}"
-                    if primary_previous_shot:
-                        critique_line += f" | Primary continuity: {primary_previous_shot.id}"
-                    if len(previous_shots) > 1:
-                        critique_line += (
-                            " | Additional continuity: "
-                            + str([shot.id for shot in previous_shots[1:STORYBOARD_MAX_REFERENCE_SHOTS]])
-                        )
-                    clip.image_critiques.append(critique_line)
-
-                    candidate = {
-                        "bytes": image_bytes_out,
-                        "mime_type": image_mime_type,
-                        "critique": critique,
-                        "prompt": working_prompt,
-                    }
-                    candidate_rank = (
-                        1 if critique["passes"] else 0,
-                        critique["score"],
-                        -len(critique["hard_fail_reasons"]),
-                    )
-                    if best_attempt is None:
-                        best_attempt = candidate
-                    else:
-                        best_rank = (
-                            1 if best_attempt["critique"]["passes"] else 0,
-                            best_attempt["critique"]["score"],
-                            -len(best_attempt["critique"]["hard_fail_reasons"]),
-                        )
-                        if candidate_rank > best_rank:
-                            best_attempt = candidate
-
-                    if critique["passes"]:
-                        break
-
-                    if attempt < STORYBOARD_MAX_ATTEMPTS:
-                        working_prompt = (
-                            f"{clip.storyboard_text}. {state.instructions}. "
-                            f"Mandatory corrections before regeneration: {critique['suggestions']}. "
-                            f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail. "
-                            "Do not introduce extra limbs, extra people, missing heads, fused bodies, broken animals, or inconsistent character design."
-                        )
-                except Exception as e:
-                    clip.image_critiques.append(
-                        f"[Attempt {attempt}] {self.image_provider.definition.label} generation failed: {str(e)}"
-                    )
-                    break
-
-            if best_attempt:
-                image_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}.png"
-                os.makedirs(PROJECTS_DIR, exist_ok=True)
-                with open(image_path, "wb") as f:
-                    f.write(best_attempt["bytes"])
-                clip.image_url = self._sync_local_project_artifact(
-                    image_path,
-                    relative_path=image_path.name,
-                    content_type=best_attempt.get("mime_type"),
-                )
-                clip.image_prompt = best_attempt["prompt"]
-                clip.image_score = best_attempt["critique"]["score"]
-                clip.image_reference_ready = best_attempt["critique"]["passes"]
-                clip.image_approved = best_attempt["critique"]["passes"]
+        relevance_map = await self._build_storyboard_relevance_map(
+            unapproved_clips,
+            image_assets=image_assets,
+            screenplay=state.screenplay,
+        )
 
         # Process all clips sequentially to avoid Google API rate limits (429 errors)
         for idx, clip in enumerate(state.timeline):
             self._check_cancelled()
             if not clip.image_approved:
+                await self._persist_state(state)
                 previous_reference_ready = [
                     c for c in state.timeline[:idx]
                     if c.image_url is not None and c.image_reference_ready
@@ -3933,9 +5153,18 @@ Return your answer STRICTLY as a JSON object:
 
                 relevant_assets = _normalize_relevant_assets(relevance_map.get(clip.id, []))
 
-                await _process_clip(clip, relevant_assets, relevant_prev_shots)
+                await self._process_storyboard_clip(
+                    state=state,
+                    clip=clip,
+                    relevant_assets=relevant_assets,
+                    previous_shots=relevant_prev_shots,
+                    asset_bytes=asset_bytes,
+                    asset_lookup=asset_lookup,
+                )
                 await self._persist_state(state)
-                await asyncio.sleep(3) # Throttle to stay within free-tier RPM limits
+                delay_seconds = self._inter_clip_delay_seconds("storyboarding")
+                if delay_seconds > 0:
+                    await self._sleep_with_cancellation_checks(delay_seconds)
         return state
 
     async def node_filming(self, state: ProjectState) -> ProjectState:
@@ -3958,22 +5187,50 @@ Return your answer STRICTLY as a JSON object:
              state.current_stage = AgentStage.FILMING
              return state
             
+        await self._ensure_generated_character_assets(state)
         await self._normalize_timeline_for_veo(state)
         os.makedirs(PROJECTS_DIR, exist_ok=True)
         await self._persist_state(state)
+        image_assets, asset_bytes, asset_lookup = self._build_storyboard_asset_context(state)
+        relevant_video_assets_map = await self._build_storyboard_relevance_map(
+            [clip for clip in state.timeline if not clip.video_approved],
+            image_assets=image_assets,
+            screenplay=state.screenplay,
+        )
         
         async def _process_filming(clip: VideoClip) -> None:
             clip.video_score = None
-            motion_prompt = await self._build_video_motion_prompt(clip, state)
+            relevant_assets = _normalize_relevant_assets(relevant_video_assets_map.get(clip.id, []))
+            motion_prompt = await self._build_video_motion_prompt(
+                clip,
+                state,
+                relevant_assets=relevant_assets,
+                asset_lookup=asset_lookup,
+            )
             clip.video_prompt = self._compose_video_generation_prompt(motion_prompt)
+            reference_assets = self._build_video_reference_assets(
+                clip=clip,
+                relevant_assets=relevant_assets,
+                asset_lookup=asset_lookup,
+            )
+
+            def note_resource_exhausted_retry(retry_attempt: int, exc: Exception) -> None:
+                clip.video_critiques.append(
+                    f"{self.video_provider.definition.label} reported resource exhaustion ({exc}). "
+                    f"Retrying automatically in {RESOURCE_EXHAUSTED_RETRY_DELAY_SECONDS}s."
+                )
             
             try:
                 image_path = _local_media_path(clip.image_url)
                 try:
-                    video_bytes = await self._generate_video_clip(
-                        prompt=clip.video_prompt,
-                        duration_seconds=int(clip.duration),
-                        image_path=image_path,
+                    video_bytes = await self._run_with_resource_exhausted_retry(
+                        lambda: self._generate_video_clip(
+                            prompt=clip.video_prompt,
+                            duration_seconds=int(clip.duration),
+                            image_path=image_path,
+                            reference_assets=reference_assets,
+                        ),
+                        on_retry=note_resource_exhausted_retry,
                     )
                 except Exception as first_error:
                     retry_motion_prompt = await self._build_video_retry_prompt(
@@ -3988,10 +5245,14 @@ Return your answer STRICTLY as a JSON object:
 
                     clip.video_prompt = retry_prompt
                     try:
-                        video_bytes = await self._generate_video_clip(
-                            prompt=clip.video_prompt,
-                            duration_seconds=int(clip.duration),
-                            image_path=image_path,
+                        video_bytes = await self._run_with_resource_exhausted_retry(
+                            lambda: self._generate_video_clip(
+                                prompt=clip.video_prompt,
+                                duration_seconds=int(clip.duration),
+                                image_path=image_path,
+                                reference_assets=reference_assets,
+                            ),
+                            on_retry=note_resource_exhausted_retry,
                         )
                     except Exception as second_error:
                         raise RuntimeError(
@@ -4020,10 +5281,13 @@ Return your answer STRICTLY as a JSON object:
                     content_type="video/mp4",
                 )
 
-                critique = await self._critique_video_frame(
-                    video_path=video_path,
-                    video_prompt=clip.video_prompt,
-                    duration=clip.duration,
+                critique = await self._run_with_resource_exhausted_retry(
+                    lambda: self._critique_video_frame(
+                        video_path=video_path,
+                        video_prompt=clip.video_prompt,
+                        duration=clip.duration,
+                    ),
+                    on_retry=note_resource_exhausted_retry,
                 )
                 critique_reasoning = str(critique.get("reasoning") or "").strip() or "Automated video review unavailable."
                 try:
@@ -4039,6 +5303,12 @@ Return your answer STRICTLY as a JSON object:
                     clip.video_critiques.append(
                         f"Score: {clip.video_score}/10 — {critique_reasoning}"
                     )
+                if reference_assets:
+                    clip.video_critiques.append(
+                        "Ingredients used: "
+                        + ", ".join(asset.label for asset in reference_assets)
+                    )
+                clip.video_approved = True
 
             except Exception as e:
                 raw_video_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}_raw.mp4"
@@ -4048,14 +5318,18 @@ Return your answer STRICTLY as a JSON object:
                     f"{self.video_provider.definition.label} generation failed: {str(e)}"
                 )
                 clip.video_url = None
+                clip.video_approved = False
 
         # Submit and poll all active clips sequentially to prevent rate limits
         for clip in state.timeline:
             self._check_cancelled()
             if not clip.video_approved:
+                await self._persist_state(state)
                 await _process_filming(clip)
                 await self._persist_state(state)
-                await asyncio.sleep(3)
+                delay_seconds = self._inter_clip_delay_seconds("filming")
+                if delay_seconds > 0:
+                    await self._sleep_with_cancellation_checks(delay_seconds)
 
         state.current_stage = AgentStage.FILMING
         return state
@@ -4076,6 +5350,7 @@ Return your answer STRICTLY as a JSON object:
         state.final_video_url = None
         state.last_error = None
         state.current_stage = AgentStage.PRODUCTION
+        self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
         return state
 
     def _build_image_critic_contents(
@@ -4196,7 +5471,7 @@ Return a single JSON object:
         image_prompt: str,
         reviewer_lens: str,
     ) -> dict[str, Any]:
-        response = self.client.models.generate_content(
+        response = await self._generate_content_with_timeout(
             model=self.critic_model,
             contents=contents + [
                 self._build_image_critic_prompt(
@@ -4238,16 +5513,18 @@ Return a single JSON object:
                 asset_bytes=asset_bytes,
                 asset_lookup=asset_lookup,
             )
-            panel_critiques = [
-                await self._single_image_critic_pass(
-                    contents=contents,
-                    storyboard_text=storyboard_text,
-                    instructions=instructions,
-                    image_prompt=image_prompt,
-                    reviewer_lens=reviewer_lens,
-                )
-                for reviewer_lens in IMAGE_CRITIC_LENSES
-            ]
+            panel_critiques = await asyncio.gather(
+                *[
+                    self._single_image_critic_pass(
+                        contents=contents,
+                        storyboard_text=storyboard_text,
+                        instructions=instructions,
+                        image_prompt=image_prompt,
+                        reviewer_lens=reviewer_lens,
+                    )
+                    for reviewer_lens in IMAGE_CRITIC_LENSES
+                ]
+            )
             return _build_panel_consensus_critique(
                 panel_critiques,
                 medium_label="image",
@@ -4335,8 +5612,7 @@ Audio inspection from ffmpeg/ffprobe:
 This clip must not contain generated music, vocals, singing, beat, soundtrack, or score.
 Diegetic sound effects or ambience alone are acceptable.""")
 
-            panel_critiques: list[dict[str, Any]] = []
-            for reviewer_lens in VIDEO_CRITIC_LENSES:
+            async def run_video_critic_pass(reviewer_lens: str) -> dict[str, Any]:
                 prompt = f"""\
 You are one of 3 independent video critics reviewing sampled frames from an AI-generated clip.
 
@@ -4373,12 +5649,16 @@ Return a single JSON object:
     }}
   ]
 }}"""
-                response = self.client.models.generate_content(
+                response = await self._generate_content_with_timeout(
                     model=self.critic_model,
                     contents=contents + [prompt],
                     config=self._critic_config(response_mime_type="application/json"),
                 )
-                panel_critiques.append(json.loads(response.text))
+                return json.loads(response.text)
+
+            panel_critiques = await asyncio.gather(
+                *[run_video_critic_pass(reviewer_lens) for reviewer_lens in VIDEO_CRITIC_LENSES]
+            )
 
             critique = _build_panel_consensus_critique(
                 panel_critiques,
@@ -4546,7 +5826,7 @@ Acceptable audio that should NOT count as music:
 Return a single JSON object:
 {"contains_music": <true_or_false>, "reasoning": "<1-2 concise sentences>"}"""
 
-            response = self.client.models.generate_content(
+            response = await self._generate_content_with_timeout(
                 model=self.critic_model,
                 contents=[
                     "AUDIO TRACK UNDER REVIEW:",
@@ -4707,6 +5987,7 @@ Return a single JSON object:
                 previous_final_url = state.final_video_url
                 previous_final_path = candidate_path
 
+        self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
         self._reconcile_production_timeline(state)
 
         video_fragments = [
@@ -4781,6 +6062,7 @@ Return a single JSON object:
             state.last_error = "Cannot produce final video because no edited clips are available on disk."
             state.final_video_url = previous_final_url
             state.current_stage = AgentStage.PRODUCTION
+            self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
             return state
 
         try:
@@ -4846,17 +6128,10 @@ Return a single JSON object:
 
             music_path = _local_media_path(state.music_url)
             if music_path and os.path.exists(music_path):
-                effective_music_fragments = music_fragments or [
-                    ProductionTimelineFragment(
-                        id="music_frag_0",
-                        track_type="music",
-                        source_clip_id=None,
-                        timeline_start=0.0,
-                        source_start=0.0,
-                        duration=round(edited_total_duration, 3),
-                        audio_enabled=True,
-                    )
-                ]
+                effective_music_fragments = music_fragments or self._default_music_production_fragments(
+                    state,
+                    program_duration=edited_total_duration,
+                )
 
                 music_segment_paths: list[str] = []
                 current_music_time = 0.0
@@ -4948,11 +6223,13 @@ Return a single JSON object:
             state.last_error = f"ffmpeg unavailable: {str(e)}"
             state.final_video_url = previous_final_url
             state.current_stage = AgentStage.PRODUCTION
+            self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
             return state
         except RuntimeError as e:
             state.last_error = str(e)
             state.final_video_url = previous_final_url
             state.current_stage = AgentStage.PRODUCTION
+            self._trim_stage_summaries_to_stage(state, AgentStage.PRODUCTION)
             return state
 
         state.current_stage = AgentStage.COMPLETED
