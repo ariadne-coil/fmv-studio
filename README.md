@@ -5,6 +5,14 @@ FMV Studio is an AI-assisted music video editor and realtime directing environme
 - `frontend/`: Next.js 16 / React 19 studio UI
 - `backend/`: FastAPI orchestration service for planning, storyboarding, filming, and production
 
+## Quick Links
+
+- Live app: `https://fmv-studio-frontend-t7cat7yhuq-uc.a.run.app`
+- Judge spin-up: [`Installation`](#installation)
+- Architecture diagram: [`docs/hackathon-architecture-diagram.md`](docs/hackathon-architecture-diagram.md)
+- Project summary: [`docs/hackathon-project-summary.md`](docs/hackathon-project-summary.md)
+- Google Cloud deployment proof: [`docs/hackathon-google-cloud-proof.md`](docs/hackathon-google-cloud-proof.md)
+
 ## Core Highlights
 
 - Stage-driven pipeline from `Input` to `Completed`, with review gates between `Music`, `Planning`, `Storyboarding`, `Filming`, and `Production`
@@ -156,3 +164,7 @@ npm run dev
 ```
 
 By default the app uses local storage under `.fmv-data/`. Vertex AI and GCS can be enabled locally with the environment variables in [`.env.example`](.env.example).
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE).
