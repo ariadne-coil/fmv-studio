@@ -108,6 +108,7 @@ class ProjectState(BaseModel):
     instructions: str = ""
     additional_lore: str = ""
     music_url: Optional[str] = None # None implies need to generate with Lyria
+    music_duration_seconds: Optional[float] = None
     image_provider: Optional[str] = None
     video_provider: Optional[str] = None
     music_provider: Optional[str] = None

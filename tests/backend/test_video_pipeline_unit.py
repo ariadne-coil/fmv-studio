@@ -582,6 +582,248 @@ async def test_generate_google_storyboard_image_respects_selected_image_resoluti
 
 
 @pytest.mark.asyncio
+async def test_generate_google_storyboard_image_falls_back_to_generated_images_when_candidate_parts_missing():
+    def fake_generate_content(**kwargs):
+        return SimpleNamespace(
+            generated_images=[
+                SimpleNamespace(
+                    image=SimpleNamespace(
+                        image_bytes=b"generated-image-bytes",
+                        mime_type="image/png",
+                    ),
+                    rai_filtered_reason=None,
+                )
+            ],
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(parts=None),
+                    finish_reason=None,
+                )
+            ],
+        )
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=fake_generate_content)
+    )
+
+    async def fake_normalize_storyboard_image_bytes(*, image_bytes, image_mime_type):
+        return image_bytes, image_mime_type
+
+    pipeline._normalize_storyboard_image_bytes = fake_normalize_storyboard_image_bytes
+
+    image_bytes, image_mime_type = await pipeline._generate_google_storyboard_image(
+        contents=["A cinematic portrait"]
+    )
+
+    assert image_bytes == b"generated-image-bytes"
+    assert image_mime_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_generate_google_storyboard_image_raises_clean_error_when_no_image_parts_exist():
+    def fake_generate_content(**kwargs):
+        return SimpleNamespace(
+            text="No image was returned",
+            generated_images=None,
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(parts=None),
+                    finish_reason="SAFETY",
+                )
+            ],
+        )
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=fake_generate_content)
+    )
+
+    with pytest.raises(RuntimeError, match="returned no image data"):
+        await pipeline._generate_google_storyboard_image(contents=["A cinematic portrait"])
+
+
+@pytest.mark.asyncio
+async def test_process_storyboard_clip_prompt_discourages_reference_repetition_and_subtitle_overlays(monkeypatch, tmp_path):
+    _patch_storage_roots(monkeypatch, tmp_path)
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace()
+
+    captured: dict[str, object] = {}
+
+    async def fake_generate_storyboard_frame(*, contents):
+        captured["contents"] = contents
+        return b"frame-bytes", "image/png"
+
+    async def fake_critique_image(**kwargs):
+        return {
+            "score": 9,
+            "passes": True,
+            "reasoning": "Looks good.",
+            "suggestions": "",
+            "hard_fail_reasons": [],
+        }
+
+    monkeypatch.setattr(pipeline, "_generate_storyboard_frame", fake_generate_storyboard_frame)
+    monkeypatch.setattr(pipeline, "_critique_image", fake_critique_image)
+    monkeypatch.setattr(
+        pipeline,
+        "_sync_local_project_artifact",
+        lambda path, *, relative_path, content_type=None: f"/projects/{relative_path}",
+    )
+
+    previous_frame_path = tmp_path / "projects" / "prev.png"
+    previous_frame_path.write_bytes(b"previous-frame")
+
+    state = ProjectState(
+        project_id="proj_storyboard_prompt",
+        name="Storyboard Prompt",
+        current_stage=AgentStage.STORYBOARDING,
+        instructions="Moody cinematic lighting.",
+    )
+    clip = VideoClip(
+        id="clip_0",
+        timeline_start=0.0,
+        duration=6.0,
+        storyboard_text="Mira turns toward the raven and starts speaking in the alley.",
+    )
+    previous_shot = VideoClip(
+        id="clip_prev",
+        timeline_start=0.0,
+        duration=6.0,
+        storyboard_text="Mira faces camera in the same alley.",
+        image_url="/projects/prev.png",
+    )
+    relevant_assets = [
+        {"id": "asset_mira", "type": "subject"},
+        {"id": "asset_raven", "type": "subject"},
+        {"id": "asset_alley", "type": "location"},
+    ]
+    asset_bytes = {
+        "asset_mira": (b"mira", "image/png"),
+        "asset_raven": (b"raven", "image/png"),
+        "asset_alley": (b"alley", "image/png"),
+    }
+    asset_lookup = {
+        "asset_mira": MediaAsset(id="asset_mira", url="/projects/mira.png", type="image", name="mira.png", label="Mira"),
+        "asset_raven": MediaAsset(id="asset_raven", url="/projects/raven.png", type="image", name="raven.png", label="White Raven"),
+        "asset_alley": MediaAsset(id="asset_alley", url="/projects/alley.png", type="image", name="alley.png", label="Neon Alley"),
+    }
+
+    await pipeline._process_storyboard_clip(
+        state=state,
+        clip=clip,
+        relevant_assets=relevant_assets,
+        previous_shots=[previous_shot],
+        asset_bytes=asset_bytes,
+        asset_lookup=asset_lookup,
+    )
+
+    prompt = str((captured["contents"] or [])[-1])
+    assert "Generate a new storyboard frame for this shot's specific action" in prompt
+    assert "Treat any prior storyboard frames strictly as reference images for continuity" in prompt
+    assert "do not use them as fixed backgrounds or background plates" in prompt
+    assert "Explicitly name every visible character, creature, or named subject present in the shot" in prompt
+    assert "Explicitly name the location or setting" in prompt
+    assert "Describe the exact camera angle, framing, and what the camera can see from that angle" in prompt
+    assert "Describe the pose, body orientation, gaze, and action of each visible character in detail" in prompt
+    assert "do not add burned-in subtitles, captions, or lyric overlays" in prompt
+    assert "realistic scale, spacing, depth, and perspective" in prompt
+    assert any(
+        isinstance(item, str) and "not as a background plate, matte layer, or frame to copy shot-for-shot" in item
+        for item in captured["contents"]
+    )
+    assert any(
+        isinstance(item, str) and "MULTI-SUBJECT REFERENCE RULE" in item
+        for item in captured["contents"]
+    )
+
+
+def test_build_image_critic_prompt_flags_unwanted_subtitles_and_bad_reference_scale():
+    pipeline = FMVAgentPipeline(api_key="dummy")
+
+    prompt = pipeline._build_image_critic_prompt(
+        storyboard_text="Mira speaks to the raven.",
+        instructions="Moody cinematic lighting.",
+        image_prompt="Some prompt",
+        reviewer_lens="Literal prompt faithfulness.",
+    )
+
+    assert "burned-in subtitles, captions, or lyric overlays" in prompt
+    assert "believable scale, spacing, and perspective" in prompt
+    assert "do not treat normal in-world text such as signage" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_build_storyboard_image_prompt_uses_orchestrator_to_require_characters_location_camera_and_pose():
+    captured = {}
+
+    def fake_generate_content(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            text=(
+                '"Low-angle medium-wide shot in Neon Alley as Mira stands three-quarters to camera with '
+                'her shoulders turned toward the white raven on her raised left forearm, mouth open mid-line, '
+                'right hand hovering near her chest, rain-slick pavement and magenta signage in the foreground, '
+                'narrow storefronts and steam in the midground, and receding neon fire escapes in the background."'
+            )
+        )
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=fake_generate_content)
+    )
+
+    state = ProjectState(
+        project_id="proj_prompt_expand",
+        name="Prompt Expand",
+        instructions="Moody neon realism with cinematic contrast.",
+    )
+    clip = VideoClip(
+        id="clip_expand",
+        timeline_start=0.0,
+        duration=6.0,
+        storyboard_text="Mira turns toward the raven and speaks in the alley.",
+    )
+    previous_shot = VideoClip(
+        id="clip_prev",
+        timeline_start=0.0,
+        duration=6.0,
+        storyboard_text="Mira walks through Neon Alley before stopping under the sign.",
+    )
+    asset_lookup = {
+        "asset_mira": MediaAsset(id="asset_mira", url="/projects/mira.png", type="image", name="mira.png", label="Mira"),
+        "asset_raven": MediaAsset(id="asset_raven", url="/projects/raven.png", type="image", name="raven.png", label="White Raven"),
+        "asset_alley": MediaAsset(id="asset_alley", url="/projects/alley.png", type="image", name="alley.png", label="Neon Alley"),
+    }
+
+    prompt = await pipeline._build_storyboard_image_prompt(
+        state=state,
+        clip=clip,
+        relevant_assets=[
+            {"id": "asset_mira", "type": "subject"},
+            {"id": "asset_raven", "type": "subject"},
+            {"id": "asset_alley", "type": "location"},
+        ],
+        previous_shots=[previous_shot],
+        asset_lookup=asset_lookup,
+    )
+
+    assert prompt.startswith("Low-angle medium-wide shot in Neon Alley")
+    assert captured["model"] == pipeline.orchestrator_model
+    request_prompt = captured["contents"][0]
+    assert "Explicitly name every visible character, creature, or named subject present in the shot" in request_prompt
+    assert "Explicitly name the location/setting" in request_prompt
+    assert "Describe the exact camera angle, shot size/framing, camera height, and point of view" in request_prompt
+    assert "Describe the pose, body orientation, gaze, expression, and action of each visible character in detail" in request_prompt
+    assert "Treat continuity reference images as scene references only" in request_prompt
+    assert "not fixed backgrounds, matte paintings, or background plates" in request_prompt
+    assert "Mira, White Raven" in request_prompt
+    assert "Neon Alley" in request_prompt
+
+
+@pytest.mark.asyncio
 async def test_normalize_storyboard_image_bytes_normalizes_non_16_9_frames(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     pipeline = FMVAgentPipeline(api_key="dummy")
@@ -1172,6 +1414,7 @@ def test_update_project_resets_music_track_when_music_start_changes(monkeypatch,
         name="Music Start Shift",
         current_stage=AgentStage.PRODUCTION,
         music_url="/projects/proj_music_start_shift_music.wav",
+        music_duration_seconds=12.0,
         music_start_seconds=0.0,
         timeline=[
             VideoClip(
@@ -1246,7 +1489,8 @@ def test_update_project_resets_music_track_when_music_start_changes(monkeypatch,
     music_fragments = [fragment for fragment in result.production_timeline if (fragment.track_type or "video") == "music"]
     assert len(music_fragments) == 1
     assert music_fragments[0].timeline_start == 4.0
-    assert music_fragments[0].duration == 8.0
+    assert music_fragments[0].duration == 12.0
+    assert result.music_duration_seconds == 12.0
     assert result.final_video_url is None
     assert result.stage_summaries == {
         "planning": original.stage_summaries["planning"],
@@ -2182,6 +2426,146 @@ async def test_live_director_asset_regeneration_keeps_planning_stage_when_review
     assert set(updated_state.stage_summaries.keys()) == {"planning"}
     assert result["target_asset_id"] == "asset_hero"
     assert updated_state.director_log[-1].applied_changes == action["change_summary"]
+
+
+@pytest.mark.asyncio
+async def test_create_director_image_asset_uses_character_reference_settings(monkeypatch):
+    pipeline = FMVAgentPipeline(api_key="dummy", image_size="2K")
+    pipeline.client = SimpleNamespace()
+
+    captured = {}
+
+    async def fake_generate_google_image(
+        *,
+        contents,
+        aspect_ratio,
+        image_size,
+        target_width,
+        target_height,
+        pad_color,
+    ):
+        captured["contents"] = contents
+        captured["aspect_ratio"] = aspect_ratio
+        captured["image_size"] = image_size
+        captured["target_width"] = target_width
+        captured["target_height"] = target_height
+        captured["pad_color"] = pad_color
+        return b"director-asset", "image/png"
+
+    monkeypatch.setattr(pipeline, "_generate_google_image", fake_generate_google_image)
+    monkeypatch.setattr(pipeline, "_run_with_resource_exhausted_retry", lambda operation: operation())
+    monkeypatch.setattr(
+        pipeline,
+        "_write_project_asset_bytes",
+        lambda relative_path, data, *, content_type=None: f"/projects/{relative_path}",
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "analyze_uploaded_asset",
+        lambda **kwargs: asyncio.sleep(0, result="Canonical portrait reference for Mira Solis."),
+    )
+
+    state = ProjectState(project_id="proj_director_create_asset", name="Director Create Asset")
+
+    asset = await pipeline._create_director_image_asset(
+        state,
+        label="Mira Solis",
+        generation_instruction="Create a canonical portrait reference for Mira with silver hair and a structured white coat.",
+        purpose="character_reference",
+    )
+
+    assert asset is not None
+    assert asset in state.assets
+    assert asset.label == "Mira Solis"
+    assert asset.purpose == "character_reference"
+    assert asset.source == "agent"
+    assert asset.ai_context == "Canonical portrait reference for Mira Solis."
+    assert captured["aspect_ratio"] == "9:16"
+    assert captured["image_size"] == "2K"
+    assert captured["target_width"] == 1152
+    assert captured["target_height"] == 2048
+    assert captured["pad_color"] == "white"
+    assert "Single centered character portrait reference." in captured["contents"][0]
+    assert "Neutral seamless white studio background." in captured["contents"][0]
+
+
+@pytest.mark.asyncio
+async def test_live_director_can_create_new_image_asset_and_target_it():
+    action = {
+        "director_operation": "none",
+        "reply_text": "I created a new rooftop location reference.",
+        "change_summary": ["Created a new location reference asset."],
+        "global_updates": {
+            "screenplay": None,
+            "instructions": None,
+            "additional_lore": None,
+            "lyrics_prompt": None,
+            "style_prompt": None,
+            "music_min_duration_seconds": None,
+            "music_max_duration_seconds": None,
+        },
+        "clip_operations": [],
+        "asset_operations": [
+            {
+                "operation_type": "create_image",
+                "target_asset_id": None,
+                "label": "Neon Alley Rooftop",
+                "generation_instruction": "Create a moody rooftop location reference with wet concrete, magenta neon spill, and distant city haze.",
+                "purpose": "reference_image",
+            }
+        ],
+        "target_fragment_id": None,
+        "fragment_updates": {
+            "audio_enabled": None,
+        },
+        "navigation_action": "stay",
+        "target_stage": None,
+        "rewind_to_stage": None,
+    }
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=lambda **kwargs: SimpleNamespace(text=json.dumps(action)))
+    )
+
+    async def fake_create_asset(state, *, label, generation_instruction, purpose=None):
+        assert label == "Neon Alley Rooftop"
+        assert "rooftop location reference" in generation_instruction
+        assert purpose == "reference_image"
+        asset = MediaAsset(
+            id="asset_neon_rooftop",
+            url="/projects/neon_rooftop.png",
+            type="image",
+            name="Neon Alley Rooftop.png",
+            label=label,
+            ai_context="Rooftop location reference with wet concrete, magenta glow, and distant skyline haze.",
+            source="agent",
+            purpose="reference_image",
+        )
+        state.assets.append(asset)
+        return asset
+
+    pipeline._create_director_image_asset = fake_create_asset
+
+    state = ProjectState(
+        project_id="proj_live_director_asset_create",
+        name="Live Director Asset Create",
+        current_stage=AgentStage.PLANNING,
+    )
+
+    updated_state, result = await pipeline.handle_live_director_mode(
+        state,
+        message="Create a new rooftop location reference asset for Neon Alley.",
+        display_stage=AgentStage.PLANNING,
+        speech_mode="realtime",
+    )
+
+    assert len(updated_state.assets) == 1
+    assert updated_state.assets[0].id == "asset_neon_rooftop"
+    assert updated_state.current_stage == AgentStage.PLANNING
+    assert result["target_asset_id"] == "asset_neon_rooftop"
+    assert updated_state.director_log[-1].applied_changes == action["change_summary"]
+    assert len(updated_state.director_undo_stack) == 1
 
 
 @pytest.mark.asyncio
@@ -3591,6 +3975,7 @@ def test_initialize_production_timeline_uses_music_start_offset():
         name="Music Offset",
         current_stage=AgentStage.PRODUCTION,
         music_url="/projects/proj_music_offset_music.wav",
+        music_duration_seconds=12.0,
         music_start_seconds=4.0,
         timeline=[
             VideoClip(
@@ -3613,7 +3998,88 @@ def test_initialize_production_timeline_uses_music_start_offset():
     music_fragments = [fragment for fragment in state.production_timeline if (fragment.track_type or "video") == "music"]
     assert len(music_fragments) == 1
     assert music_fragments[0].timeline_start == 4.0
-    assert music_fragments[0].duration == 8.0
+    assert music_fragments[0].duration == 12.0
+
+
+def test_get_project_backfills_music_duration_seconds(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    state = ProjectState(
+        project_id="proj_music_duration_backfill",
+        name="Music Duration Backfill",
+        current_stage=AgentStage.PLANNING,
+        music_url="/projects/proj_music_duration_backfill_music.wav",
+        music_duration_seconds=None,
+    )
+    (projects_dir / "proj_music_duration_backfill.fmv").write_text(state.model_dump_json())
+
+    monkeypatch.setattr(endpoints_module, "_measure_audio_duration_seconds_sync", lambda music_url: 42.5)
+
+    loaded = endpoints_module.get_project("proj_music_duration_backfill")
+    persisted = endpoints_module.get_project("proj_music_duration_backfill")
+
+    assert loaded.music_duration_seconds == 42.5
+    assert persisted.music_duration_seconds == 42.5
+
+
+def test_reconcile_production_timeline_preserves_music_duration_beyond_picture():
+    pipeline = FMVAgentPipeline(api_key=None)
+
+    state = ProjectState(
+        project_id="proj_music_reconcile",
+        name="Music Reconcile",
+        current_stage=AgentStage.PRODUCTION,
+        music_url="/projects/proj_music_reconcile_music.wav",
+        music_start_seconds=4.0,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+            ),
+        ],
+        production_timeline=[
+            ProductionTimelineFragment(
+                id="clip_0_frag_0",
+                source_clip_id="clip_0",
+                timeline_start=0.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="clip_1_frag_0",
+                source_clip_id="clip_1",
+                timeline_start=6.0,
+                source_start=0.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="music_frag_0",
+                track_type="music",
+                source_clip_id=None,
+                timeline_start=4.0,
+                source_start=0.0,
+                duration=12.0,
+                audio_enabled=True,
+            ),
+        ],
+    )
+
+    pipeline._reconcile_production_timeline(state)
+
+    music_fragments = [fragment for fragment in state.production_timeline if (fragment.track_type or "video") == "music"]
+    assert len(music_fragments) == 1
+    assert music_fragments[0].timeline_start == 4.0
+    assert music_fragments[0].duration == 12.0
 
 
 @pytest.mark.asyncio
@@ -5174,6 +5640,70 @@ def test_update_project_preserves_manual_storyboard_frame_on_description_edit(mo
     assert response.final_video_url is None
 
 
+def test_update_storyboard_clip_text_endpoint_reconciles_outputs(monkeypatch, tmp_path):
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    state = ProjectState(
+        project_id="proj_storyboard_text_update",
+        name="Storyboard Text Update",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0.0,
+                duration=6.0,
+                storyboard_text="Opening shot",
+                image_url="/projects/proj_storyboard_text_update_clip_0.png",
+                image_prompt="Old prompt",
+                image_approved=True,
+                image_score=8,
+                image_reference_ready=True,
+                video_url="/projects/proj_storyboard_text_update_clip_0.mp4",
+                video_prompt="Old video prompt",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=6.0,
+                duration=6.0,
+                storyboard_text="Second shot",
+                image_url="/projects/proj_storyboard_text_update_clip_1.png",
+                image_prompt="Second prompt",
+                image_approved=True,
+                image_score=8,
+                image_reference_ready=True,
+                video_url="/projects/proj_storyboard_text_update_clip_1.mp4",
+                video_prompt="Second video prompt",
+                video_approved=True,
+            ),
+        ],
+        final_video_url="/projects/proj_storyboard_text_update_final.mp4",
+        stage_summaries={
+            "planning": StageSummary(text="Planning", generated_at="2026-03-07T00:00:00+00:00"),
+            "storyboarding": StageSummary(text="Storyboarding", generated_at="2026-03-07T00:01:00+00:00"),
+            "filming": StageSummary(text="Filming", generated_at="2026-03-07T00:02:00+00:00"),
+        },
+    )
+    (projects_dir / "proj_storyboard_text_update.fmv").write_text(state.model_dump_json())
+
+    response = endpoints_module.update_storyboard_clip_text(
+        "proj_storyboard_text_update",
+        "clip_0",
+        endpoints_module.StoryboardTextUpdateRequest(
+            storyboard_text="Updated opening shot with a stronger silhouette.",
+        ),
+    )
+
+    assert response.current_stage == AgentStage.STORYBOARDING
+    assert response.timeline[0].storyboard_text == "Updated opening shot with a stronger silhouette."
+    assert response.timeline[0].image_url is None
+    assert response.timeline[0].video_url is None
+    assert response.timeline[1].image_url == "/projects/proj_storyboard_text_update_clip_1.png"
+    assert response.timeline[1].video_url == "/projects/proj_storyboard_text_update_clip_1.mp4"
+    assert response.final_video_url is None
+    assert response.stage_summaries == {}
+
+
 def test_update_asset_label_endpoint_does_not_touch_storyboard_frame(monkeypatch, tmp_path):
     projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
 
@@ -5631,6 +6161,9 @@ async def test_node_storyboarding_retries_until_high_score_and_only_persists_bes
 
     pipeline._select_relevant_previous_shots = fake_select_previous_shots
     pipeline._critique_image = fake_critique_image
+    pipeline._build_storyboard_image_prompt = (
+        lambda **kwargs: asyncio.sleep(0, result="A figure stands under a flickering streetlight in rain.")
+    )
 
     state = ProjectState(
         project_id="proj_storyboard_retry",

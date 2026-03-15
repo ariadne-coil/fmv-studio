@@ -1086,7 +1086,10 @@ class FMVAgentPipeline:
             return []
 
         music_start = self._normalized_music_start_seconds(state, program_duration=program_duration)
-        duration = max(0.1, round(program_duration - music_start, 3))
+        if state.music_duration_seconds is not None and float(state.music_duration_seconds) > 0:
+            duration = max(0.1, round(float(state.music_duration_seconds), 3))
+        else:
+            duration = max(0.1, round(program_duration - music_start, 3))
         return [
             ProductionTimelineFragment(
                 id="music_frag_0",
@@ -1594,6 +1597,7 @@ User instruction:
             if deleted_asset.type == "audio":
                 if state.music_url == deleted_asset.url:
                     state.music_url = None
+                    state.music_duration_seconds = None
                 state.production_timeline = [
                     fragment
                     for fragment in state.production_timeline
@@ -1631,11 +1635,8 @@ User instruction:
         ):
             timeline_start = max(0.0, round(float(fragment.timeline_start), 3))
             timeline_start = max(timeline_start, round(current_end, 3))
-            max_start = max(0.0, program_duration - 0.1)
-            timeline_start = min(timeline_start, max_start)
 
             duration = max(0.1, round(float(fragment.duration), 3))
-            duration = min(duration, max(0.1, program_duration - timeline_start))
             source_start = max(0.0, round(float(fragment.source_start), 3))
 
             normalized_fragments.append(
@@ -1867,7 +1868,7 @@ Supported operations:
 - director_operation: no-op or undo the last Live Director change
 - global_updates: screenplay, instructions, additional_lore, lyrics_prompt, style_prompt, music_min_duration_seconds, music_max_duration_seconds
 - one or more clip operations: each clip operation may update, insert, delete, or move a shot
-- one or more asset operations: each asset operation may rename, delete, or regenerate an image asset
+- one or more asset operations: each asset operation may rename, delete, regenerate, or create an image asset
 - one production audio toggle: target_fragment_id + fragment_updates.audio_enabled
 - optional stage navigation when the user asks to move forward or backward in the pipeline
 
@@ -1881,9 +1882,12 @@ Rules:
   - "update_label": rename an existing asset label
   - "delete": remove an existing asset
   - "regenerate_image": edit an existing image asset itself while keeping it as a reusable reference
+  - "create_image": create a new reusable image reference asset and add it to the asset library
 - Asset labels should be concise semantic names like characters, props, locations, or music references. Do not rewrite them into long descriptions.
 - If a labeled image asset exists for a character, prop, creature, vehicle, or location and the user wants that entity to look different, prefer regenerating that reference image asset instead of rewriting shots.
 - Do not delete a reference image asset just because the user wants that character or object changed. Regenerate the asset unless the user truly wants it removed.
+- If the user asks for a brand new reference image, concept sheet, character reference, prop image, or location reference that does not already exist as an asset, use "create_image" instead of rewriting shots.
+- For "create_image", provide a concise semantic label plus a detailed generation_instruction. Set purpose to "character_reference" for a clean portrait reference of a recurring character, otherwise use "reference_image".
 - If the user asks to proceed, continue, move on, or go to the next stage, set navigation_action to "advance".
 - If the user asks to go back, return, rewind, or revisit an earlier stage, set navigation_action to "rewind".
 - If the user explicitly names a stage like planning, storyboarding, filming, production, or music, set target_stage to that stage value.
@@ -1933,10 +1937,11 @@ Return STRICTLY as JSON matching this schema:
   ],
   "asset_operations": [
     {{
-      "operation_type": "update_label" | "delete" | "regenerate_image",
+      "operation_type": "update_label" | "delete" | "regenerate_image" | "create_image",
       "target_asset_id": string | null,
       "label": string | null,
-      "generation_instruction": string | null
+      "generation_instruction": string | null,
+      "purpose": "character_reference" | "reference_image" | null
     }}
   ],
   "target_fragment_id": string | null,
@@ -2240,6 +2245,29 @@ User instruction:
 
         for asset_operation in asset_operations:
             asset_operation_type = str(asset_operation.get("operation_type") or "").strip().lower()
+            if asset_operation_type == "create_image":
+                next_label = str(asset_operation.get("label") or "").strip()
+                generation_instruction = str(
+                    asset_operation.get("generation_instruction")
+                    or requested_message
+                    or ""
+                ).strip()
+                created_asset = await self._create_director_image_asset(
+                    updated_state,
+                    label=next_label,
+                    generation_instruction=generation_instruction,
+                    purpose=asset_operation.get("purpose"),
+                )
+                if created_asset is None:
+                    continue
+                targeted_asset_id = created_asset.id
+                asset_changed = True
+                if not change_summary:
+                    change_summary.append(
+                        f"Created a new reference image asset for {display_asset_label(created_asset.label, created_asset.name)}."
+                    )
+                continue
+
             target_asset_id = str(
                 asset_operation.get("target_asset_id")
                 or (selected_asset_id if len(asset_operations) == 1 else "")
@@ -2990,14 +3018,42 @@ User instruction:
 
         image_bytes_out = None
         image_mime_type = "image/png"
-        for part in result.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                image_bytes_out = part.inline_data.data
-                image_mime_type = part.inline_data.mime_type
+        diagnostics: list[str] = []
+
+        for generated_image in (getattr(result, "generated_images", None) or []):
+            image = getattr(generated_image, "image", None)
+            image_bytes = getattr(image, "image_bytes", None)
+            mime_type = getattr(image, "mime_type", None) or "image/png"
+            if image_bytes:
+                image_bytes_out = image_bytes
+                image_mime_type = mime_type
                 break
+            filtered_reason = str(getattr(generated_image, "rai_filtered_reason", "") or "").strip()
+            if filtered_reason:
+                diagnostics.append(f"filtered: {filtered_reason}")
 
         if not image_bytes_out:
-            raise RuntimeError(f"{self.image_provider.definition.label} returned no image data")
+            for candidate in (getattr(result, "candidates", None) or []):
+                finish_reason = getattr(candidate, "finish_reason", None)
+                if finish_reason:
+                    diagnostics.append(f"finish_reason={finish_reason}")
+                content = getattr(candidate, "content", None)
+                for part in (getattr(content, "parts", None) or []):
+                    inline_data = getattr(part, "inline_data", None)
+                    mime_type = str(getattr(inline_data, "mime_type", "") or "")
+                    if inline_data and mime_type.startswith("image/"):
+                        image_bytes_out = inline_data.data
+                        image_mime_type = mime_type
+                        break
+                if image_bytes_out:
+                    break
+
+        if not image_bytes_out:
+            response_text = str(getattr(result, "text", "") or "").strip()
+            if response_text:
+                diagnostics.append(response_text[:240])
+            diagnostic_suffix = f" ({'; '.join(dict.fromkeys(diagnostics))})" if diagnostics else ""
+            raise RuntimeError(f"{self.image_provider.definition.label} returned no image data{diagnostic_suffix}")
 
         return await self._normalize_generated_image_bytes(
             image_bytes=image_bytes_out,
@@ -3824,6 +3880,89 @@ Return only the rewritten motion prompt.
         )
         return target_asset
 
+    async def _create_director_image_asset(
+        self,
+        state: ProjectState,
+        *,
+        label: str,
+        generation_instruction: str,
+        purpose: str | None = None,
+    ) -> MediaAsset | None:
+        normalized_label = display_asset_label(label, "reference image").strip()
+        instruction_text = str(generation_instruction or "").strip()
+        if not normalized_label or not instruction_text:
+            return None
+
+        normalized_purpose = str(purpose or "reference_image").strip().lower() or "reference_image"
+        if normalized_purpose not in {CHARACTER_REFERENCE_ASSET_PURPOSE, "reference_image"}:
+            normalized_purpose = "reference_image"
+
+        if normalized_purpose == CHARACTER_REFERENCE_ASSET_PURPOSE:
+            target_width, target_height = REFERENCE_IMAGE_SIZE_DIMENSIONS[self.image_size]
+            aspect_ratio = TARGET_REFERENCE_IMAGE_ASPECT_RATIO
+            pad_color = "white"
+            prompt_lines = [
+                f"Create a clean reusable canonical portrait reference for {normalized_label}.",
+                f"Director request: {instruction_text}",
+                "Single centered character portrait reference.",
+                "Portrait aspect ratio.",
+                "Neutral seamless white studio background.",
+                "Even clean studio lighting.",
+                "No environment, no extra people, no collage.",
+            ]
+        else:
+            target_width, target_height = IMAGE_SIZE_DIMENSIONS[self.image_size]
+            aspect_ratio = TARGET_IMAGE_ASPECT_RATIO
+            pad_color = "black"
+            prompt_lines = [
+                f"Create a clean reusable visual reference image labeled {normalized_label}.",
+                f"Director request: {instruction_text}",
+                "Treat this as a reusable downstream reference asset, not a finished storyboard frame.",
+                "Prioritize clear identity, composition, and legibility of the referenced subject or setting.",
+                "No collage, no watermark, no UI chrome unless explicitly requested.",
+            ]
+
+        image_bytes, image_mime_type = await self._run_with_resource_exhausted_retry(
+            lambda: self._generate_google_image(
+                contents=[" ".join(prompt_lines)],
+                aspect_ratio=aspect_ratio,
+                image_size=self.image_size,
+                target_width=target_width,
+                target_height=target_height,
+                pad_color=pad_color,
+            )
+        )
+
+        asset_slug = _slugify_asset_label(normalized_label)
+        asset_suffix = uuid.uuid4().hex[:8]
+        relative_path = f"{state.project_id}_asset_{asset_slug}_{asset_suffix}.png"
+        asset_url = self._write_project_asset_bytes(
+            relative_path,
+            image_bytes,
+            content_type=image_mime_type,
+        )
+        ai_context = await analyze_uploaded_asset(
+            client=self.client,
+            filename=f"{normalized_label}.png",
+            label=normalized_label,
+            mime_type=image_mime_type,
+            asset_type="image",
+            content=image_bytes,
+        )
+        created_asset = MediaAsset(
+            id=f"asset_{asset_slug}_{asset_suffix}",
+            url=asset_url,
+            type="image",
+            name=f"{normalized_label}.png",
+            label=normalized_label,
+            mime_type=image_mime_type,
+            ai_context=ai_context,
+            source=AUTO_GENERATED_ASSET_SOURCE,
+            purpose=normalized_purpose,
+        )
+        state.assets.append(created_asset)
+        return created_asset
+
     async def _resolve_director_asset_affected_clip_ids(
         self,
         state: ProjectState,
@@ -3875,6 +4014,7 @@ Return only the rewritten motion prompt.
         )
         if music_url:
             state.music_url = music_url
+            state.music_duration_seconds = await self._measure_audio_duration_seconds(music_url)
             self._apply_generated_music_signature(state)
         return music_url
 
@@ -4424,7 +4564,10 @@ Existing style prompt:
 {audio_duration_hint}
             CRITICAL: 
             - The storyboard image provider will generate the starting frames, and the video provider will animate them.
-            - The storyboard image provider requires highly descriptive, specific visual prompts (lighting, camera angle, subject, style).
+            - The storyboard image provider requires highly descriptive, specific visual prompts.
+            - Each storyboard_text must already be visually specific enough to draw from directly.
+            - Every storyboard_text MUST explicitly name all visible characters/creatures/subjects in the shot, explicitly name the location/setting, describe the precise camera angle/framing and what is visible from that angle, and describe the pose/body orientation/action of each visible character in detail.
+            - Do not rely on downstream prompt expansion to invent omitted visual essentials.
             - Consider the provided "Instructions", "Additional Lore", and uploaded document context carefully to ensure stylistic consistency across all clips.
             - If uploaded reference images are labeled with a character, creature, prop, vehicle, or location name, preserve that name verbatim in any storyboard descriptions where that entity appears so downstream reference routing can attach the correct asset.
             - If an audio track was provided (which you are currently listening to), align the clip transitions with major musical shifts or beats.
@@ -4927,6 +5070,124 @@ Return STRICTLY as a JSON list:
         reference_assets.extend(extra_reference_assets[:MAX_VEO_REFERENCE_IMAGES])
         return reference_assets
 
+    async def _build_storyboard_image_prompt(
+        self,
+        *,
+        state: ProjectState,
+        clip: VideoClip,
+        relevant_assets: list[dict[str, str]],
+        previous_shots: list[VideoClip],
+        asset_lookup: dict[str, Any],
+    ) -> str:
+        subject_labels: list[str] = []
+        location_labels: list[str] = []
+        other_labels: list[str] = []
+        for asset in relevant_assets:
+            asset_id = asset.get("id")
+            if not asset_id:
+                continue
+            stored_asset = asset_lookup.get(asset_id)
+            asset_label = display_asset_label(
+                getattr(stored_asset, "label", None),
+                getattr(stored_asset, "name", asset_id),
+            )
+            asset_type = asset.get("type")
+            if asset_type == "subject":
+                subject_labels.append(asset_label)
+            elif asset_type in {"location", "background"}:
+                location_labels.append(asset_label)
+            else:
+                other_labels.append(asset_label)
+
+        unique_subject_labels = list(dict.fromkeys([label for label in subject_labels if label]))
+        unique_location_labels = list(dict.fromkeys([label for label in location_labels if label]))
+        unique_other_labels = list(dict.fromkeys([label for label in other_labels if label]))
+        continuity_summaries = [
+            str(reference_shot.storyboard_text or "").strip()
+            for reference_shot in previous_shots[:STORYBOARD_MAX_REFERENCE_SHOTS]
+            if str(reference_shot.storyboard_text or "").strip()
+        ]
+        fallback_prompt = (
+            f"{clip.storyboard_text}. {state.instructions}. "
+            "Generate a new storyboard frame for this shot's specific action, framing, camera distance, and composition rather than repeating or lightly restaging a prior frame. "
+            "Treat any prior storyboard frames strictly as reference images for continuity of subject identity, wardrobe, props, lighting mood, and the overall scene; do not use them as fixed backgrounds or background plates. "
+            "Keep the same overall scene while changing the camera angle and composition to match this shot. "
+            "Explicitly name every visible character, creature, or named subject present in the shot. "
+            "Explicitly name the location or setting. "
+            "Describe the exact camera angle, framing, and what the camera can see from that angle. "
+            "Describe the pose, body orientation, gaze, and action of each visible character in detail. "
+            "Maintain continuity with any supplied references, but do not recreate the exact same pose, crop, composition, or camera angle unless the shot brief explicitly asks for it. "
+            "If characters are speaking, do not add burned-in subtitles, captions, or lyric overlays unless the shot brief explicitly asks for them. "
+            "If the brief calls for intentional in-world text such as signage, a display, or a title card, keep that text physically motivated by the scene rather than as an overlay. "
+            "If multiple reference assets are supplied, treat them as identity or environment guides only and compose them with realistic scale, spacing, depth, and perspective for the described shot. "
+            "Do not composite them as equal-sized cutouts, a lineup, or a collage unless the shot brief explicitly asks for that. "
+            f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
+        )
+
+        model_generate_content = getattr(getattr(self.client, "models", None), "generate_content", None)
+        if not callable(model_generate_content):
+            return fallback_prompt
+
+        prompt = f"""
+You are expanding a storyboard shot brief into a highly detailed still-image generation prompt for a cinematic storyboard frame.
+
+Return one dense plain-English paragraph that is specific enough for an image model to stage the shot accurately.
+
+Hard requirements:
+- Explicitly name every visible character, creature, or named subject present in the shot. If a labeled reference asset exists, preserve that label verbatim.
+- Explicitly name the location/setting. If a labeled location or environment reference exists, preserve that label verbatim.
+- Describe the exact camera angle, shot size/framing, camera height, and point of view in concrete cinematic terms.
+- Describe what is visible from that angle, including the most important foreground, midground, and background elements when relevant.
+- Describe the pose, body orientation, gaze, expression, and action of each visible character in detail.
+- Keep the frame specific to this shot's moment, not a generic restaging of the previous shot.
+- Maintain continuity with supplied references, but do not copy a continuity frame shot-for-shot unless explicitly requested.
+- Treat continuity reference images as scene references only. They are not fixed backgrounds, matte paintings, or background plates to reuse unchanged.
+- Keep the same overall scene continuity while changing the camera angle, composition, and visible spatial relationships to match this shot.
+- If characters are speaking, do not add burned-in subtitles, captions, or lyric overlays unless the shot brief explicitly asks for them.
+- If the brief calls for intentional in-world text such as signage, a device display, or a title card, keep that text physically motivated by the scene rather than as an overlay.
+- If multiple reference assets are supplied, use them only as identity/environment guides and compose them with realistic relative scale, spacing, depth, and perspective.
+- Keep the prompt visually concrete and direct. Avoid vague shorthand like "dynamic shot" or "cinematic angle" without specifying what that actually means.
+- End as a still-image prompt, not a video-motion instruction.
+
+Project style instructions:
+{state.instructions or "(none)"}
+
+Current shot brief:
+{clip.storyboard_text}
+
+Named subject references:
+{", ".join(unique_subject_labels) or "(none)"}
+
+Named location/environment references:
+{", ".join(unique_location_labels) or "(none)"}
+
+Other named references:
+{", ".join(unique_other_labels) or "(none)"}
+
+Continuity references from prior shots:
+{json.dumps(continuity_summaries, ensure_ascii=False) if continuity_summaries else "[]"}
+
+Return only the final detailed image prompt.
+""".strip()
+
+        try:
+            response = await self._generate_content_with_timeout(
+                model=self.orchestrator_model,
+                contents=[prompt],
+                config=self._orchestrator_config(
+                    thinking_budget=1024,
+                    temperature=0.2,
+                ),
+            )
+            candidate = str(getattr(response, "text", "") or "").strip()
+            candidate = candidate.strip().strip('"').strip("'")
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+            if len(candidate.split()) < 24:
+                return fallback_prompt
+            return candidate
+        except Exception:
+            return fallback_prompt
+
     async def _process_storyboard_clip(
         self,
         *,
@@ -4937,22 +5198,21 @@ Return STRICTLY as a JSON list:
         asset_bytes: dict[str, tuple[bytes, str]],
         asset_lookup: dict[str, Any],
     ) -> None:
+        base_prompt = await self._build_storyboard_image_prompt(
+            state=state,
+            clip=clip,
+            relevant_assets=relevant_assets,
+            previous_shots=previous_shots,
+            asset_lookup=asset_lookup,
+        )
         if not self.client:
-            clip.image_prompt = (
-                f"{clip.storyboard_text}. {state.instructions}. "
-                f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
-            )
+            clip.image_prompt = base_prompt
             clip.image_url = f"https://picsum.photos/seed/{clip.id}/800/450"
             clip.image_score = None
             clip.image_reference_ready = False
             clip.image_approved = False
             clip.image_critiques = []
             return
-
-        base_prompt = (
-            f"{clip.storyboard_text}. {state.instructions}. "
-            f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail."
-        )
         working_prompt = base_prompt
         clip.image_prompt = base_prompt
         clip.image_url = None
@@ -4967,12 +5227,18 @@ Return STRICTLY as a JSON list:
         primary_shot_path = _local_media_path(primary_previous_shot.image_url) if primary_previous_shot else None
         if primary_previous_shot and primary_shot_path and os.path.exists(primary_shot_path):
             clip_ref_parts.append(
-                "PRIMARY CONTINUITY REFERENCE (CRITICAL): Match the same character identity, environment, and visual continuity unless the shot description explicitly calls for a change."
+                "PRIMARY CONTINUITY REFERENCE IMAGE (CRITICAL): Match the same character identity, environment, props, wardrobe, and overall scene continuity unless the shot description explicitly calls for a change. Use this image as a reference only, not as a background plate, matte layer, or frame to copy shot-for-shot. Keep the same scene while changing the camera angle and composition to fit the current shot."
             )
             with open(primary_shot_path, "rb") as f:
                 clip_ref_parts.append(
                     genai.types.Part.from_bytes(data=f.read(), mime_type="image/png")
                 )
+
+        subject_reference_count = sum(1 for asset in relevant_assets if asset.get("type") == "subject")
+        if subject_reference_count > 1:
+            clip_ref_parts.append(
+                "MULTI-SUBJECT REFERENCE RULE: When multiple subject references are present, preserve each subject's identity from its own reference, but size and place them naturally for the described scene. Use realistic perspective and relative scale rather than matching the apparent size of the reference photos."
+            )
 
         for asset in relevant_assets:
             asset_id = asset.get("id")
@@ -4991,12 +5257,14 @@ Return STRICTLY as a JSON list:
                     f"REFERENCE: Subject '{asset_label}' [{asset_id}]. "
                     f"Treat this image as the canonical appearance reference for that named subject. "
                     f"Use this image ONLY for the subject's likeness/appearance. DO NOT copy or use the background from this image. "
-                    f"Ensure the subject is placed entirely in the environment described in the main prompt or continuity references."
+                    f"Ensure the subject is placed entirely in the environment described in the main prompt or continuity references. "
+                    f"Keep the subject's scale, distance, and perspective natural to the shot instead of matching the framing or apparent size of the reference photo."
                 )
             else:
                 clip_ref_parts.append(
                     f"REFERENCE: Background/Location '{asset_label}' [{asset_id}]. "
-                    f"Use this image as the canonical environmental reference for that named setting."
+                    f"Use this image as the canonical environmental reference for that named setting. "
+                    f"Use it for scene design only, not as a pasted overlay or collage element."
                 )
             if asset_context:
                 clip_ref_parts.append(f"AI-understood context for '{asset_label}': {asset_context}")
@@ -5081,10 +5349,10 @@ Return STRICTLY as a JSON list:
 
                 if attempt < STORYBOARD_MAX_ATTEMPTS:
                     working_prompt = (
-                        f"{clip.storyboard_text}. {state.instructions}. "
+                        f"{base_prompt} "
                         f"Mandatory corrections before regeneration: {critique['suggestions']}. "
-                        f"High quality, cinematic still frame, {self.image_aspect_ratio} aspect ratio, {self.image_size} detail. "
-                        "Do not introduce extra limbs, extra people, missing heads, fused bodies, broken animals, or inconsistent character design."
+                        "Do not introduce extra limbs, extra people, missing heads, fused bodies, broken animals, inconsistent character design, or burned-in subtitles/captions for speech unless explicitly requested. "
+                        "When multiple references are supplied, keep their proportions, spacing, and perspective natural to the described shot."
                     )
             except Exception as e:
                 clip.image_critiques.append(
@@ -5437,6 +5705,9 @@ Evaluate the generated frame on all of the following:
 5. Anatomy and artifact integrity
 6. Subject identity consistency with the reference shots/assets
 7. Scene and environment continuity with the reference shots
+8. Whether the frame improperly repeats a supplied continuity/reference frame instead of depicting this shot's own moment
+9. Whether any burned-in subtitles, captions, or lyric overlays appear without being requested by the shot brief
+10. Whether multiple referenced subjects/assets are composed with believable scale, spacing, and perspective
 
 Hard-fail findings must be reserved for blocking issues that clearly justify rejection.
 
@@ -5445,6 +5716,8 @@ Rules:
 - If a limb, hand, head, face, or body part is occluded, cropped, tiny, blurred, stylized, or otherwise hard to inspect, do not guess.
 - Uncertain concerns belong in reasoning/suggestions only, not hard-fail findings.
 - Every hard-fail finding must cite direct visual evidence from the frame itself.
+- Burned-in subtitles, captions, or lyric overlays for speech that the shot brief did not request are a hard fail.
+- Do not treat normal in-world text such as signage, a device screen, or a title card as a defect when the shot brief clearly calls for it.
 
 Return a single JSON object:
 {{

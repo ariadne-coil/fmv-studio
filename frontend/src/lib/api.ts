@@ -77,6 +77,7 @@ export interface ProjectState {
     instructions: string;
     additional_lore: string;
     music_url?: string;
+    music_duration_seconds?: number | null;
     image_provider?: string | null;
     video_provider?: string | null;
     music_provider?: string | null;
@@ -743,6 +744,26 @@ export const api = {
             return res.json();
         } catch (error) {
             throw toApiError("Failed to update storyboard approval", error);
+        }
+    },
+
+    async updateStoryboardClipText(id: string, clipId: string, storyboardText: string): Promise<ProjectState> {
+        const key = getStoredApiKey();
+        try {
+            const res = await fetch(`${API_URL}/projects/${id}/storyboard-clips/${clipId}/text`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(key ? { "X-API-Key": key } : {}),
+                },
+                body: JSON.stringify({ storyboard_text: storyboardText }),
+            });
+            if (!res.ok) {
+                throw new Error(await getApiErrorMessage(res, "Failed to save storyboard prompt"));
+            }
+            return res.json();
+        } catch (error) {
+            throw toApiError("Failed to save storyboard prompt", error);
         }
     },
 

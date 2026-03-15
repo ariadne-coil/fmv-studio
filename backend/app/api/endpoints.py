@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import asyncio
 import os
+import subprocess
 import uuid
 from typing import List, Optional
 
@@ -8,7 +9,7 @@ from fastapi import APIRouter, File, Header, HTTPException, Request, Response, U
 from pydantic import BaseModel, Field
 
 from app.agent.models import AgentStage, PipelineRunState, PipelineRunStatus, ProductionTimelineFragment, ProjectState
-from app.agent.graph import FMVAgentPipeline, _normalize_relevant_assets
+from app.agent.graph import FFPROBE, FMVAgentPipeline, _normalize_relevant_assets
 from app.core.asset_context import (
     analyze_uploaded_asset,
     build_asset_reference_registry,
@@ -107,6 +108,10 @@ class StoryboardFrameUploadRequest(BaseModel):
     name: str = Field(min_length=1)
 
 
+class StoryboardTextUpdateRequest(BaseModel):
+    storyboard_text: str = ""
+
+
 class AssetLabelUpdateRequest(BaseModel):
     label: Optional[str] = None
 
@@ -181,6 +186,56 @@ def _resolve_critic_model(override: Optional[str]) -> Optional[str]:
 def _write_project(project_id: str, state: ProjectState) -> ProjectState:
     get_storage_backend().write_project_state(project_id, state.model_dump_json())
     return state
+
+
+def _measure_audio_duration_seconds_sync(music_url: str | None) -> float | None:
+    storage = get_storage_backend()
+    music_path = storage.resolve_project_asset_to_local_path(music_url) if music_url else None
+    if not music_path or not os.path.exists(music_path):
+        return None
+
+    try:
+        proc = subprocess.run(
+            [
+                FFPROBE,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                music_path,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return None
+        value = float((proc.stdout or "").strip())
+        return round(max(0.0, value), 3)
+    except Exception:
+        return None
+
+
+def _ensure_music_duration_seconds(state: ProjectState) -> bool:
+    if not state.music_url:
+        if state.music_duration_seconds is not None:
+            state.music_duration_seconds = None
+            return True
+        return False
+
+    try:
+        current_value = float(state.music_duration_seconds) if state.music_duration_seconds is not None else None
+    except (TypeError, ValueError):
+        current_value = None
+
+    if current_value is not None and current_value > 0:
+        return False
+
+    measured = _measure_audio_duration_seconds_sync(state.music_url)
+    if measured is None:
+        return False
+
+    state.music_duration_seconds = measured
+    return True
 
 
 def _collect_project_asset_paths(state: ProjectState) -> list[str]:
@@ -445,7 +500,10 @@ def _default_music_fragment_for_state(state: ProjectState) -> list[ProductionTim
         _normalize_music_start_seconds(state.music_start_seconds),
         max(0.0, round(program_duration - 0.1, 3)),
     )
-    duration = max(0.1, round(program_duration - music_start, 3))
+    if state.music_duration_seconds is not None and float(state.music_duration_seconds) > 0:
+        duration = max(0.1, round(float(state.music_duration_seconds), 3))
+    else:
+        duration = max(0.1, round(program_duration - music_start, 3))
     return [
         ProductionTimelineFragment(
             id="music_frag_0",
@@ -459,6 +517,35 @@ def _default_music_fragment_for_state(state: ProjectState) -> list[ProductionTim
     ]
 
 
+def _shift_music_fragments(
+    fragments: list[ProductionTimelineFragment],
+    target_music_start: float,
+) -> list[ProductionTimelineFragment]:
+    working_fragments = [
+        fragment
+        for fragment in fragments
+        if (fragment.track_type or "video") == "music" and float(fragment.duration) > 0
+    ]
+    if not working_fragments:
+        return []
+
+    earliest_start = min(max(0.0, float(fragment.timeline_start)) for fragment in working_fragments)
+    shift_delta = round(target_music_start - earliest_start, 3)
+
+    return [
+        ProductionTimelineFragment(
+            id=fragment.id,
+            track_type="music",
+            source_clip_id=None,
+            timeline_start=round(float(fragment.timeline_start) + shift_delta, 3),
+            source_start=round(max(0.0, float(fragment.source_start)), 3),
+            duration=round(max(0.1, float(fragment.duration)), 3),
+            audio_enabled=True,
+        )
+        for fragment in sorted(working_fragments, key=lambda item: (item.timeline_start, item.id))
+    ]
+
+
 def _reconcile_after_music_start_edit(previous: ProjectState, state: ProjectState) -> None:
     state.music_start_seconds = _normalize_music_start_seconds(state.music_start_seconds)
     video_fragments = [
@@ -466,7 +553,24 @@ def _reconcile_after_music_start_edit(previous: ProjectState, state: ProjectStat
         for fragment in state.production_timeline
         if (fragment.track_type or "video") != "music"
     ]
-    state.production_timeline = video_fragments + _default_music_fragment_for_state(state)
+    music_fragments = _shift_music_fragments(
+        [
+            fragment
+            for fragment in state.production_timeline
+            if (fragment.track_type or "video") == "music"
+        ]
+        or [
+            fragment
+            for fragment in previous.production_timeline
+            if (fragment.track_type or "video") == "music"
+        ],
+        state.music_start_seconds,
+    )
+    state.production_timeline = video_fragments + (
+        music_fragments
+        if music_fragments
+        else _default_music_fragment_for_state(state)
+    )
     state.final_video_url = None
     state.last_error = None
     state.stage_summaries = {
@@ -810,12 +914,16 @@ def delete_project(project_id: str):
 def get_project(project_id: str):
     storage = get_storage_backend()
     try:
-        return ProjectState.model_validate_json(storage.read_project_state(project_id))
+        state = ProjectState.model_validate_json(storage.read_project_state(project_id))
+        if _ensure_music_duration_seconds(state):
+            _write_project(project_id, state)
+        return state
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
 
 @router.put("/projects/{project_id}", response_model=ProjectState)
 def update_project(project_id: str, state: ProjectState):
+    _ensure_music_duration_seconds(state)
     if get_storage_backend().project_exists(project_id):
         current = get_project(project_id)
         if _planning_signature(current) != _planning_signature(state):
@@ -841,6 +949,23 @@ def update_storyboard_clip_approval(project_id: str, clip_id: str, payload: Clip
     state = get_project(project_id)
     updated_state = _apply_image_approval_change(state, clip_id, payload.approved)
     return _write_project(project_id, updated_state)
+
+
+@router.post("/projects/{project_id}/storyboard-clips/{clip_id}/text", response_model=ProjectState)
+def update_storyboard_clip_text(project_id: str, clip_id: str, payload: StoryboardTextUpdateRequest):
+    if _get_project_run_state(project_id):
+        raise HTTPException(status_code=409, detail="Storyboard edits are unavailable while a background pipeline run is active")
+
+    state = get_project(project_id)
+    previous_state = state.model_copy(deep=True)
+    clip = _get_clip_or_404(state, clip_id)
+    next_storyboard_text = str(payload.storyboard_text or "").strip()
+    if (clip.storyboard_text or "").strip() == next_storyboard_text:
+        return state
+
+    clip.storyboard_text = next_storyboard_text
+    _reconcile_after_planning_edits(previous_state, state)
+    return _write_project(project_id, state)
 
 
 @router.post("/projects/{project_id}/clips/{clip_id}/video-approval", response_model=ProjectState)
@@ -997,6 +1122,7 @@ async def regenerate_music_preview(
 
     try:
         await pipeline._generate_music_track(state)
+        _ensure_music_duration_seconds(state)
         state.last_error = None
     except Exception as exc:
         state.music_url = previous_music_url

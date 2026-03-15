@@ -169,22 +169,14 @@ function buildDefaultMusicProductionFragment(
     musicDuration?: number | null,
     musicStartSeconds?: number | null,
 ): ProductionTimelineFragment | null {
-    if (programDuration <= 0) {
+    if (programDuration <= 0 && !(Number.isFinite(musicDuration) && (musicDuration ?? 0) > 0)) {
         return null;
     }
 
     const effectiveMusicDuration = Number.isFinite(musicDuration) && (musicDuration ?? 0) > 0
-        ? Math.max(MIN_MUSIC_FRAGMENT_DURATION, Math.min(programDuration, Number(musicDuration)))
-        : null;
-    const maxStart = Math.max(
-        0,
-        programDuration - (effectiveMusicDuration ?? MIN_MUSIC_FRAGMENT_DURATION),
-    );
-    const timelineStart = Math.min(normalizeMusicStartSeconds(musicStartSeconds), Number(maxStart.toFixed(3)));
-    const duration = effectiveMusicDuration ?? Math.max(
-        MIN_MUSIC_FRAGMENT_DURATION,
-        Number((programDuration - timelineStart).toFixed(3)),
-    );
+        ? Math.max(MIN_MUSIC_FRAGMENT_DURATION, Number((musicDuration ?? 0).toFixed(3)))
+        : Math.max(MIN_MUSIC_FRAGMENT_DURATION, Number(programDuration.toFixed(3)));
+    const timelineStart = normalizeMusicStartSeconds(musicStartSeconds);
 
     return {
         id: "music_frag_0",
@@ -192,9 +184,38 @@ function buildDefaultMusicProductionFragment(
         source_clip_id: null,
         timeline_start: Number(timelineStart.toFixed(3)),
         source_start: 0,
-        duration: Number(duration.toFixed(3)),
+        duration: Number(effectiveMusicDuration.toFixed(3)),
         audio_enabled: true,
     };
+}
+
+function shiftMusicTimelineFragments(
+    fragments: ProductionTimelineFragment[],
+    nextMusicStartSeconds: number,
+): ProductionTimelineFragment[] {
+    const musicFragments = fragments
+        .filter((fragment) => (fragment.track_type ?? "video") === "music" && fragment.duration > 0)
+        .sort((left, right) => left.timeline_start - right.timeline_start);
+
+    if (!musicFragments.length) {
+        return [];
+    }
+
+    const earliestStart = Math.max(
+        0,
+        Math.min(...musicFragments.map((fragment) => Number(fragment.timeline_start) || 0)),
+    );
+    const shiftDelta = nextMusicStartSeconds - earliestStart;
+
+    return musicFragments.map((fragment) => ({
+        ...fragment,
+        track_type: "music" as const,
+        source_clip_id: null,
+        timeline_start: Number((fragment.timeline_start + shiftDelta).toFixed(3)),
+        source_start: Number(Math.max(0, fragment.source_start).toFixed(3)),
+        duration: Number(Math.max(MIN_MUSIC_FRAGMENT_DURATION, fragment.duration).toFixed(3)),
+        audio_enabled: true,
+    }));
 }
 
 function buildDefaultProductionTimeline(
@@ -299,8 +320,6 @@ function normalizeProductionTimeline(
             return normalized;
         });
 
-    const totalVideoDuration = normalizedVideo.reduce((sum, fragment) => sum + fragment.duration, 0);
-
     const normalizedMusic: ProductionTimelineFragment[] = [];
     let previousMusicEnd = 0;
     for (const fragment of fragments
@@ -319,9 +338,6 @@ function normalizeProductionTimeline(
         }
         if (duration <= 0) continue;
 
-        if (totalVideoDuration > 0) {
-            timelineStart = Math.min(timelineStart, Math.max(0, totalVideoDuration - duration));
-        }
         timelineStart = Math.max(timelineStart, Number(previousMusicEnd.toFixed(3)));
 
         const normalized = {
@@ -588,6 +604,9 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     });
     const musicStartAutosaveTimeoutRef = useRef<number | null>(null);
     const musicStartAutosaveRequestRef = useRef(0);
+    const storyboardTextAutosaveTimeoutsRef = useRef<Record<string, number>>({});
+    const storyboardTextAutosaveRequestRef = useRef<Record<string, number>>({});
+    const storyboardTextDraftsRef = useRef<Record<string, string>>({});
     const stagePlaybackFrameRef = useRef<number | null>(null);
     const stagePlaybackLastFrameRef = useRef<number | null>(null);
     const stagePlaybackSecondsRef = useRef(0);
@@ -697,6 +716,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const displayStageIndex = stageMap[resolvedDisplayStage] ?? 0;
     const isCurrentDisplayedStage = displayStage === (project?.current_stage ?? 'input');
     const planningMusicStartSeconds = normalizeMusicStartSeconds(project?.music_start_seconds);
+    const persistedMusicDuration = Math.max(
+        0,
+        Number.isFinite(project?.music_duration_seconds)
+            ? Number(project?.music_duration_seconds)
+            : 0,
+    );
     const productionTimeline = project
         ? normalizeProductionTimeline(
             project.production_timeline.length > 0
@@ -708,20 +733,36 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                         ...project.production_timeline,
                         ...buildDefaultProductionTimeline(project.timeline, {
                             includeMusic: true,
-                            musicDuration: productionMusicDuration || undefined,
+                            musicDuration: productionMusicDuration || persistedMusicDuration || undefined,
                             musicStartSeconds: planningMusicStartSeconds,
                         }).filter((fragment) => fragment.track_type === "music"),
                     ]
                     : project.production_timeline
                 : buildDefaultProductionTimeline(project.timeline, {
                     includeMusic: !!project.music_url,
-                    musicDuration: productionMusicDuration || undefined,
+                    musicDuration: productionMusicDuration || persistedMusicDuration || undefined,
                     musicStartSeconds: planningMusicStartSeconds,
                 }),
             project.timeline,
-            productionMusicDuration || undefined,
+            productionMusicDuration || persistedMusicDuration || undefined,
         )
         : [];
+    const effectiveMusicDuration = Math.max(
+        0,
+        productionMusicDuration > 0
+            ? productionMusicDuration
+            : persistedMusicDuration > 0
+                ? persistedMusicDuration
+            : productionTimeline
+                .filter((fragment) => (fragment.track_type ?? "video") === "music")
+                .reduce(
+                    (maxDuration, fragment) => Math.max(
+                        maxDuration,
+                        Math.max(0, fragment.source_start) + Math.max(0, fragment.duration),
+                    ),
+                    0,
+                ),
+    );
     const selectedAsset = project
         ? project.assets.find((asset) => asset.id === selectedAssetId) ?? project.assets[0] ?? null
         : null;
@@ -774,7 +815,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
             0,
         ) ?? 0,
         project?.music_url
-            ? planningMusicStartSeconds + Math.max(0, productionMusicDuration || 0)
+            ? planningMusicStartSeconds + effectiveMusicDuration
             : 0,
     );
     const supportsFooterStagePlayback = displayStage === "input"
@@ -856,6 +897,10 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
             window.clearTimeout(musicStartAutosaveTimeoutRef.current);
             musicStartAutosaveTimeoutRef.current = null;
         }
+        Object.values(storyboardTextAutosaveTimeoutsRef.current).forEach((timeoutId) => {
+            window.clearTimeout(timeoutId);
+        });
+        storyboardTextAutosaveTimeoutsRef.current = {};
     }, []);
 
     useEffect(() => {
@@ -1304,22 +1349,29 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         const videoFragments = project.production_timeline.filter(
             (fragment) => (fragment.track_type ?? "video") !== "music",
         );
+        const musicFragments = project.production_timeline.filter(
+            (fragment) => (fragment.track_type ?? "video") === "music",
+        );
         const nextProductionTimeline = videoFragments.length > 0
             ? [
                 ...videoFragments,
                 ...(
                     project.music_url
-                        ? buildDefaultProductionTimeline(project.timeline, {
-                            includeMusic: true,
-                            musicDuration: productionMusicDuration || undefined,
-                            musicStartSeconds: nextMusicStartSeconds,
-                        }).filter((fragment) => fragment.track_type === "music")
+                        ? (
+                            musicFragments.length > 0
+                                ? shiftMusicTimelineFragments(musicFragments, nextMusicStartSeconds)
+                                : buildDefaultProductionTimeline(project.timeline, {
+                                    includeMusic: true,
+                                    musicDuration: effectiveMusicDuration || undefined,
+                                    musicStartSeconds: nextMusicStartSeconds,
+                                }).filter((fragment) => fragment.track_type === "music")
+                        )
                         : []
                 ),
             ]
             : buildDefaultProductionTimeline(project.timeline, {
                 includeMusic: !!project.music_url,
-                musicDuration: productionMusicDuration || undefined,
+                musicDuration: effectiveMusicDuration || undefined,
                 musicStartSeconds: nextMusicStartSeconds,
             });
 
@@ -1401,7 +1453,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         const audio = footerStageAudioRef.current;
         if (!audio || !project?.music_url) return;
 
-        const knownDuration = Number.isFinite(audio.duration) ? audio.duration : productionMusicDuration;
+        const knownDuration = Number.isFinite(audio.duration) ? audio.duration : effectiveMusicDuration;
         const musicRelativeSeconds = seconds - planningMusicStartSeconds;
 
         if (musicRelativeSeconds < 0) {
@@ -1658,7 +1710,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         const normalizedTimeline = normalizeProductionTimeline(
             fragments,
             project.timeline,
-            productionMusicDuration || undefined,
+            effectiveMusicDuration || undefined,
         );
         const nextProject: ProjectState = {
             ...project,
@@ -2155,7 +2207,50 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         const newTimeline = project.timeline.map(clip =>
             clip.id === clipId ? { ...clip, storyboard_text: newText } : clip
         );
-        setProject({ ...project, timeline: newTimeline });
+        const nextProject = { ...project, timeline: newTimeline };
+        storyboardTextDraftsRef.current[clipId] = newText;
+        setProject(nextProject);
+
+        const existingTimeout = storyboardTextAutosaveTimeoutsRef.current[clipId];
+        if (existingTimeout !== undefined) {
+            window.clearTimeout(existingTimeout);
+        }
+        const requestId = (storyboardTextAutosaveRequestRef.current[clipId] ?? 0) + 1;
+        storyboardTextAutosaveRequestRef.current[clipId] = requestId;
+        storyboardTextAutosaveTimeoutsRef.current[clipId] = window.setTimeout(async () => {
+            try {
+                const savedProject = await api.updateStoryboardClipText(nextProject.project_id, clipId, newText);
+                if (storyboardTextAutosaveRequestRef.current[clipId] !== requestId) return;
+                if (storyboardTextDraftsRef.current[clipId] === newText) {
+                    delete storyboardTextDraftsRef.current[clipId];
+                }
+                setProject((currentProject) => {
+                    if (!currentProject || currentProject.project_id !== savedProject.project_id) {
+                        return currentProject;
+                    }
+                    const dirtyDrafts = storyboardTextDraftsRef.current;
+                    if (!Object.keys(dirtyDrafts).length) {
+                        return savedProject;
+                    }
+                    return {
+                        ...savedProject,
+                        timeline: savedProject.timeline.map((savedClip) => {
+                            const draftText = dirtyDrafts[savedClip.id];
+                            return draftText != null
+                                ? { ...savedClip, storyboard_text: draftText }
+                                : savedClip;
+                        }),
+                    };
+                });
+            } catch (error) {
+                if (storyboardTextAutosaveRequestRef.current[clipId] !== requestId) return;
+                console.error("Failed to autosave storyboard prompt", error);
+            } finally {
+                if (storyboardTextAutosaveRequestRef.current[clipId] === requestId) {
+                    delete storyboardTextAutosaveTimeoutsRef.current[clipId];
+                }
+            }
+        }, 450);
     };
 
     const handleStoryboardTimelineChange = (nextTimeline: VideoClip[]) => {
@@ -2249,8 +2344,54 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
         setStoryboardRegeneratingClipId(clipId);
 
         try {
-            const serverProject = await api.regenerateStoryboardClip(project.project_id, clipId);
-            setProject(serverProject);
+            const draftTimeout = storyboardTextAutosaveTimeoutsRef.current[clipId];
+            if (draftTimeout !== undefined) {
+                window.clearTimeout(draftTimeout);
+                delete storyboardTextAutosaveTimeoutsRef.current[clipId];
+            }
+            const targetClip = project.timeline.find((clip) => clip.id === clipId);
+            const persistedProject = targetClip
+                ? await api.updateStoryboardClipText(project.project_id, clipId, targetClip.storyboard_text)
+                : project;
+            delete storyboardTextDraftsRef.current[clipId];
+            setProject((currentProject) => {
+                if (!currentProject || currentProject.project_id !== persistedProject.project_id) {
+                    return currentProject;
+                }
+                const dirtyDrafts = storyboardTextDraftsRef.current;
+                if (!Object.keys(dirtyDrafts).length) {
+                    return persistedProject;
+                }
+                return {
+                    ...persistedProject,
+                    timeline: persistedProject.timeline.map((savedClip) => {
+                        const draftText = dirtyDrafts[savedClip.id];
+                        return draftText != null
+                            ? { ...savedClip, storyboard_text: draftText }
+                            : savedClip;
+                    }),
+                };
+            });
+
+            const serverProject = await api.regenerateStoryboardClip(persistedProject.project_id, clipId);
+            setProject((currentProject) => {
+                if (!currentProject || currentProject.project_id !== serverProject.project_id) {
+                    return currentProject;
+                }
+                const dirtyDrafts = storyboardTextDraftsRef.current;
+                if (!Object.keys(dirtyDrafts).length) {
+                    return serverProject;
+                }
+                return {
+                    ...serverProject,
+                    timeline: serverProject.timeline.map((savedClip) => {
+                        const draftText = dirtyDrafts[savedClip.id];
+                        return draftText != null
+                            ? { ...savedClip, storyboard_text: draftText }
+                            : savedClip;
+                    }),
+                };
+            });
             setViewedStage(null);
         } catch (error) {
             console.error("Storyboard regeneration failed", error);
@@ -2812,7 +2953,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                     } else if (newState.current_stage === 'production') {
                         newState.production_timeline = buildDefaultProductionTimeline(newState.timeline, {
                             includeMusic: !!newState.music_url,
-                            musicDuration: productionMusicDuration || undefined,
+                            musicDuration: effectiveMusicDuration || undefined,
                             musicStartSeconds: normalizeMusicStartSeconds(newState.music_start_seconds),
                         });
                         newState.final_video_url = undefined;
@@ -4663,7 +4804,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                     <StageTimelineOverview
                                         clips={project.timeline}
                                         musicStartSeconds={planningMusicStartSeconds}
-                                        musicDurationSeconds={productionMusicDuration > 0 ? productionMusicDuration : undefined}
+                                        musicDurationSeconds={effectiveMusicDuration > 0 ? effectiveMusicDuration : undefined}
                                         showMusic={!!project.music_url}
                                         playheadSeconds={stagePlaybackSeconds}
                                         onSeek={hasFooterStageContent ? handleFooterStageSeek : undefined}
@@ -4702,7 +4843,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                 <StageTimelineOverview
                                     clips={project.timeline}
                                     musicStartSeconds={planningMusicStartSeconds}
-                                    musicDurationSeconds={productionMusicDuration > 0 ? productionMusicDuration : undefined}
+                                    musicDurationSeconds={effectiveMusicDuration > 0 ? effectiveMusicDuration : undefined}
                                     showMusic={!!project.music_url}
                                     label={displayStage === "filming" ? "Filming Timeline" : "Timeline Overview"}
                                 />
