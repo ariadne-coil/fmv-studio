@@ -18,6 +18,7 @@ import app.storage as storage_module
 from app.agent.graph import (
     FMVAgentPipeline,
     _is_resource_exhausted_error,
+    _is_timeout_error,
     _local_media_path,
     _normalize_image_critique,
     _normalize_veo_duration_sequence,
@@ -188,6 +189,33 @@ def test_get_project_run_state_clears_stale_cloud_run(monkeypatch, tmp_path):
     )
 
 
+def test_get_project_clears_stale_filming_run_from_main_project_payload(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    state = ProjectState(
+        project_id="proj_stale_filming_run",
+        name="Stale Filming Run",
+        current_stage=AgentStage.FILMING,
+        active_run=PipelineRunState(
+            run_id="run-stale-film",
+            stage=AgentStage.FILMING,
+            status=PipelineRunStatus.RUNNING,
+            driver="cloud_tasks",
+            started_at="2026-03-12T00:00:00+00:00",
+            updated_at="2026-03-12T00:00:00+00:00",
+        ),
+    )
+    (projects_dir / "proj_stale_filming_run.fmv").write_text(state.model_dump_json())
+
+    persisted = endpoints_module.get_project("proj_stale_filming_run")
+
+    assert persisted.active_run is None
+    assert persisted.last_error == (
+        "Background filming run timed out while waiting for progress. Please retry the stage."
+    )
+
+
 class _FakeFiles:
     def __init__(self, video_bytes: bytes):
         self.video_bytes = video_bytes
@@ -310,6 +338,85 @@ async def _read_streaming_response_body(response) -> bytes:
 def test_normalize_veo_duration_sequence_matches_allowed_lengths_and_target_total():
     assert _normalize_veo_duration_sequence([5, 5, 5, 5, 6], target_total=26) == [4, 6, 4, 6, 6]
     assert _normalize_veo_duration_sequence([5.2], target_total=None) == [6]
+
+
+def test_normalize_veo_duration_sequence_supports_ingredients_mode_eight_second_only():
+    assert _normalize_veo_duration_sequence(
+        [4, 6, 8],
+        target_total=18,
+        allowed_durations=(8,),
+    ) == [8, 8, 8]
+
+
+def test_update_project_enabling_ingredients_mode_preserves_existing_media_and_stage(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+
+    current = ProjectState(
+        project_id="proj_ingredients_mode_toggle",
+        name="Ingredients Mode Toggle Preserve Media",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0,
+                duration=4.0,
+                storyboard_text="Shot one",
+                image_url="/projects/clip_0.png",
+                image_approved=True,
+                video_url="/projects/clip_0.mp4",
+                video_approved=True,
+            ),
+            VideoClip(
+                id="clip_1",
+                timeline_start=4.0,
+                duration=6.0,
+                storyboard_text="Shot two",
+                image_url="/projects/clip_1.png",
+                image_approved=True,
+                video_url="/projects/clip_1.mp4",
+                video_approved=True,
+            ),
+        ],
+        production_timeline=[
+            ProductionTimelineFragment(
+                id="video_frag_0",
+                source_clip_id="clip_0",
+                timeline_start=0.0,
+                duration=4.0,
+                audio_enabled=True,
+            ),
+            ProductionTimelineFragment(
+                id="video_frag_1",
+                source_clip_id="clip_1",
+                timeline_start=4.0,
+                duration=6.0,
+                audio_enabled=True,
+            ),
+        ],
+        final_video_url="/projects/proj_ingredients_mode_toggle_final.mp4",
+    )
+    (projects_dir / "proj_ingredients_mode_toggle.fmv").write_text(current.model_dump_json())
+
+    updated = current.model_copy(deep=True)
+    updated.ingredients_mode_enabled = True
+
+    result = endpoints_module.update_project("proj_ingredients_mode_toggle", updated)
+
+    assert result.ingredients_mode_enabled is True
+    assert [clip.duration for clip in result.timeline] == [4.0, 6.0]
+    assert [clip.timeline_start for clip in result.timeline] == [0.0, 4.0]
+    assert [clip.video_url for clip in result.timeline] == [
+        "/projects/clip_0.mp4",
+        "/projects/clip_1.mp4",
+    ]
+    assert [clip.image_url for clip in result.timeline] == [
+        "/projects/clip_0.png",
+        "/projects/clip_1.png",
+    ]
+    assert len(result.production_timeline) == 2
+    assert result.final_video_url == "/projects/proj_ingredients_mode_toggle_final.mp4"
+    assert result.current_stage == AgentStage.FILMING
 
 
 def test_build_project_asset_response_streams_full_file_without_ranges(tmp_path):
@@ -3820,7 +3927,7 @@ async def test_generate_google_video_clip_uses_ingredients_mode_with_selected_st
 
 
 @pytest.mark.asyncio
-async def test_generate_google_video_clip_falls_back_to_frame_mode_when_ingredients_return_no_videos(monkeypatch, tmp_path):
+async def test_generate_google_video_clip_does_not_fall_back_to_second_attempt_when_ingredients_return_no_videos(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     storyboard_path = tmp_path / "storyboard.png"
     storyboard_path.write_bytes(b"storyboard-image")
@@ -3829,31 +3936,27 @@ async def test_generate_google_video_clip_falls_back_to_frame_mode_when_ingredie
 
     pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
     pipeline.client = _FakeClient(
-        video_bytes=b"frame-video-bytes",
-        response=[_FakeEmptyPayload(), _FakePayload()],
+        video_bytes=b"",
+        response=[_FakeEmptyPayload()],
     )
 
-    video_bytes = await pipeline._generate_google_video_clip(
-        prompt="Animate the singer stepping forward as the city lights shimmer.",
-        duration_seconds=6,
-        image_path=str(storyboard_path),
-        reference_assets=[
-            VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
-            VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
-        ],
-    )
+    with pytest.raises(RuntimeError, match="returned no videos"):
+        await pipeline._generate_google_video_clip(
+            prompt="Animate the singer stepping forward as the city lights shimmer.",
+            duration_seconds=6,
+            image_path=str(storyboard_path),
+            reference_assets=[
+                VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
+                VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
+            ],
+        )
 
-    assert video_bytes == b"frame-video-bytes"
-    assert len(pipeline.client.models.calls) == 2
-    first_request = pipeline.client.models.calls[0]
-    second_request = pipeline.client.models.calls[1]
-    assert first_request["config"].duration_seconds == 8
-    assert len(first_request["config"].reference_images) == 2
-    assert first_request["source"].image is None
-    assert second_request["config"].duration_seconds == 6
-    assert getattr(second_request["config"], "reference_images", None) is None
-    assert second_request["source"].image is not None
-    assert len(pipeline.client.files.download_calls) == 1
+    assert len(pipeline.client.models.calls) == 1
+    request = pipeline.client.models.calls[0]
+    assert request["config"].duration_seconds == 8
+    assert len(request["config"].reference_images) == 2
+    assert request["source"].image is None
+    assert len(pipeline.client.files.download_calls) == 0
 
 
 @pytest.mark.asyncio
@@ -3913,6 +4016,150 @@ async def test_generate_google_video_clip_surfaces_operation_error_message(monke
                 VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
             ],
         )
+
+
+def test_google_video_operation_timeout_seconds_scales_for_heavier_jobs():
+    pipeline = FMVAgentPipeline(api_key="dummy", video_resolution="720p")
+
+    fast_timeout = pipeline._google_video_operation_timeout_seconds(
+        model_name="veo-3.1-fast-generate-001",
+        duration_seconds=4,
+        uses_ingredients_mode=False,
+        reference_asset_count=0,
+    )
+    quality_timeout = pipeline._google_video_operation_timeout_seconds(
+        model_name="veo-3.1-generate-001",
+        duration_seconds=8,
+        uses_ingredients_mode=True,
+        reference_asset_count=3,
+    )
+
+    pipeline.video_resolution = "4k"
+    four_k_timeout = pipeline._google_video_operation_timeout_seconds(
+        model_name="veo-3.1-fast-generate-001",
+        duration_seconds=6,
+        uses_ingredients_mode=False,
+        reference_asset_count=0,
+    )
+
+    assert fast_timeout == 600
+    assert quality_timeout > fast_timeout
+    assert four_k_timeout > fast_timeout
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_timeout_message_includes_generation_context(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"storyboard-image")
+    character_path = tmp_path / "mira.png"
+    character_path.write_bytes(b"mira-image")
+
+    pending_operation = SimpleNamespace(
+        done=False,
+        name="operations/slow-veo",
+        response=None,
+        error=None,
+    )
+    captured_calls = []
+
+    class _PendingModels:
+        def generate_videos(self, **kwargs):
+            captured_calls.append(kwargs)
+            return pending_operation
+
+    class _PendingOperations:
+        def get(self, operation, *, config=None):
+            return operation
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
+    pipeline.client = SimpleNamespace(
+        models=_PendingModels(),
+        files=_FakeFiles(b""),
+        operations=_PendingOperations(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_google_video_operation_timeout_seconds",
+        lambda **kwargs: 10,
+    )
+    fake_time = [0.0]
+    monkeypatch.setattr(graph_module.time, "monotonic", lambda: fake_time[0])
+
+    async def fake_sleep(_seconds):
+        fake_time[0] += _seconds
+        return None
+
+    monkeypatch.setattr(graph_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"timed out after 10s \(model=veo-3\.1-fast-generate-001, mode=ingredients, refs=2, duration=6s, resolution=1080p\)",
+    ):
+        await pipeline._generate_google_video_clip(
+            prompt="Animate the singer stepping forward as the city lights shimmer.",
+            duration_seconds=6,
+            image_path=str(storyboard_path),
+            reference_assets=[
+                VideoGenerationReferenceAsset(path=str(storyboard_path), label="Storyboard frame"),
+                VideoGenerationReferenceAsset(path=str(character_path), label="Mira"),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_google_video_clip_invokes_heartbeat_while_polling(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    storyboard_path = tmp_path / "storyboard.png"
+    storyboard_path.write_bytes(b"storyboard-image")
+
+    pending_operation = SimpleNamespace(
+        done=False,
+        name="operations/slow-veo",
+        response=None,
+        error=None,
+    )
+
+    class _PendingModels:
+        def generate_videos(self, **kwargs):
+            return pending_operation
+
+    class _PendingOperations:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, operation, *, config=None):
+            self.calls += 1
+            if self.calls >= 3:
+                operation.done = True
+                operation.response = _FakePayload()
+            return operation
+
+    fake_time = [0.0]
+    heartbeat_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        fake_time[0] += seconds
+        return None
+
+    pipeline = FMVAgentPipeline(api_key="dummy", video_model="veo-3.1-fast-generate-001")
+    pipeline.client = SimpleNamespace(
+        models=_PendingModels(),
+        files=_FakeFiles(b"fake-video-bytes"),
+        operations=_PendingOperations(),
+    )
+    monkeypatch.setattr(graph_module.time, "monotonic", lambda: fake_time[0])
+    monkeypatch.setattr(graph_module.asyncio, "sleep", fake_sleep)
+
+    video_bytes = await pipeline._generate_google_video_clip(
+        prompt="Animate this scene.",
+        duration_seconds=6,
+        image_path=str(storyboard_path),
+        heartbeat_callback=lambda: heartbeat_calls.append(fake_time[0]),
+    )
+
+    assert video_bytes == b"fake-video-bytes"
+    assert heartbeat_calls == [0.0, 5.0, 10.0]
 
 
 def test_reconcile_production_timeline_syncs_whole_clip_fragment_durations_to_latest_storyboard_timing():
@@ -4083,7 +4330,7 @@ def test_reconcile_production_timeline_preserves_music_duration_beyond_picture()
 
 
 @pytest.mark.asyncio
-async def test_node_filming_retries_with_adjusted_prompt_after_first_generation_failure(monkeypatch, tmp_path):
+async def test_node_filming_does_not_retry_with_adjusted_prompt_after_generation_failure(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
     storyboard_path = projects_dir / "proj_retry_clip_0.png"
@@ -4095,22 +4342,22 @@ async def test_node_filming_retries_with_adjusted_prompt_after_first_generation_
 
     prompts = []
 
-    async def fake_generate_video_clip(*, prompt, duration_seconds, image_path, reference_assets=None):
+    async def fake_generate_video_clip(
+        *,
+        prompt,
+        duration_seconds,
+        image_path,
+        reference_assets=None,
+        job_started_callback=None,
+        heartbeat_callback=None,
+    ):
         prompts.append(prompt)
-        if len(prompts) == 1:
-            raise RuntimeError("Google Veo returned no videos")
-        return b"retry-video-bytes"
-
-    async def fake_retry_prompt(clip, state, *, failed_prompt, failure_message):
-        assert failed_prompt.startswith("Intense macro visualization")
-        assert "returned no videos" in failure_message
-        return "Slow continuous camera move through the scene as intense macro visualization of internal clockwork gears jamming and overheating."
+        raise RuntimeError("Google Veo returned no videos")
 
     async def fake_critique(**kwargs):
         return {"score": 8, "reasoning": "ok", "suggestions": ""}
 
     pipeline._generate_video_clip = fake_generate_video_clip
-    pipeline._build_video_retry_prompt = fake_retry_prompt
     pipeline._critique_video_frame = fake_critique
 
     state = ProjectState(
@@ -4134,10 +4381,131 @@ async def test_node_filming_retries_with_adjusted_prompt_after_first_generation_
 
     result = await pipeline.node_filming(state)
 
-    assert result.timeline[0].video_url is not None
-    assert len(prompts) == 2
+    assert result.timeline[0].video_url is None
+    assert result.timeline[0].video_approved is False
+    assert len(prompts) == 1
     assert prompts[0].startswith("Intense macro visualization")
-    assert prompts[1].startswith("Slow continuous camera move through the scene as")
+    assert "returned no videos" in result.timeline[0].video_critiques[-1]
+
+
+def test_is_timeout_error_detects_wrapped_timeout():
+    wrapped = RuntimeError("Retried with adjusted phrasing, but Veo still failed")
+    wrapped.__cause__ = TimeoutError("Google Veo job timed out after 600s")
+
+    assert _is_timeout_error(wrapped) is True
+
+
+@pytest.mark.asyncio
+async def test_node_filming_persists_video_job_tracking_for_timed_out_clip(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+    storyboard_path = projects_dir / "proj_timeout_clip_0.png"
+    storyboard_path.write_bytes(b"fake-image")
+
+    persisted_states = []
+
+    async def persist_state(state):
+        persisted_states.append(state.model_copy(deep=True))
+
+    pipeline = FMVAgentPipeline(api_key="dummy", persist_state_callback=persist_state)
+    pipeline.client = SimpleNamespace(models=SimpleNamespace())
+
+    async def fake_generate_video_clip(
+        *,
+        prompt,
+        duration_seconds,
+        image_path,
+        reference_assets=None,
+        job_started_callback=None,
+        heartbeat_callback=None,
+    ):
+        if job_started_callback is not None:
+            await job_started_callback(
+                "operations/slow-veo",
+                "gs://test-bucket/generated-video/slow-job/",
+                "veo-3.1-fast-generate-001",
+            )
+        raise TimeoutError("Google Veo job timed out after 600s")
+
+    pipeline._generate_video_clip = fake_generate_video_clip
+
+    state = ProjectState(
+        project_id="proj_timeout",
+        name="Timed Out Filming",
+        current_stage=AgentStage.STORYBOARDING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0,
+                duration=6.0,
+                storyboard_text="A lighthouse in fog at dusk.",
+                image_url="/projects/proj_timeout_clip_0.png",
+                image_approved=True,
+            )
+        ],
+    )
+
+    result = await pipeline.node_filming(state)
+
+    assert result.timeline[0].video_url is None
+    assert result.timeline[0].video_approved is False
+    assert result.timeline[0].video_generation_operation_name == "operations/slow-veo"
+    assert result.timeline[0].video_generation_output_gcs_uri == "gs://test-bucket/generated-video/slow-job/"
+    assert result.timeline[0].video_generation_model == "veo-3.1-fast-generate-001"
+    assert any(saved.timeline[0].video_generation_operation_name == "operations/slow-veo" for saved in persisted_states)
+
+
+@pytest.mark.asyncio
+async def test_node_filming_harvests_completed_video_from_timed_out_job(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    projects_dir = _patch_storage_roots(monkeypatch, tmp_path)
+    storyboard_path = projects_dir / "proj_harvest_clip_0.png"
+    storyboard_path.write_bytes(b"fake-image")
+
+    pipeline = FMVAgentPipeline(api_key="dummy")
+    pipeline.client = SimpleNamespace(models=SimpleNamespace())
+    pipeline._download_first_gcs_prefix_bytes = lambda prefix_uri: b"harvested-video-bytes"
+    pipeline._probe_video_dimensions = lambda video_path: asyncio.sleep(0, result=(1920, 1080))
+
+    async def fake_generate_video_clip(*, prompt, duration_seconds, image_path, reference_assets=None, job_started_callback=None):
+        raise AssertionError("Harvested clips should not start a new Veo generation")
+
+    async def fake_critique_video_frame(*, video_path, video_prompt, duration):
+        return {"score": 9, "reasoning": "Recovered clip looks clean."}
+
+    pipeline._generate_video_clip = fake_generate_video_clip
+    pipeline._critique_video_frame = fake_critique_video_frame
+
+    state = ProjectState(
+        project_id="proj_harvest",
+        name="Harvest Timed Out Video",
+        current_stage=AgentStage.FILMING,
+        timeline=[
+            VideoClip(
+                id="clip_0",
+                timeline_start=0,
+                duration=6.0,
+                storyboard_text="A lighthouse in fog at dusk.",
+                image_url="/projects/proj_harvest_clip_0.png",
+                image_approved=True,
+                video_prompt="A gentle push-in through the fog toward the lighthouse.",
+                video_generation_operation_name="operations/slow-veo",
+                video_generation_output_gcs_uri="gs://test-bucket/generated-video/slow-job/",
+                video_generation_model="veo-3.1-fast-generate-001",
+                video_generation_started_at="2026-03-15T00:00:00+00:00",
+            )
+        ],
+    )
+
+    result = await pipeline.node_filming(state)
+
+    assert result.timeline[0].video_url is not None
+    assert result.timeline[0].video_approved is True
+    assert result.timeline[0].video_generation_operation_name is None
+    assert result.timeline[0].video_generation_output_gcs_uri is None
+    assert result.timeline[0].video_generation_model is None
+    assert result.timeline[0].video_generation_started_at is None
+    assert any("Recovered completed Veo output" in critique for critique in result.timeline[0].video_critiques)
 
 
 @pytest.mark.asyncio
@@ -6210,6 +6578,19 @@ def test_normalize_image_critique_filters_speculative_body_dysmorphia_finding():
 
     assert normalized["hard_fail_reasons"] == []
     assert normalized["passes"] is True
+
+
+def test_cache_busted_project_url_uses_unique_high_resolution_timestamp(monkeypatch):
+    pipeline = FMVAgentPipeline(api_key=None)
+    timestamps = iter([111_111_111, 111_111_112])
+    monkeypatch.setattr(graph_module.time, "time_ns", lambda: next(timestamps))
+
+    first_url = pipeline._cache_busted_project_url("/projects/frame.png")
+    second_url = pipeline._cache_busted_project_url("/projects/frame.png")
+
+    assert first_url == "/projects/frame.png?t=111111111"
+    assert second_url == "/projects/frame.png?t=111111112"
+    assert first_url != second_url
 
 
 def test_normalize_image_critique_keeps_clear_high_confidence_anatomy_failure():

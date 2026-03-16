@@ -39,6 +39,8 @@ class BaseVideoProvider:
         duration_seconds: int,
         image_path: str | None,
         reference_assets: list[VideoGenerationReferenceAsset] | None = None,
+        job_started_callback=None,
+        heartbeat_callback=None,
     ) -> bytes:
         raise NotImplementedError
 
@@ -60,12 +62,16 @@ class GoogleVeoProvider(BaseVideoProvider):
         duration_seconds: int,
         image_path: str | None,
         reference_assets: list[VideoGenerationReferenceAsset] | None = None,
+        job_started_callback=None,
+        heartbeat_callback=None,
     ) -> bytes:
         return await pipeline._generate_google_video_clip(
             prompt=prompt,
             duration_seconds=duration_seconds,
             image_path=image_path,
             reference_assets=reference_assets or [],
+            job_started_callback=job_started_callback,
+            heartbeat_callback=heartbeat_callback,
         )
 
 

@@ -36,9 +36,11 @@ from google import genai as _genai
 router = APIRouter()
 
 STAGE_ORDER = ["input", "lyria_prompting", "planning", "storyboarding", "filming", "production", "completed"]
+VALID_VEO_DURATIONS = (4, 6, 8)
+INGREDIENTS_MODE_VEO_DURATIONS = (8,)
 DEFAULT_STALE_RUN_TIMEOUT_SECONDS = {
     AgentStage.STORYBOARDING: 15 * 60,
-    AgentStage.FILMING: 60 * 60,
+    AgentStage.FILMING: 20 * 60,
 }
 
 
@@ -186,6 +188,17 @@ def _resolve_critic_model(override: Optional[str]) -> Optional[str]:
 def _write_project(project_id: str, state: ProjectState) -> ProjectState:
     get_storage_backend().write_project_state(project_id, state.model_dump_json())
     return state
+
+
+def _read_project_state(project_id: str) -> ProjectState:
+    storage = get_storage_backend()
+    try:
+        state = ProjectState.model_validate_json(storage.read_project_state(project_id))
+        if _ensure_music_duration_seconds(state):
+            _write_project(project_id, state)
+        return state
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Project not found") from exc
 
 
 def _measure_audio_duration_seconds_sync(music_url: str | None) -> float | None:
@@ -441,6 +454,10 @@ def _clear_clip_storyboard_outputs(clip) -> None:
     clip.video_critiques = []
     clip.video_score = None
     clip.video_approved = False
+    clip.video_generation_operation_name = None
+    clip.video_generation_output_gcs_uri = None
+    clip.video_generation_model = None
+    clip.video_generation_started_at = None
 
 
 def _clear_clip_video_outputs(clip) -> None:
@@ -449,6 +466,10 @@ def _clear_clip_video_outputs(clip) -> None:
     clip.video_critiques = []
     clip.video_score = None
     clip.video_approved = False
+    clip.video_generation_operation_name = None
+    clip.video_generation_output_gcs_uri = None
+    clip.video_generation_model = None
+    clip.video_generation_started_at = None
 
 
 def _preserve_music_production_fragments(state: ProjectState) -> None:
@@ -466,6 +487,33 @@ def _normalize_music_start_seconds(value: float | None) -> float:
         return round(max(0.0, float(value)), 3)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _allowed_veo_durations_for_state(state: ProjectState) -> tuple[int, ...]:
+    if bool(getattr(state, "ingredients_mode_enabled", False)):
+        return INGREDIENTS_MODE_VEO_DURATIONS
+    return VALID_VEO_DURATIONS
+
+
+def _closest_allowed_veo_duration(duration: float | int | None, state: ProjectState) -> int:
+    value = float(duration or 6)
+    allowed_durations = _allowed_veo_durations_for_state(state)
+    return min(allowed_durations, key=lambda allowed: (abs(allowed - value), -allowed))
+
+
+def _normalize_timeline_durations_for_state(state: ProjectState) -> None:
+    current_time = 0.0
+    for clip in state.timeline:
+        clip.duration = float(_closest_allowed_veo_duration(clip.duration, state))
+        clip.timeline_start = current_time
+        current_time += float(clip.duration)
+
+
+def _recalculate_timeline_starts(state: ProjectState) -> None:
+    current_time = 0.0
+    for clip in state.timeline:
+        clip.timeline_start = current_time
+        current_time += float(clip.duration)
 
 
 def _default_music_fragment_for_state(state: ProjectState) -> list[ProductionTimelineFragment]:
@@ -659,10 +707,7 @@ def _apply_revert_to_state(state: ProjectState, target_stage: AgentStage | str) 
 
     if target_idx <= _stage_index(AgentStage.STORYBOARDING):
         for clip in state.timeline:
-            clip.video_url = None
-            clip.video_prompt = None
-            clip.video_critiques = []
-            clip.video_approved = False
+            _clear_clip_video_outputs(clip)
         _preserve_music_production_fragments(state)
 
     if target_idx <= _stage_index(AgentStage.FILMING):
@@ -705,11 +750,7 @@ def _apply_image_approval_change(state: ProjectState, clip_id: str, approved: bo
     state.final_video_url = None
 
     if not approved:
-        clip.video_prompt = None
-        clip.video_url = None
-        clip.video_critiques = []
-        clip.video_score = None
-        clip.video_approved = False
+        _clear_clip_video_outputs(clip)
 
     _trim_stage_summaries_to(state, AgentStage.PLANNING)
     state.current_stage = AgentStage.STORYBOARDING
@@ -734,7 +775,7 @@ def _apply_video_approval_change(state: ProjectState, clip_id: str, approved: bo
 
 def _get_project_run_state(project_id: str) -> PipelineRunState | None:
     try:
-        state = get_project(project_id)
+        state = _read_project_state(project_id)
     except HTTPException:
         return None
 
@@ -774,6 +815,18 @@ async def _persist_pipeline_progress(project_id: str, run_id: str, state: Projec
     if not _is_pipeline_run_current(project_id, run_id):
         raise asyncio.CancelledError("Pipeline run superseded")
     current = get_project(project_id)
+    if not current.active_run or current.active_run.run_id != run_id:
+        raise asyncio.CancelledError("Pipeline run superseded")
+    current.active_run.updated_at = _now_iso()
+    current.active_run.status = PipelineRunStatus.RUNNING
+    state.active_run = current.active_run
+    _write_project(project_id, state)
+
+
+async def _heartbeat_pipeline_progress(project_id: str, run_id: str, state: ProjectState) -> None:
+    if not _is_pipeline_run_current(project_id, run_id):
+        raise asyncio.CancelledError("Pipeline run superseded")
+    current = _read_project_state(project_id)
     if not current.active_run or current.active_run.run_id != run_id:
         raise asyncio.CancelledError("Pipeline run superseded")
     current.active_run.updated_at = _now_iso()
@@ -848,6 +901,7 @@ async def _execute_pipeline_run(
             music_model=_resolve_music_provider(music_model, state),
             stage_voice_briefs_enabled=True if stage_voice_briefs_enabled is None else stage_voice_briefs_enabled,
             persist_state_callback=lambda next_state: _persist_pipeline_progress(project_id, run_id, next_state),
+            heartbeat_callback=lambda current_state: _heartbeat_pipeline_progress(project_id, run_id, current_state),
             is_cancelled=lambda: not _is_pipeline_run_current(project_id, run_id),
         )
         new_state = await pipeline.run_pipeline(state)
@@ -885,6 +939,7 @@ def list_projects():
 
 @router.post("/projects", response_model=ProjectState)
 def create_project(project: ProjectState):
+    _normalize_timeline_durations_for_state(project)
     storage = get_storage_backend()
     if storage.project_exists(project.project_id):
         raise HTTPException(status_code=400, detail="Project already exists")
@@ -912,24 +967,36 @@ def delete_project(project_id: str):
 
 @router.get("/projects/{project_id}", response_model=ProjectState)
 def get_project(project_id: str):
-    storage = get_storage_backend()
-    try:
-        state = ProjectState.model_validate_json(storage.read_project_state(project_id))
-        if _ensure_music_duration_seconds(state):
-            _write_project(project_id, state)
+    state = _read_project_state(project_id)
+    if not state.active_run:
         return state
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Project not found") from exc
+
+    active_run = _get_project_run_state(project_id)
+    if active_run is None:
+        return _read_project_state(project_id)
+
+    state.active_run = active_run
+    return state
 
 @router.put("/projects/{project_id}", response_model=ProjectState)
 def update_project(project_id: str, state: ProjectState):
     _ensure_music_duration_seconds(state)
     if get_storage_backend().project_exists(project_id):
         current = get_project(project_id)
-        if _planning_signature(current) != _planning_signature(state):
+        ingredients_mode_changed = bool(current.ingredients_mode_enabled) != bool(state.ingredients_mode_enabled)
+        planning_changed = _planning_signature(current) != _planning_signature(state)
+        if planning_changed:
+            _normalize_timeline_durations_for_state(state)
             _reconcile_after_planning_edits(current, state)
+        elif ingredients_mode_changed:
+            _recalculate_timeline_starts(state)
         elif round(float(current.music_start_seconds or 0.0), 3) != round(float(state.music_start_seconds or 0.0), 3):
+            _recalculate_timeline_starts(state)
             _reconcile_after_music_start_edit(current, state)
+        else:
+            _recalculate_timeline_starts(state)
+    else:
+        _normalize_timeline_durations_for_state(state)
     return _write_project(project_id, state)
 
 

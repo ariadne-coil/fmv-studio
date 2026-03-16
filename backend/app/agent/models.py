@@ -51,6 +51,10 @@ class VideoClip(BaseModel):
     video_critiques: List[str] = Field(default_factory=list)
     video_score: Optional[int] = None
     video_approved: Optional[bool] = None
+    video_generation_operation_name: Optional[str] = None
+    video_generation_output_gcs_uri: Optional[str] = None
+    video_generation_model: Optional[str] = None
+    video_generation_started_at: Optional[str] = None
 
 
 class ProductionTimelineFragment(BaseModel):
@@ -124,6 +128,7 @@ class ProjectState(BaseModel):
     generated_music_min_duration_seconds: Optional[float] = None
     generated_music_max_duration_seconds: Optional[float] = None
     veo_quality: str = "fast"
+    ingredients_mode_enabled: bool = False
     assets: List[MediaAsset] = Field(default_factory=list)
     
     # Agent State

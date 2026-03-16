@@ -93,6 +93,7 @@ def _find_ffprobe(ffmpeg_path: str) -> str:
 FFMPEG = _find_ffmpeg()
 FFPROBE = _find_ffprobe(FFMPEG)
 VALID_VEO_DURATIONS = (4, 6, 8)
+INGREDIENTS_MODE_VEO_DURATIONS = (8,)
 TARGET_IMAGE_ASPECT_RATIO = "16:9"
 TARGET_REFERENCE_IMAGE_ASPECT_RATIO = "9:16"
 TARGET_VIDEO_ASPECT_RATIO = "16:9"
@@ -127,6 +128,12 @@ GENAI_IMAGE_REQUEST_TIMEOUT_SECONDS = 180
 DEFAULT_VERTEX_STORYBOARD_INTER_CLIP_DELAY_SECONDS = 0.5
 DEFAULT_VERTEX_FILMING_INTER_CLIP_DELAY_SECONDS = 0.5
 DEFAULT_DEVELOPER_INTER_CLIP_DELAY_SECONDS = 3.0
+DEFAULT_FAST_VEO_TIMEOUT_SECONDS = 600
+DEFAULT_QUALITY_VEO_TIMEOUT_SECONDS = 900
+DEFAULT_INGREDIENTS_VEO_TIMEOUT_BONUS_SECONDS = 180
+DEFAULT_1080P_VEO_TIMEOUT_BONUS_SECONDS = 60
+DEFAULT_4K_VEO_TIMEOUT_BONUS_SECONDS = 180
+DEFAULT_LONG_VEO_TIMEOUT_BONUS_SECONDS = 60
 LYRIA_PCM_SAMPLE_RATE = 48000
 LYRIA_PCM_CHANNELS = 2
 LYRIA_PCM_SAMPLE_WIDTH = 2
@@ -180,6 +187,22 @@ def _is_resource_exhausted_error(error: object) -> bool:
         or "resource exhausted" in normalized_message
         or "resource has been exhausted" in normalized_message
     )
+
+
+def _is_timeout_error(error: object) -> bool:
+    if error is None:
+        return False
+    if isinstance(error, TimeoutError):
+        return True
+
+    raw_message = str(error or "").strip().lower()
+    if "timed out after" in raw_message or raw_message.endswith("timed out"):
+        return True
+
+    nested = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+    if nested is not None and nested is not error:
+        return _is_timeout_error(nested)
+    return False
 
 
 def _looks_like_literal_director_text(requested_message: str, candidate_text: str) -> bool:
@@ -762,21 +785,30 @@ def _normalize_music_prompt_payload(raw_payload: Any) -> dict[str, Any]:
     }
 
 
-def _closest_valid_veo_duration(duration: float | int | None) -> int:
+def _closest_valid_veo_duration(
+    duration: float | int | None,
+    *,
+    allowed_durations: tuple[int, ...] = VALID_VEO_DURATIONS,
+) -> int:
     value = float(duration or 6)
     # Prefer the longer duration on ties so 5 -> 6 and 7 -> 8.
-    return min(VALID_VEO_DURATIONS, key=lambda allowed: (abs(allowed - value), -allowed))
+    return min(allowed_durations, key=lambda allowed: (abs(allowed - value), -allowed))
 
 
 def _normalize_veo_duration_sequence(
     durations: list[float],
     target_total: float | None = None,
+    *,
+    allowed_durations: tuple[int, ...] = VALID_VEO_DURATIONS,
 ) -> list[int]:
     if not durations:
         return []
 
     if target_total is None:
-        return [_closest_valid_veo_duration(duration) for duration in durations]
+        return [
+            _closest_valid_veo_duration(duration, allowed_durations=allowed_durations)
+            for duration in durations
+        ]
 
     original_cumulative: list[float] = []
     running_original = 0.0
@@ -789,7 +821,7 @@ def _normalize_veo_duration_sequence(
     for idx, duration in enumerate(durations):
         next_states: dict[int, tuple[float, list[int]]] = {}
         for running_total, (cost, chosen) in states.items():
-            for allowed in VALID_VEO_DURATIONS:
+            for allowed in allowed_durations:
                 new_total = running_total + allowed
                 new_cost = (
                     cost
@@ -826,6 +858,7 @@ class FMVAgentPipeline:
         music_model: str = None,
         stage_voice_briefs_enabled: bool = True,
         persist_state_callback: Callable[[ProjectState], Any] | None = None,
+        heartbeat_callback: Callable[[ProjectState], Any] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ):
         # Initialize Google GenAI client
@@ -857,7 +890,9 @@ class FMVAgentPipeline:
         self.stage_brief_voice = os.getenv("FMV_STAGE_BRIEF_VOICE", "Kore")
         self.stage_voice_briefs_enabled = stage_voice_briefs_enabled
         self._persist_state_callback = persist_state_callback
+        self._heartbeat_callback = heartbeat_callback
         self._is_cancelled = is_cancelled or (lambda: False)
+        self._last_heartbeat_monotonic = 0.0
         self.uses_vertex_ai = uses_vertex_ai()
         
         self.client = build_genai_client(api_key=self.api_key)
@@ -872,6 +907,17 @@ class FMVAgentPipeline:
             else self.media_client
         )
 
+    def _allowed_veo_durations_for_state(self, state: ProjectState) -> tuple[int, ...]:
+        if bool(getattr(state, "ingredients_mode_enabled", False)):
+            return INGREDIENTS_MODE_VEO_DURATIONS
+        return VALID_VEO_DURATIONS
+
+    def _duration_rule_text_for_state(self, state: ProjectState) -> str:
+        allowed_durations = self._allowed_veo_durations_for_state(state)
+        if allowed_durations == INGREDIENTS_MODE_VEO_DURATIONS:
+            return "Every clip duration MUST be exactly 8 seconds."
+        return "Every clip duration MUST be exactly one of: 4, 6, or 8 seconds."
+
     def _check_cancelled(self) -> None:
         if self._is_cancelled():
             raise asyncio.CancelledError("Pipeline run cancelled")
@@ -885,6 +931,28 @@ class FMVAgentPipeline:
         result = self._persist_state_callback(persisted_state)
         if inspect.isawaitable(result):
             await result
+        self._check_cancelled()
+
+    async def _heartbeat_state(
+        self,
+        state: ProjectState,
+        *,
+        minimum_interval_seconds: float = 20.0,
+        force: bool = False,
+    ) -> None:
+        self._check_cancelled()
+        if not self._heartbeat_callback:
+            return
+
+        now = time.monotonic()
+        if not force and (now - self._last_heartbeat_monotonic) < minimum_interval_seconds:
+            return
+
+        heartbeat_state = state.model_copy(deep=True)
+        result = self._heartbeat_callback(heartbeat_state)
+        if inspect.isawaitable(result):
+            await result
+        self._last_heartbeat_monotonic = time.monotonic()
         self._check_cancelled()
 
     async def _sleep_with_cancellation_checks(self, delay_seconds: float) -> None:
@@ -967,7 +1035,7 @@ class FMVAgentPipeline:
 
     def _cache_busted_project_url(self, url: str) -> str:
         separator = "&" if "?" in url else "?"
-        return f"{url}{separator}t={int(time.time())}"
+        return f"{url}{separator}t={time.time_ns()}"
 
     def _write_project_asset_bytes(
         self,
@@ -1492,6 +1560,10 @@ User instruction:
         clip.video_critiques = []
         clip.video_score = None
         clip.video_approved = False
+        clip.video_generation_operation_name = None
+        clip.video_generation_output_gcs_uri = None
+        clip.video_generation_model = None
+        clip.video_generation_started_at = None
 
     def _clear_clip_video_outputs(self, clip: VideoClip, *, preserve_prompt: bool = True) -> None:
         if not preserve_prompt:
@@ -1500,11 +1572,16 @@ User instruction:
         clip.video_critiques = []
         clip.video_score = None
         clip.video_approved = False
+        clip.video_generation_operation_name = None
+        clip.video_generation_output_gcs_uri = None
+        clip.video_generation_model = None
+        clip.video_generation_started_at = None
 
     def _recalculate_timeline_starts(self, state: ProjectState) -> None:
         current_time = 0.0
+        allowed_durations = self._allowed_veo_durations_for_state(state)
         for clip in state.timeline:
-            clip.duration = float(_closest_valid_veo_duration(clip.duration))
+            clip.duration = float(_closest_valid_veo_duration(clip.duration, allowed_durations=allowed_durations))
             clip.timeline_start = current_time
             current_time += clip.duration
 
@@ -1534,10 +1611,17 @@ User instruction:
         if not storyboard_text.strip():
             return None
 
+        allowed_durations = self._allowed_veo_durations_for_state(state)
+        default_duration = 8.0 if allowed_durations == INGREDIENTS_MODE_VEO_DURATIONS else 4.0
         new_clip = VideoClip(
             id=self._next_director_clip_id(state),
             timeline_start=0.0,
-            duration=float(_closest_valid_veo_duration(duration or 4.0)),
+            duration=float(
+                _closest_valid_veo_duration(
+                    duration or default_duration,
+                    allowed_durations=allowed_durations,
+                )
+            ),
             storyboard_text=storyboard_text.strip(),
         )
 
@@ -1726,11 +1810,7 @@ User instruction:
 
         if target_idx <= stage_order.index(AgentStage.STORYBOARDING):
             for clip in state.timeline:
-                clip.video_url = None
-                clip.video_critiques = []
-                clip.video_score = None
-                clip.video_approved = False
-                clip.video_prompt = None
+                self._clear_clip_video_outputs(clip, preserve_prompt=False)
             self._preserve_music_production_fragments(state)
 
         if target_idx <= stage_order.index(AgentStage.FILMING):
@@ -1898,7 +1978,7 @@ Rules:
   - "move_before" / "move_after": move target_clip_id relative to anchor_clip_id
 - In production, use fragment source_shot_number to match numbered shot requests when you need target_fragment_id.
 - If the user says "this shot", "this clip", "this frame", or "this edit", prefer the selected ids.
-- duration must be one of 4, 6, or 8 seconds.
+- {self._duration_rule_text_for_state(state)}
 - storyboard_text is required for insert operations and is only for planning/storyboarding-level changes.
 - video_prompt is only for filming-level changes.
 - fragment_updates.audio_enabled is only for production.
@@ -2213,7 +2293,12 @@ User instruction:
 
             duration = clip_operation.get("duration")
             if isinstance(duration, (int, float)):
-                operation_target_clip.duration = float(_closest_valid_veo_duration(duration))
+                operation_target_clip.duration = float(
+                    _closest_valid_veo_duration(
+                        duration,
+                        allowed_durations=self._allowed_veo_durations_for_state(updated_state),
+                    )
+                )
                 planning_changed_clip_ids.add(operation_target_clip.id)
 
             video_prompt = clip_operation.get("video_prompt")
@@ -3079,6 +3164,35 @@ User instruction:
             return normalized
         return self.video_model
 
+    def _google_video_operation_timeout_seconds(
+        self,
+        *,
+        model_name: str,
+        duration_seconds: int,
+        uses_ingredients_mode: bool,
+        reference_asset_count: int,
+    ) -> int:
+        normalized_model = (model_name or "").strip().lower()
+        timeout_seconds = (
+            DEFAULT_FAST_VEO_TIMEOUT_SECONDS
+            if "fast" in normalized_model
+            else DEFAULT_QUALITY_VEO_TIMEOUT_SECONDS
+        )
+
+        normalized_resolution = _normalize_video_resolution_name(self.video_resolution)
+        if normalized_resolution == "1080p":
+            timeout_seconds += DEFAULT_1080P_VEO_TIMEOUT_BONUS_SECONDS
+        elif normalized_resolution == "4k":
+            timeout_seconds += DEFAULT_4K_VEO_TIMEOUT_BONUS_SECONDS
+
+        if uses_ingredients_mode or reference_asset_count > 0:
+            timeout_seconds += DEFAULT_INGREDIENTS_VEO_TIMEOUT_BONUS_SECONDS
+
+        if int(duration_seconds or 0) >= 8:
+            timeout_seconds += DEFAULT_LONG_VEO_TIMEOUT_BONUS_SECONDS
+
+        return timeout_seconds
+
     def _sanitize_video_motion_prompt_text(self, text: str) -> str:
         cleaned = str(text or "").strip()
         if not cleaned:
@@ -3277,6 +3391,8 @@ Return only the rewritten motion prompt.
         duration_seconds: int,
         image_path: str | None,
         reference_assets: list[VideoGenerationReferenceAsset] | None = None,
+        job_started_callback: Callable[[str | None, str | None, str], Any] | None = None,
+        heartbeat_callback: Callable[[], Any] | None = None,
     ) -> bytes:
         return await self.video_provider.generate_clip(
             self,
@@ -3284,6 +3400,8 @@ Return only the rewritten motion prompt.
             duration_seconds=duration_seconds,
             image_path=image_path,
             reference_assets=reference_assets or [],
+            job_started_callback=job_started_callback,
+            heartbeat_callback=heartbeat_callback,
         )
 
     async def _generate_google_video_clip(
@@ -3294,6 +3412,8 @@ Return only the rewritten motion prompt.
         image_path: str | None,
         reference_assets: list[VideoGenerationReferenceAsset] | None = None,
         _allow_ingredients_fallback: bool = True,
+        job_started_callback: Callable[[str | None, str | None, str], Any] | None = None,
+        heartbeat_callback: Callable[[], Any] | None = None,
     ) -> bytes:
         client = self.media_client if self.uses_vertex_ai else self.client
         if client is None:
@@ -3381,18 +3501,43 @@ Return only the rewritten motion prompt.
             client.models.generate_videos,
             **generate_kwargs
         )
+        operation_name = str(getattr(operation, "name", "") or "").strip() or None
+        if callable(job_started_callback):
+            callback_result = job_started_callback(operation_name, output_gcs_uri, effective_model)
+            if inspect.isawaitable(callback_result):
+                await callback_result
 
-        timeout_seconds = 300
+        timeout_seconds = self._google_video_operation_timeout_seconds(
+            model_name=effective_model,
+            duration_seconds=requested_duration_seconds,
+            uses_ingredients_mode=uses_ingredients_mode,
+            reference_asset_count=len(reference_assets),
+        )
         poll_interval = 5
-        elapsed = 0
+        deadline = time.monotonic() + timeout_seconds
 
         while not operation.done:
-            if elapsed >= timeout_seconds:
+            if time.monotonic() >= deadline:
+                if output_gcs_uri:
+                    video_bytes = await asyncio.to_thread(
+                        self._download_first_gcs_prefix_bytes,
+                        output_gcs_uri,
+                    )
+                    if video_bytes:
+                        return video_bytes
                 raise TimeoutError(
-                    f"{self.video_provider.definition.label} job timed out after {timeout_seconds}s"
+                    f"{self.video_provider.definition.label} job timed out after {timeout_seconds}s "
+                    f"(model={effective_model}, "
+                    f"mode={'ingredients' if uses_ingredients_mode else 'frame'}, "
+                    f"refs={len(reference_assets)}, "
+                    f"duration={requested_duration_seconds}s, "
+                    f"resolution={self.video_resolution})"
                 )
+            if callable(heartbeat_callback):
+                heartbeat_result = heartbeat_callback()
+                if inspect.isawaitable(heartbeat_result):
+                    await heartbeat_result
             await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
             operation = await asyncio.to_thread(client.operations.get, operation)
 
         operation_error = getattr(operation, "error", None)
@@ -3421,24 +3566,6 @@ Return only the rewritten motion prompt.
                 return video_bytes
 
         if not generated_videos:
-            fallback_error: Exception | None = None
-            if (
-                uses_ingredients_mode
-                and _allow_ingredients_fallback
-                and image_path
-                and os.path.exists(image_path)
-            ):
-                try:
-                    return await self._generate_google_video_clip(
-                        prompt=prompt,
-                        duration_seconds=duration_seconds,
-                        image_path=image_path,
-                        reference_assets=[],
-                        _allow_ingredients_fallback=False,
-                    )
-                except Exception as exc:  # pragma: no cover - exercised via raised message
-                    fallback_error = exc
-
             generation_context = (
                 f"model={effective_model}, "
                 f"mode={'ingredients' if uses_ingredients_mode else 'frame'}, "
@@ -3447,20 +3574,15 @@ Return only the rewritten motion prompt.
                 f"resolution={self.video_resolution}"
             )
             filter_reasons = self._extract_video_filter_reasons(operation_payload)
-            fallback_suffix = ""
-            if fallback_error is not None:
-                fallback_suffix = (
-                    f" Fell back to frame-only generation, but that also failed: {fallback_error}"
-                )
             if filter_reasons:
                 raise RuntimeError(
                     f"{self.video_provider.definition.label} returned no videos. "
                     f"Possible filter reasons: {', '.join(filter_reasons)} "
-                    f"({generation_context}).{fallback_suffix}"
+                    f"({generation_context})."
                 )
             raise RuntimeError(
                 f"{self.video_provider.definition.label} returned no videos "
-                f"({generation_context}).{fallback_suffix}"
+                f"({generation_context})."
             )
 
         generated_video = generated_videos[0]
@@ -3498,6 +3620,121 @@ Return only the rewritten motion prompt.
                     return file_handle.read()
 
         return video_bytes
+
+    async def _record_clip_video_generation_job(
+        self,
+        state: ProjectState,
+        clip: VideoClip,
+        *,
+        operation_name: str | None,
+        output_gcs_uri: str | None,
+        model_name: str,
+    ) -> None:
+        clip.video_generation_operation_name = operation_name
+        clip.video_generation_output_gcs_uri = output_gcs_uri
+        clip.video_generation_model = model_name
+        clip.video_generation_started_at = self._stage_summary_generated_at()
+        await self._persist_state(state)
+
+    def _clear_clip_video_generation_tracking(self, clip: VideoClip) -> None:
+        clip.video_generation_operation_name = None
+        clip.video_generation_output_gcs_uri = None
+        clip.video_generation_model = None
+        clip.video_generation_started_at = None
+
+    async def _finalize_generated_video_clip(
+        self,
+        *,
+        state: ProjectState,
+        clip: VideoClip,
+        video_bytes: bytes,
+        reference_assets: list[VideoGenerationReferenceAsset],
+        recovery_note: str | None = None,
+        critique_retry_callback: Callable[[int, Exception], Any] | None = None,
+    ) -> None:
+        raw_video_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}_raw.mp4"
+        video_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}.mp4"
+        with open(raw_video_path, "wb") as f:
+            f.write(video_bytes)
+
+        probed_width, probed_height = await self._probe_video_dimensions(str(raw_video_path))
+        if (probed_width, probed_height) != (self.video_width, self.video_height):
+            await self._normalize_video_canvas(
+                input_path=str(raw_video_path),
+                output_path=str(video_path),
+                include_audio=True,
+            )
+            if os.path.exists(raw_video_path):
+                os.remove(raw_video_path)
+        else:
+            os.replace(raw_video_path, video_path)
+
+        clip.video_url = self._sync_local_project_artifact(
+            video_path,
+            relative_path=video_path.name,
+            content_type="video/mp4",
+        )
+
+        critique = await self._run_with_resource_exhausted_retry(
+            lambda: self._critique_video_frame(
+                video_path=video_path,
+                video_prompt=clip.video_prompt,
+                duration=clip.duration,
+            ),
+            on_retry=critique_retry_callback,
+        )
+        critique_reasoning = str(critique.get("reasoning") or "").strip() or "Automated video review unavailable."
+        try:
+            raw_video_score = critique.get("score")
+            if raw_video_score is None or raw_video_score == "":
+                raise TypeError("score unavailable")
+            clip.video_score = int(float(raw_video_score))
+        except (TypeError, ValueError):
+            clip.video_score = None
+        if clip.video_score is None:
+            clip.video_critiques.append(critique_reasoning)
+        else:
+            clip.video_critiques.append(
+                f"Score: {clip.video_score}/10 — {critique_reasoning}"
+            )
+        if recovery_note:
+            clip.video_critiques.append(recovery_note)
+        if reference_assets:
+            clip.video_critiques.append(
+                "Ingredients used: "
+                + ", ".join(asset.label for asset in reference_assets)
+            )
+        clip.video_approved = True
+        self._clear_clip_video_generation_tracking(clip)
+
+    async def _harvest_completed_video_clip_if_available(
+        self,
+        *,
+        state: ProjectState,
+        clip: VideoClip,
+        reference_assets: list[VideoGenerationReferenceAsset],
+        critique_retry_callback: Callable[[int, Exception], Any] | None = None,
+    ) -> bool:
+        output_gcs_uri = str(clip.video_generation_output_gcs_uri or "").strip()
+        if clip.video_url or not output_gcs_uri:
+            return False
+
+        video_bytes = await asyncio.to_thread(
+            self._download_first_gcs_prefix_bytes,
+            output_gcs_uri,
+        )
+        if not video_bytes:
+            return False
+
+        await self._finalize_generated_video_clip(
+            state=state,
+            clip=clip,
+            video_bytes=video_bytes,
+            reference_assets=reference_assets,
+            recovery_note="Recovered completed Veo output from a previously timed-out generation job.",
+            critique_retry_callback=critique_retry_callback,
+        )
+        return True
 
     def _music_extension_for_mime_type(self, mime_type: str | None) -> str:
         normalized = (mime_type or "").lower()
@@ -4360,6 +4597,7 @@ Existing style prompt:
         normalized_durations = _normalize_veo_duration_sequence(
             [clip.duration for clip in state.timeline],
             target_total=target_total,
+            allowed_durations=self._allowed_veo_durations_for_state(state),
         )
         self._apply_timeline_durations(state, normalized_durations)
 
@@ -4540,6 +4778,10 @@ Existing style prompt:
                     program_duration=audio_duration_seconds + max(0.0, float(state.music_start_seconds or 0.0)) + 0.1,
                 )
                 target_total_seconds = audio_duration_seconds + music_start_seconds
+                duration_rule_text = self._duration_rule_text_for_state(state)
+                allowed_durations = self._allowed_veo_durations_for_state(state)
+                shortest_duration = min(allowed_durations)
+                longest_duration = max(allowed_durations)
                 audio_duration_hint = (
                     f"\n            DURATION CONSTRAINT (HARD RULE):\n"
                     f"            The audio track is exactly {audio_duration_seconds:.1f} seconds long.\n"
@@ -4547,8 +4789,8 @@ Existing style prompt:
                     f"            Your clips MUST sum to approximately {target_total_seconds:.1f} seconds total so there is room for the full song after that lead-in.\n"
                     f"            Shots before {music_start_seconds:.1f}s are pre-music intro shots.\n"
                     f"            Generate the minimum number of clips needed to fill this duration naturally.\n"
-                    f"            Every clip duration MUST be exactly one of: 4, 6, or 8 seconds.\n"
-                    f"            Aim for {max(1, int(target_total_seconds // 6))}–{max(2, int(target_total_seconds // 4))} clips."
+                    f"            {duration_rule_text}\n"
+                    f"            Aim for {max(1, int(target_total_seconds // longest_duration))}–{max(2, int(target_total_seconds // shortest_duration))} clips."
                 )
 
             # ── Upload audio for multimodal beat alignment ───────────────────
@@ -4557,10 +4799,11 @@ Existing style prompt:
             if music_path and os.path.exists(music_path):
                 media_files.append(self._content_part_from_local_file(music_path))
 
+            duration_rule_text = self._duration_rule_text_for_state(state)
             prompt = f"""
             You are an expert music video director and visual architect. 
             Break down the following screenplay into a timeline of individual visual clips for an AI pipeline. 
-            Each clip duration must be EXACTLY one of 4, 6, or 8 seconds. Do not use any other values.
+            {duration_rule_text} Do not use any other values.
 {audio_duration_hint}
             CRITICAL: 
             - The storyboard image provider will generate the starting frames, and the video provider will animate them.
@@ -4612,6 +4855,7 @@ Existing style prompt:
                 normalized_durations = _normalize_veo_duration_sequence(
                     proposed_durations,
                     target_total=target_total_seconds,
+                    allowed_durations=self._allowed_veo_durations_for_state(state),
                 )
                 current_time = 0.0
                 for idx, (storyboard_text, duration) in enumerate(zip(proposed_storyboard_texts, normalized_durations)):
@@ -5487,101 +5731,60 @@ Return only the final detailed image prompt.
                     f"{self.video_provider.definition.label} reported resource exhaustion ({exc}). "
                     f"Retrying automatically in {RESOURCE_EXHAUSTED_RETRY_DELAY_SECONDS}s."
                 )
+
+            async def note_video_job_started(
+                operation_name: str | None,
+                output_gcs_uri: str | None,
+                model_name: str,
+            ) -> None:
+                await self._record_clip_video_generation_job(
+                    state,
+                    clip,
+                    operation_name=operation_name,
+                    output_gcs_uri=output_gcs_uri,
+                    model_name=model_name,
+                )
             
             try:
+                if await self._harvest_completed_video_clip_if_available(
+                    state=state,
+                    clip=clip,
+                    reference_assets=reference_assets,
+                    critique_retry_callback=note_resource_exhausted_retry,
+                ):
+                    return
+
                 image_path = _local_media_path(clip.image_url)
                 try:
-                    video_bytes = await self._run_with_resource_exhausted_retry(
-                        lambda: self._generate_video_clip(
-                            prompt=clip.video_prompt,
-                            duration_seconds=int(clip.duration),
-                            image_path=image_path,
-                            reference_assets=reference_assets,
-                        ),
-                        on_retry=note_resource_exhausted_retry,
+                    video_bytes = await self._generate_video_clip(
+                        prompt=clip.video_prompt,
+                        duration_seconds=int(clip.duration),
+                        image_path=image_path,
+                        reference_assets=reference_assets,
+                        job_started_callback=note_video_job_started,
+                        heartbeat_callback=lambda: self._heartbeat_state(state),
                     )
-                except Exception as first_error:
-                    retry_motion_prompt = await self._build_video_retry_prompt(
-                        clip,
-                        state,
-                        failed_prompt=motion_prompt,
-                        failure_message=str(first_error),
-                    )
-                    retry_prompt = self._compose_video_generation_prompt(retry_motion_prompt)
-                    if retry_prompt.strip() == clip.video_prompt.strip():
-                        raise
-
-                    clip.video_prompt = retry_prompt
-                    try:
-                        video_bytes = await self._run_with_resource_exhausted_retry(
-                            lambda: self._generate_video_clip(
-                                prompt=clip.video_prompt,
-                                duration_seconds=int(clip.duration),
-                                image_path=image_path,
-                                reference_assets=reference_assets,
-                            ),
-                            on_retry=note_resource_exhausted_retry,
+                except Exception as generation_error:
+                    if _is_resource_exhausted_error(generation_error):
+                        clip.video_critiques.append(
+                            f"{self.video_provider.definition.label} reported resource exhaustion ({generation_error}). "
+                            "No automatic retry was attempted to avoid duplicate billable Veo jobs."
                         )
-                    except Exception as second_error:
-                        raise RuntimeError(
-                            f"{first_error} Retried with adjusted phrasing, but Veo still failed: {second_error}"
-                        ) from second_error
-
-                raw_video_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}_raw.mp4"
-                video_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}.mp4"
-                with open(raw_video_path, "wb") as f:
-                    f.write(video_bytes)
-
-                probed_width, probed_height = await self._probe_video_dimensions(str(raw_video_path))
-                if (probed_width, probed_height) != (self.video_width, self.video_height):
-                    await self._normalize_video_canvas(
-                        input_path=str(raw_video_path),
-                        output_path=str(video_path),
-                        include_audio=True,
-                    )
-                    if os.path.exists(raw_video_path):
-                        os.remove(raw_video_path)
-                else:
-                    os.replace(raw_video_path, video_path)
-                clip.video_url = self._sync_local_project_artifact(
-                    video_path,
-                    relative_path=video_path.name,
-                    content_type="video/mp4",
+                    raise
+                await self._finalize_generated_video_clip(
+                    state=state,
+                    clip=clip,
+                    video_bytes=video_bytes,
+                    reference_assets=reference_assets,
+                    critique_retry_callback=note_resource_exhausted_retry,
                 )
-
-                critique = await self._run_with_resource_exhausted_retry(
-                    lambda: self._critique_video_frame(
-                        video_path=video_path,
-                        video_prompt=clip.video_prompt,
-                        duration=clip.duration,
-                    ),
-                    on_retry=note_resource_exhausted_retry,
-                )
-                critique_reasoning = str(critique.get("reasoning") or "").strip() or "Automated video review unavailable."
-                try:
-                    raw_video_score = critique.get("score")
-                    if raw_video_score is None or raw_video_score == "":
-                        raise TypeError("score unavailable")
-                    clip.video_score = int(float(raw_video_score))
-                except (TypeError, ValueError):
-                    clip.video_score = None
-                if clip.video_score is None:
-                    clip.video_critiques.append(critique_reasoning)
-                else:
-                    clip.video_critiques.append(
-                        f"Score: {clip.video_score}/10 — {critique_reasoning}"
-                    )
-                if reference_assets:
-                    clip.video_critiques.append(
-                        "Ingredients used: "
-                        + ", ".join(asset.label for asset in reference_assets)
-                    )
-                clip.video_approved = True
 
             except Exception as e:
                 raw_video_path = PROJECTS_DIR / f"{state.project_id}_{clip.id}_raw.mp4"
                 if os.path.exists(raw_video_path):
                     os.remove(raw_video_path)
+                if not _is_timeout_error(e):
+                    self._clear_clip_video_generation_tracking(clip)
                 clip.video_critiques.append(
                     f"{self.video_provider.definition.label} generation failed: {str(e)}"
                 )

@@ -10,6 +10,7 @@ interface ShotListEditorProps {
     expandedShotId?: string | null;
     onChange: (clips: VideoClip[]) => void;
     onExpand?: (id: string) => void;
+    allowedDurations?: readonly (4 | 6 | 8)[];
 }
 
 let _idCounter = Date.now();
@@ -17,27 +18,35 @@ const VALID_DURATIONS = [4, 6, 8] as const;
 
 function newClipId() { return `clip_custom_${_idCounter++}`; }
 
-function quantizeDuration(duration: number): 4 | 6 | 8 {
+function quantizeDuration(duration: number, allowedDurations: readonly (4 | 6 | 8)[] = VALID_DURATIONS): 4 | 6 | 8 {
     const value = Number.isFinite(duration) ? duration : 6;
-    return VALID_DURATIONS.reduce((best, candidate) => {
+    const candidates = allowedDurations.length ? allowedDurations : VALID_DURATIONS;
+    return candidates.reduce((best, candidate) => {
         const bestDelta = Math.abs(best - value);
         const candidateDelta = Math.abs(candidate - value);
         if (candidateDelta < bestDelta) return candidate;
         if (candidateDelta === bestDelta && candidate > best) return candidate;
         return best;
-    }, VALID_DURATIONS[1]);
+    }, candidates[candidates.length - 1]);
 }
 
-function recalcTimestamps(clips: VideoClip[]): VideoClip[] {
+function recalcTimestamps(clips: VideoClip[], allowedDurations: readonly (4 | 6 | 8)[] = VALID_DURATIONS): VideoClip[] {
     let t = 0;
     return clips.map(c => {
-        const updated = { ...c, duration: quantizeDuration(c.duration), timeline_start: t };
+        const updated = { ...c, duration: quantizeDuration(c.duration, allowedDurations), timeline_start: t };
         t += updated.duration;
         return updated;
     });
 }
 
-export default function ShotListEditor({ clips, projectId, expandedShotId, onChange, onExpand }: ShotListEditorProps) {
+export default function ShotListEditor({
+    clips,
+    projectId,
+    expandedShotId,
+    onChange,
+    onExpand,
+    allowedDurations = VALID_DURATIONS,
+}: ShotListEditorProps) {
     const [filling, setFilling] = useState<string | null>(null); // clipId being filled
     const dragSrc = useRef<number | null>(null);
     const dragOver = useRef<number | null>(null);
@@ -53,31 +62,31 @@ export default function ShotListEditor({ clips, projectId, expandedShotId, onCha
         const [moved] = reordered.splice(dragSrc.current, 1);
         reordered.splice(dragOver.current, 0, moved);
         dragSrc.current = null; dragOver.current = null;
-        onChange(recalcTimestamps(reordered));
+        onChange(recalcTimestamps(reordered, allowedDurations));
     };
 
     // ── Mutations ──────────────────────────────────────────────────────────────
     const updateClip = (id: string, patch: Partial<VideoClip>) => {
         const updated = clips.map(c => c.id === id ? { ...c, ...patch } : c);
-        onChange(recalcTimestamps(updated));
+        onChange(recalcTimestamps(updated, allowedDurations));
     };
 
     const deleteClip = (id: string) => {
-        onChange(recalcTimestamps(clips.filter(c => c.id !== id)));
+        onChange(recalcTimestamps(clips.filter(c => c.id !== id), allowedDurations));
     };
 
     const addClip = () => {
         const newClip: VideoClip = {
             id: newClipId(),
             timeline_start: 0,
-            duration: 6.0,
+            duration: allowedDurations[allowedDurations.length - 1] ?? 8,
             storyboard_text: "",
             image_critiques: [],
             image_approved: false,
             video_critiques: [],
             video_approved: false,
         };
-        onChange(recalcTimestamps([...clips, newClip]));
+        onChange(recalcTimestamps([...clips, newClip], allowedDurations));
     };
 
     // ── AI fill-in ─────────────────────────────────────────────────────────────
@@ -142,12 +151,12 @@ export default function ShotListEditor({ clips, projectId, expandedShotId, onCha
                         {/* Duration input */}
                         <div className="shot-duration-wrap">
                             <select
-                                value={quantizeDuration(clip.duration)}
+                                value={quantizeDuration(clip.duration, allowedDurations)}
                                 onChange={(e) => updateClip(clip.id, { duration: Number(e.target.value) as 4 | 6 | 8 })}
                                 className="shot-duration-input"
-                                title="Shot duration (4s, 6s, or 8s)"
+                                title={allowedDurations.length === 1 ? "Shot duration (8s only)" : "Shot duration (4s, 6s, or 8s)"}
                             >
-                                {VALID_DURATIONS.map((duration) => (
+                                {allowedDurations.map((duration) => (
                                     <option key={duration} value={duration}>
                                         {duration}
                                     </option>

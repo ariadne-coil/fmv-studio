@@ -9,7 +9,7 @@ import SettingsModal from "@/components/ui/SettingsModal";
 import ShotListEditor from "@/components/ui/ShotListEditor";
 import StageTimelineOverview from "@/components/ui/StageTimelineOverview";
 import AssetViewerWorkspace from "@/components/ui/AssetViewerWorkspace";
-import { Loader2, Music, ImageIcon, Play, Pause, SkipBack, SkipForward, Wand2, X, AlertCircle, Save, Video, Settings, ListPlus, Maximize2, GripVertical, Home, FileText, Trash2, Plus, RefreshCw } from 'lucide-react';
+import { Loader2, Music, ImageIcon, Play, Pause, SkipBack, SkipForward, Wand2, X, AlertCircle, Save, Download, Video, Settings, ListPlus, Maximize2, GripVertical, Home, FileText, Trash2, Plus, RefreshCw } from 'lucide-react';
 import { api, getMusicProviderOption, getStoredApiKey, getStoredModels, getStoredPreferences, isManualImportMusicProvider, LiveDirectorResponse, normalizeMusicProviderId, ProductionTimelineFragment, ProjectRunStatus, ProjectState, toBackendAssetUrl, VideoClip } from "@/lib/api";
 
 const MIN_PRODUCTION_FRAGMENT_DURATION = 0.25;
@@ -18,24 +18,33 @@ const DEFAULT_MUSIC_MIN_DURATION_SECONDS = 90;
 const DEFAULT_MUSIC_MAX_DURATION_SECONDS = 240;
 const DEFAULT_MUSIC_START_SECONDS = 0;
 const STORYBOARD_VALID_DURATIONS = [4, 6, 8] as const;
+const INGREDIENTS_MODE_DURATIONS = [8] as const;
 const RANGE_DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 let storyboardClipIdCounter = Date.now();
 
-function quantizeStoryboardDuration(duration: number): 4 | 6 | 8 {
+function getStoryboardAllowedDurations(project?: ProjectState | null): readonly (4 | 6 | 8)[] {
+    return project?.ingredients_mode_enabled ? INGREDIENTS_MODE_DURATIONS : STORYBOARD_VALID_DURATIONS;
+}
+
+function quantizeStoryboardDuration(duration: number, allowedDurations: readonly (4 | 6 | 8)[] = STORYBOARD_VALID_DURATIONS): 4 | 6 | 8 {
     const value = Number.isFinite(duration) ? duration : 6;
-    return STORYBOARD_VALID_DURATIONS.reduce((best, candidate) => {
+    const candidates = allowedDurations.length ? allowedDurations : STORYBOARD_VALID_DURATIONS;
+    return candidates.reduce((best, candidate) => {
         const bestDelta = Math.abs(best - value);
         const candidateDelta = Math.abs(candidate - value);
         if (candidateDelta < bestDelta) return candidate;
         if (candidateDelta === bestDelta && candidate > best) return candidate;
         return best;
-    }, STORYBOARD_VALID_DURATIONS[1]);
+    }, candidates[candidates.length - 1]);
 }
 
-function recalcStoryboardTimeline(clips: VideoClip[]): VideoClip[] {
+function recalcStoryboardTimeline(
+    clips: VideoClip[],
+    allowedDurations: readonly (4 | 6 | 8)[] = STORYBOARD_VALID_DURATIONS,
+): VideoClip[] {
     let currentTime = 0;
     return clips.map((clip) => {
-        const normalizedDuration = quantizeStoryboardDuration(clip.duration);
+        const normalizedDuration = quantizeStoryboardDuration(clip.duration, allowedDurations);
         const updated = {
             ...clip,
             duration: normalizedDuration,
@@ -46,11 +55,11 @@ function recalcStoryboardTimeline(clips: VideoClip[]): VideoClip[] {
     });
 }
 
-function createStoryboardClip(): VideoClip {
+function createStoryboardClip(defaultDuration: 4 | 6 | 8 = 6): VideoClip {
     return {
         id: `clip_custom_${storyboardClipIdCounter++}`,
         timeline_start: 0,
-        duration: 6,
+        duration: defaultDuration,
         storyboard_text: "",
         image_critiques: [],
         image_approved: false,
@@ -542,10 +551,12 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const [pipelineRunStatus, setPipelineRunStatus] = useState<ProjectRunStatus>({ is_running: false });
     const abortControllerRef = React.useRef<AbortController | null>(null);
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+    const [isSavingIngredientsMode, setIsSavingIngredientsMode] = useState(false);
     const [confirmDialog, setConfirmDialog] = useState<{ title: string, message: string, onConfirm: () => void } | null>(null);
     const [activeMediaSwapKey, setActiveMediaSwapKey] = useState<string | null>(null);
     const [isExportingResources, setIsExportingResources] = useState(false);
     const [isExportingFinalVideo, setIsExportingFinalVideo] = useState(false);
+    const [isExportingFilmingClips, setIsExportingFilmingClips] = useState(false);
     const [isPreparingFinalVideo, setIsPreparingFinalVideo] = useState(false);
     const [isRegeneratingMusic, setIsRegeneratingMusic] = useState(false);
     const [isDirectorProcessing, setIsDirectorProcessing] = useState(false);
@@ -715,6 +726,8 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
     const activeStageIndex = stageMap[resolvedCurrentReviewStage] ?? 0;
     const displayStageIndex = stageMap[resolvedDisplayStage] ?? 0;
     const isCurrentDisplayedStage = displayStage === (project?.current_stage ?? 'input');
+    const storyboardAllowedDurations = getStoryboardAllowedDurations(project);
+    const storyboardDurationOptionsLabel = storyboardAllowedDurations.length === 1 ? "8s only" : "4s / 6s / 8s";
     const planningMusicStartSeconds = normalizeMusicStartSeconds(project?.music_start_seconds);
     const persistedMusicDuration = Math.max(
         0,
@@ -1404,6 +1417,26 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                 }
             }
         }, 450);
+    };
+
+    const handleIngredientsModeChange = async (enabled: boolean) => {
+        if (!project) return;
+        const nextProject: ProjectState = {
+            ...project,
+            ingredients_mode_enabled: enabled,
+        };
+        setProject(nextProject);
+        setIsSavingIngredientsMode(true);
+        try {
+            const savedProject = await api.updateProject(project.project_id, nextProject);
+            setProject(savedProject);
+        } catch (error) {
+            console.error("Failed to update ingredients mode", error);
+            alert(error instanceof Error ? error.message : "Failed to update ingredients mode.");
+            setProject(project);
+        } finally {
+            setIsSavingIngredientsMode(false);
+        }
     };
 
     const ensureFooterStageAudioSourceLoaded = async (): Promise<string | null> => {
@@ -2255,9 +2288,10 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
 
     const handleStoryboardTimelineChange = (nextTimeline: VideoClip[]) => {
         if (!project) return;
-        const normalizedTimeline = recalcStoryboardTimeline(nextTimeline);
-        const previousTimelineSignature = project.timeline.map((clip) => `${clip.id}:${quantizeStoryboardDuration(clip.duration)}`).join("|");
-        const nextTimelineSignature = normalizedTimeline.map((clip) => `${clip.id}:${quantizeStoryboardDuration(clip.duration)}`).join("|");
+        const allowedDurations = getStoryboardAllowedDurations(project);
+        const normalizedTimeline = recalcStoryboardTimeline(nextTimeline, allowedDurations);
+        const previousTimelineSignature = project.timeline.map((clip) => `${clip.id}:${quantizeStoryboardDuration(clip.duration, allowedDurations)}`).join("|");
+        const nextTimelineSignature = normalizedTimeline.map((clip) => `${clip.id}:${quantizeStoryboardDuration(clip.duration, allowedDurations)}`).join("|");
         const timelineStructureChanged = previousTimelineSignature !== nextTimelineSignature;
 
         setProject({
@@ -2273,10 +2307,11 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
 
     const handleStoryboardDurationChange = (clipId: string, duration: number) => {
         if (!project) return;
+        const allowedDurations = getStoryboardAllowedDurations(project);
         handleStoryboardTimelineChange(
             project.timeline.map((clip) =>
                 clip.id === clipId
-                    ? { ...clip, duration: quantizeStoryboardDuration(duration) }
+                    ? { ...clip, duration: quantizeStoryboardDuration(duration, allowedDurations) }
                     : clip
             ),
         );
@@ -2293,7 +2328,8 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
 
     const handleStoryboardAddClip = () => {
         if (!project) return;
-        const nextClip = createStoryboardClip();
+        const allowedDurations = getStoryboardAllowedDurations(project);
+        const nextClip = createStoryboardClip(allowedDurations[allowedDurations.length - 1] ?? 8);
         handleStoryboardTimelineChange([...project.timeline, nextClip]);
         setSelectedPlanningShotId(nextClip.id);
     };
@@ -2750,6 +2786,68 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
             alert(error instanceof Error ? error.message : "Failed to export project resources.");
         } finally {
             setIsExportingResources(false);
+        }
+    };
+
+    const handleExportFilmingClips = async () => {
+        if (!project || isExportingFilmingClips) return;
+
+        const clipsToExport = project.timeline.filter((clip) => !!clip.video_url);
+        if (!clipsToExport.length) {
+            alert("No generated clips are available to download yet.");
+            return;
+        }
+
+        const pickerWindow = window as Window & {
+            showDirectoryPicker?: (options?: { mode?: "readwrite" }) => Promise<any>;
+        };
+
+        try {
+            setIsExportingFilmingClips(true);
+
+            if (pickerWindow.showDirectoryPicker) {
+                const directoryHandle = await pickerWindow.showDirectoryPicker({ mode: "readwrite" });
+                let exportedCount = 0;
+                for (const [index, clip] of clipsToExport.entries()) {
+                    const clipBlob = await fetchExportBlob(clip.video_url!);
+                    await writeBlobToHandle(
+                        directoryHandle,
+                        getExportFileName(
+                            clip.video_url,
+                            `${String(index + 1).padStart(2, "0")}_${clip.id}`,
+                            ".mp4",
+                        ),
+                        clipBlob,
+                    );
+                    exportedCount += 1;
+                }
+                alert(`Exported ${exportedCount} clip${exportedCount === 1 ? "" : "s"} to the selected folder.`);
+                return;
+            }
+
+            for (const [index, clip] of clipsToExport.entries()) {
+                const clipBlob = await fetchExportBlob(clip.video_url!);
+                triggerBlobDownload(
+                    clipBlob,
+                    getExportFileName(
+                        clip.video_url,
+                        `${String(index + 1).padStart(2, "0")}_${clip.id}`,
+                        ".mp4",
+                    ),
+                );
+                if (index < clipsToExport.length - 1) {
+                    await new Promise((resolve) => window.setTimeout(resolve, 150));
+                }
+            }
+            alert(`Started ${clipsToExport.length} clip download${clipsToExport.length === 1 ? "" : "s"}.`);
+        } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") {
+                return;
+            }
+            console.error("Failed to export filming clips", error);
+            alert(error instanceof Error ? error.message : "Failed to export generated clips.");
+        } finally {
+            setIsExportingFilmingClips(false);
         }
     };
 
@@ -3533,7 +3631,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                             <div className="space-y-4 mb-6">
                                     <div className="p-3 bg-surface-hover/30 border border-primary/20 rounded-xl mb-4">
                                         <p className="text-sm text-white/80 font-medium">Gemini Draft Generation Complete.</p>
-                                    <p className="text-xs text-surface-border mt-1">Review and edit the shots below. Drag to reorder, tweak durations in 4s / 6s / 8s increments, add new shots, or click ✨ AI Fill to let Gemini write one. Changes are saved when you click Generate Storyboards.</p>
+                                    <p className="text-xs text-surface-border mt-1">Review and edit the shots below. Drag to reorder, tweak durations in {storyboardDurationOptionsLabel} increments, add new shots, or click ✨ AI Fill to let Gemini write one. Changes are saved when you click Generate Storyboards.</p>
                                 </div>
                                 <GlassCard className="!p-4 space-y-4">
                                     <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -3560,6 +3658,7 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                     clips={project.timeline}
                                     projectId={project.project_id}
                                     expandedShotId={selectedPlanningShotId}
+                                    allowedDurations={storyboardAllowedDurations}
                                     onChange={(clips) => setProject({ ...project, timeline: clips })}
                                     onExpand={(id) => setSelectedPlanningShotId(prev => prev === id ? null : id)}
                                 />
@@ -3674,13 +3773,13 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                                                     <label className="sr-only" htmlFor={`storyboard-duration-${clip.id}`}>Shot duration</label>
                                                     <select
                                                         id={`storyboard-duration-${clip.id}`}
-                                                        value={quantizeStoryboardDuration(clip.duration)}
+                                                        value={quantizeStoryboardDuration(clip.duration, storyboardAllowedDurations)}
                                                         onChange={(e) => handleStoryboardDurationChange(clip.id, Number(e.target.value))}
                                                         onClick={(e) => e.stopPropagation()}
                                                         className="bg-transparent text-xs font-mono text-white/80 outline-none"
                                                         title="Shot duration"
                                                     >
-                                                        {STORYBOARD_VALID_DURATIONS.map((duration) => (
+                                                        {storyboardAllowedDurations.map((duration) => (
                                                             <option key={duration} value={duration} className="text-black">
                                                                 {duration}s
                                                             </option>
@@ -3907,12 +4006,37 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
                         {displayStage === 'filming' && (
                             <div className="space-y-4 mb-6">
                                 <div className="p-3 bg-surface-hover/30 border border-primary/20 rounded-xl mb-4">
-                                    <p className="text-sm text-white/80 font-medium">{isFilmingRunActive ? "Veo 3.1 is generating clips." : "Veo 3.1 Video Renders Ready."}</p>
-                                    <p className="text-xs text-surface-border mt-1">
-                                        {isFilmingRunActive
-                                            ? `${readyFilmingClipCount} of ${totalFilmingClipCount} clips are ready. Stay here while new shots appear automatically as they finish rendering.`
-                                            : "Review the final clips. Approve them to move into Production, reject individual clips to rerender them, or upload your own replacement clip for any shot."}
-                                    </p>
+                                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                                        <div className="min-w-0">
+                                            <p className="text-sm text-white/80 font-medium">{isFilmingRunActive ? "Veo 3.1 is generating clips." : "Veo 3.1 Video Renders Ready."}</p>
+                                            <p className="text-xs text-surface-border mt-1">
+                                                {isFilmingRunActive
+                                                    ? `${readyFilmingClipCount} of ${totalFilmingClipCount} clips are ready. Stay here while new shots appear automatically as they finish rendering.`
+                                                    : "Review the final clips. Approve them to move into Production, reject individual clips to rerender them, or upload your own replacement clip for any shot."}
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => void handleExportFilmingClips()}
+                                            disabled={isExportingFilmingClips || readyFilmingClipCount === 0}
+                                            className={`inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2 text-xs font-semibold transition-colors ${isExportingFilmingClips || readyFilmingClipCount === 0
+                                                ? "border-surface-border text-white/30 cursor-not-allowed"
+                                                : "border-primary/30 bg-primary/10 text-primary hover:bg-primary/20"
+                                            }`}
+                                        >
+                                            {isExportingFilmingClips ? (
+                                                <React.Fragment>
+                                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                                    Exporting Clips...
+                                                </React.Fragment>
+                                            ) : (
+                                                <React.Fragment>
+                                                    <Download className="w-4 h-4" />
+                                                    Download All Clips
+                                                </React.Fragment>
+                                            )}
+                                        </button>
+                                    </div>
                                 </div>
                                 <div className="grid grid-cols-1 gap-4">
                                     {project.timeline.map((clip, index) => {
@@ -4887,6 +5011,9 @@ export default function StudioPage({ params }: { params: Promise<{ projectId: st
             <SettingsModal
                 isOpen={isSettingsOpen}
                 onClose={() => setIsSettingsOpen(false)}
+                ingredientsModeEnabled={!!project?.ingredients_mode_enabled}
+                onIngredientsModeChange={handleIngredientsModeChange}
+                ingredientsModeSaving={isSavingIngredientsMode}
             />
 
             {/* Full-Screen Confirmation Dialog overlay */}

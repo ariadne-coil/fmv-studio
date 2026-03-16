@@ -93,6 +93,7 @@ export interface ProjectState {
     generated_music_min_duration_seconds?: number | null;
     generated_music_max_duration_seconds?: number | null;
     veo_quality: 'fast' | 'quality';
+    ingredients_mode_enabled?: boolean;
     assets: MediaAsset[];
     timeline: VideoClip[];
     production_timeline: ProductionTimelineFragment[];

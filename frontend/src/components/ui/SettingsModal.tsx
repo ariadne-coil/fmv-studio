@@ -23,9 +23,18 @@ import {
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  ingredientsModeEnabled?: boolean;
+  onIngredientsModeChange?: (enabled: boolean) => void | Promise<void>;
+  ingredientsModeSaving?: boolean;
 }
 
-export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
+export default function SettingsModal({
+  isOpen,
+  onClose,
+  ingredientsModeEnabled = false,
+  onIngredientsModeChange,
+  ingredientsModeSaving = false,
+}: SettingsModalProps) {
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<AppModels>(DEFAULT_MODELS);
   const [preferences, setPreferences] = useState<AppPreferences>(DEFAULT_PREFERENCES);
@@ -283,6 +292,20 @@ export default function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               <p className="text-xs text-surface-border">
                 {selectedVideoResolution?.description}
               </p>
+              <label className="mt-1 flex items-start gap-3 rounded-xl border border-surface-border bg-background/40 px-4 py-3 text-sm text-white/85">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 rounded border-surface-border bg-background accent-cyan-400"
+                  checked={ingredientsModeEnabled}
+                  disabled={ingredientsModeSaving}
+                  onChange={(e) => {
+                    void onIngredientsModeChange?.(e.target.checked);
+                  }}
+                />
+                <span className="block font-medium text-white/90">
+                  Ingredients mode
+                </span>
+              </label>
             </div>
 
             <div className="flex flex-col gap-1.5">
